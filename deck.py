@@ -266,7 +266,7 @@ async def claim_ad_reward(user_id: str):
 # fires. That callback is the ONLY place shards get credited — nothing in
 # the /watchad command itself grants anything.
 ADSGRAM_BOT_TOKEN = "37e23e9115824303b8efec1b8e23cd78"    # from your AdsGram profile (Copy token)
-ADSGRAM_WATCHAD_BLOCKID = "47736"                          # numeric only, no "bot-" prefix
+ADSGRAM_WATCHAD_BLOCKID = "48391"                          # numeric only, no "bot-" prefix
 ADSGRAM_WATCHAD_REWARD_SECRET = "8yhhrHral2eMLBMr_oK0NQkWTxsk-vVv"  # put the same value in the Reward URL's &key=
 ADSGRAM_WATCHAD_REWARD_AMOUNT = 30                          # flat shards per confirmed watch
 ADSGRAM_WATCHAD_COOLDOWN_SECONDS = 30 * 60                  # 30 min between claimable rewards, per user
@@ -363,7 +363,8 @@ async def watchad_cmd(message: Message):
         await smart_reply(message, "⏳ Please wait a moment before requesting another ad.", parse_mode=ParseMode.HTML)
         return
 
-    remaining = _watchad_seconds_remaining(db["users"][user_id])
+    _, user_data = get_user_from_db(db, user_id)
+    remaining = _watchad_seconds_remaining(user_data) if user_data else 0
     if remaining > 0:
         mins = max(1, remaining // 60)
         await smart_reply(
@@ -386,6 +387,10 @@ async def watchad_cmd(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
 
     # AdsGram requires ads sent via the bot API to be non-forwardable.
+    # reply_to_message_id ties the ad back to the /watchad command that
+    # triggered it — this matters in groups where several people may be
+    # requesting ads around the same time. allow_sending_without_reply
+    # keeps this from erroring if the original command got deleted.
     try:
         if ad.get("image_url"):
             await bot.send_photo(
@@ -395,6 +400,8 @@ async def watchad_cmd(message: Message):
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
                 protect_content=True,
+                reply_to_message_id=message.message_id,
+                allow_sending_without_reply=True,
             )
         else:
             await bot.send_message(
@@ -403,6 +410,8 @@ async def watchad_cmd(message: Message):
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
                 protect_content=True,
+                reply_to_message_id=message.message_id,
+                allow_sending_without_reply=True,
             )
     except Exception as e:
         dlog.error(f"[watchad] failed to send ad to {user_id}: {e}")
