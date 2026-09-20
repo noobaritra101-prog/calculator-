@@ -24,7 +24,8 @@ import aiohttp
 import config
 from config import (
     bot, main_router, DECK_PER_PAGE, RARITY_ORDER, BACKEND_PUBLIC_URL,
-    format_rarity, ensure_user, load_db, save_db, is_ghost_banned, is_shadow_banned
+    format_rarity, ensure_user, load_db, save_db, is_ghost_banned, is_shadow_banned,
+    ADMIN_IDS, format_duration_seconds
 )
 from handlers import smart_reply, smart_reply_photo, _check_action_cooldown
 from vlog import log_action
@@ -82,6 +83,25 @@ ADSGRAM_RARITY_WEIGHTS = {
     "Elite ⚓": (1 - ADSGRAM_DIVINE_CHANCE) * ADSGRAM_ELITE_SHARE,
     "Basic 🃏": (1 - ADSGRAM_DIVINE_CHANCE) * ADSGRAM_BASIC_SHARE,
 }
+
+# ── /fad — FORCE ADS DIVINE ─────────────────────────────────────────────────
+# Admin toggle. While active, every Adsgram daily-card claim rolls Divine ❄️
+# instead of the normal weighted odds. Expiry is stored as a timestamp in
+# db["settings"], so it survives restarts and switches itself off after 24h.
+FAD_DURATION_SECONDS = 24 * 60 * 60
+
+def _fad_seconds_left(db: dict) -> int:
+    """Seconds of Force-Ads-Divine remaining (0 = off). Clears an expired flag."""
+    settings = db.setdefault("settings", {})
+    expires_at = settings.get("fad_expires_at", 0)
+    if not expires_at:
+        return 0
+    left = int(expires_at - time.time())
+    if left <= 0:
+        settings.pop("fad_expires_at", None)
+        save_db()
+        return 0
+    return left
 
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -185,7 +205,10 @@ async def claim_ad_reward(user_id: str):
     # from within that tier. Re-normalize weights over only the tiers that
     # currently have cards, so an empty tier never blocks a claim.
     weights = [ADSGRAM_RARITY_WEIGHTS[r] for r in available_rarities]
-    chosen_rarity = random.choices(available_rarities, weights=weights, k=1)[0]
+    if _fad_seconds_left(db) > 0 and "Divine ❄️" in available_rarities:
+        chosen_rarity = "Divine ❄️"   # /fad is on — force Divine
+    else:
+        chosen_rarity = random.choices(available_rarities, weights=weights, k=1)[0]
     card_pool = pools_by_rarity[chosen_rarity]
 
     if chosen_rarity != "Divine ❄️":
@@ -242,178 +265,6 @@ async def claim_ad_reward(user_id: str):
         "rarity": display_rarity,
         "anime": card_data.get("anime", "Unknown")
     }
-
-
-# ==========================================
-# /watchad — IN-CHAT (NON-WEBAPP) ADSGRAM ADS
-# ==========================================
-# This is a SEPARATE AdsGram ad block from the webapp rewarded-card system
-# above (deck.html uses the AdsGram JS SDK; this uses AdsGram's bot-chat
-# API: https://api.adsgram.ai/advbot). Sending the ad itself uses that
-# GET-based advbot endpoint below. Crediting the reward is SEPARATE and
-# trustworthy: this ad block's "Reward URL" (set in the AdsGram dashboard)
-# points back at watchad_reward_callback() below, which AdsGram's own
-# server calls with the real Telegram user id once a genuine REWARD event
-# fires. That callback is the ONLY place shards get credited — nothing in
-# the /watchad command itself grants anything.
-ADSGRAM_BOT_TOKEN = "37e23e9115824303b8efec1b8e23cd78"    # from your AdsGram profile (Copy token)
-ADSGRAM_WATCHAD_BLOCKID = "48391"                          # numeric only, no "bot-" prefix
-ADSGRAM_WATCHAD_REWARD_SECRET = "8yhhrHral2eMLBMr_oK0NQkWTxsk-vVv"  # put the same value in the Reward URL's &key=
-ADSGRAM_WATCHAD_REWARD_AMOUNT = 30                          # flat shards per confirmed watch
-ADSGRAM_WATCHAD_COOLDOWN_SECONDS = 30 * 60                  # 30 min between claimable rewards, per user
-
-def _watchad_seconds_remaining(user_data: dict) -> int:
-    """Seconds left before this user can earn another /watchad reward.
-    0 (or negative) means they're eligible right now. Stored on the user
-    record (not an in-memory cooldown) so it survives restarts and can't
-    be reset by spamming /watchad — the ad-fetch cooldown below is a
-    separate, shorter anti-spam check on the command itself."""
-    last = user_data.get("watchad_last_reward_ts", 0)
-    elapsed = time.time() - last
-    return int(ADSGRAM_WATCHAD_COOLDOWN_SECONDS - elapsed)
-
-@deck_api.get("/ads/watchad-reward")
-async def watchad_reward_callback(userid: str, key: str = ""):
-    """Server-to-server callback configured as this ad block's Reward URL:
-    https://<your-domain>/api/deck/ads/watchad-reward?userid=[userId]&key=<secret>
-    AdsGram substitutes [userId] with the Telegram user id and calls this
-    from their server after a genuine completed ad view. This is the sole
-    source of truth for the /watchad reward — the command handler never
-    credits anything on its own."""
-    if key != ADSGRAM_WATCHAD_REWARD_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid key")
-
-    db = load_db()
-    actual_key, user_data = get_user_from_db(db, userid)
-    if not user_data:
-        ensure_user(userid, "User", None)
-        db = load_db()
-        actual_key, user_data = get_user_from_db(db, userid)
-    if not user_data:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    remaining = _watchad_seconds_remaining(user_data)
-    if remaining > 0:
-        save_db()
-        return {"ok": True, "status": "on_cooldown", "seconds_remaining": remaining}
-
-    user_data["watchad_last_reward_ts"] = time.time()
-    user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + ADSGRAM_WATCHAD_REWARD_AMOUNT
-
-    log_action(db, str(actual_key), {
-        "type": "watchad_reward",
-        "shards_earned": ADSGRAM_WATCHAD_REWARD_AMOUNT,
-        "chat_title": "Adsgram /watchad Reward"
-    })
-    save_db()
-
-    try:
-        await bot.send_message(
-            chat_id=int(actual_key),
-            text=f"💠 <b>+{ADSGRAM_WATCHAD_REWARD_AMOUNT} Nexus Shards</b> credited for watching an ad!",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        # DM can fail if the user blocked the bot — never let that break
-        # the credit itself, just log it.
-        dlog.error(f"[watchad_reward] failed to DM user {actual_key} their reward: {e}")
-
-    return {"ok": True, "status": "credited", "shards_earned": ADSGRAM_WATCHAD_REWARD_AMOUNT}
-
-async def _fetch_adsgram_bot_ad(tgid: str, language: str = "en") -> dict | None:
-    """Calls AdsGram's bot-chat ad endpoint and returns the parsed JSON, or
-    None if no ad is available / the request failed."""
-    url = (
-        "https://api.adsgram.ai/advbot"
-        f"?tgid={tgid}&blockid={ADSGRAM_WATCHAD_BLOCKID}"
-        f"&language={language}&token={ADSGRAM_BOT_TOKEN}"
-    )
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    dlog.error(f"[watchad] AdsGram returned status {resp.status} for tgid={tgid}")
-                    return None
-                data = await resp.json(content_type=None)
-                if not data or not data.get("text_html"):
-                    return None
-                return data
-    except Exception as e:
-        dlog.error(f"[watchad] AdsGram fetch failed for tgid={tgid}: {e}")
-        return None
-
-@main_router.message(Command("watchad"))
-async def watchad_cmd(message: Message):
-    uid_int = message.from_user.id
-    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
-
-    user_id = str(uid_int)
-    db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
-
-    if _check_action_cooldown(f"watchad_{user_id}"):
-        await smart_reply(message, "⏳ Please wait a moment before requesting another ad.", parse_mode=ParseMode.HTML)
-        return
-
-    _, user_data = get_user_from_db(db, user_id)
-    remaining = _watchad_seconds_remaining(user_data) if user_data else 0
-    if remaining > 0:
-        mins = max(1, remaining // 60)
-        await smart_reply(
-            message,
-            f"⏳ You've already earned shards from an ad recently. Try again in ~{mins} min.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    ad = await _fetch_adsgram_bot_ad(user_id)
-    if not ad:
-        await smart_reply(message, "😕 No ads available right now — try again in a bit.", parse_mode=ParseMode.HTML)
-        return
-
-    buttons = []
-    if ad.get("button_name") and ad.get("click_url"):
-        buttons.append(InlineKeyboardButton(text=ad["button_name"], url=ad["click_url"]))
-    if ad.get("button_reward_name") and ad.get("reward_url"):
-        buttons.append(InlineKeyboardButton(text=ad["button_reward_name"], url=ad["reward_url"]))
-    kb = InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
-
-    # AdsGram requires ads sent via the bot API to be non-forwardable.
-    # reply_to_message_id ties the ad back to the /watchad command that
-    # triggered it — this matters in groups where several people may be
-    # requesting ads around the same time. allow_sending_without_reply
-    # keeps this from erroring if the original command got deleted.
-    try:
-        if ad.get("image_url"):
-            await bot.send_photo(
-                chat_id=message.chat.id,
-                photo=ad["image_url"],
-                caption=ad["text_html"],
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-                protect_content=True,
-                reply_to_message_id=message.message_id,
-                allow_sending_without_reply=True,
-            )
-        else:
-            await bot.send_message(
-                chat_id=message.chat.id,
-                text=ad["text_html"],
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-                protect_content=True,
-                reply_to_message_id=message.message_id,
-                allow_sending_without_reply=True,
-            )
-    except Exception as e:
-        dlog.error(f"[watchad] failed to send ad to {user_id}: {e}")
-        await smart_reply(message, "😕 Couldn't load an ad right now — try again shortly.", parse_mode=ParseMode.HTML)
-        return
-
-    await smart_reply(
-        message,
-        f"💠 Complete the ad above and your <b>+{ADSGRAM_WATCHAD_REWARD_AMOUNT} shards</b> will be credited automatically.",
-        parse_mode=ParseMode.HTML,
-    )
 
 
 # In-memory cache for Telegram image URLs.
@@ -764,6 +615,44 @@ async def adrop_cmd(message: Message):
         reply_markup=kb,
         parse_mode=ParseMode.HTML
     )
+
+
+@main_router.message(Command("fad"))
+async def fad_cmd(message: Message, command: CommandObject):
+    """Admin only: /fad on | /fad off | /fad (status). 'on' lasts 24h, then reverts on its own."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    db = load_db()
+    arg = (command.args or "").strip().lower()
+
+    if arg == "on":
+        db.setdefault("settings", {})["fad_expires_at"] = time.time() + FAD_DURATION_SECONDS
+        save_db()
+        await smart_reply(
+            message,
+            "✅ <b>Force Ads Divine: ON</b>\n"
+            "Every airdrop ad reward will now be a <b>Divine ❄️</b> card.\n"
+            f"⏳ Auto-off in <b>{format_duration_seconds(FAD_DURATION_SECONDS)}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif arg == "off":
+        db.setdefault("settings", {}).pop("fad_expires_at", None)
+        save_db()
+        await smart_reply(
+            message,
+            "🛑 <b>Force Ads Divine: OFF</b>\nAd rewards are back to normal odds.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif arg == "":
+        left = _fad_seconds_left(db)
+        if left > 0:
+            text = f"✅ <b>Force Ads Divine is ON</b>\n⏳ Auto-off in <b>{format_duration_seconds(left)}</b>."
+        else:
+            text = "🛑 <b>Force Ads Divine is OFF</b>"
+        await smart_reply(message, text, parse_mode=ParseMode.HTML)
+    else:
+        await smart_reply(message, "⚠️ <b>Usage:</b> <code>/fad on</code> | <code>/fad off</code>", parse_mode=ParseMode.HTML)
 
 
 # NOTE: /dlog, /bug, and /adstats used to live here — they've moved to
