@@ -21,7 +21,7 @@ from aiohttp import ClientConnectionError, ServerDisconnectedError
 
 # ==========================================
 # LOGGING CONFIGURATION
-# ==========================================
+# =========================================
 os.makedirs("logs", exist_ok=True)
 _log_formatter = logging.Formatter(
     "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
