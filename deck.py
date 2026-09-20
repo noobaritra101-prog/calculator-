@@ -620,7 +620,15 @@ async def adrop_cmd(message: Message):
 @main_router.message(Command("fad"))
 async def fad_cmd(message: Message, command: CommandObject):
     """Admin only: /fad on | /fad off | /fad (status). 'on' lasts 24h, then reverts on its own."""
+    print(f"[fad] /fad received from {message.from_user.id} args={command.args!r}")
     if message.from_user.id not in ADMIN_IDS:
+        # Deliberately not silent (unlike other admin commands) so it's obvious
+        # whether the handler is firing and which ID needs to be in ADMIN_IDS.
+        await smart_reply(
+            message,
+            f"⛔ Admins only.\nYour ID: <code>{message.from_user.id}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     db = load_db()
