@@ -23,7 +23,7 @@ import aiohttp
 
 import config
 from config import (
-    bot, main_router, DECK_PER_PAGE, RARITY_ORDER,
+    bot, main_router, DECK_PER_PAGE, RARITY_ORDER, BACKEND_PUBLIC_URL,
     format_rarity, ensure_user, load_db, save_db, is_ghost_banned, is_shadow_banned
 )
 from handlers import smart_reply, smart_reply_photo, _check_action_cooldown
@@ -42,15 +42,6 @@ if not dlog.handlers:
     _dlog_handler.setLevel(logging.ERROR)
     _dlog_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     dlog.addHandler(_dlog_handler)
-
-# ==========================================
-# BACKEND'S OWN PUBLIC URL (this Railway service)
-# ==========================================
-# Used to build absolute URLs (e.g. card image links) that must point back
-# at THIS running app. Do not hardcode a different Railway service's domain
-# here — if it drifts from the actual host, every image link silently
-# points at a dead service and every <img> in the Mini Apps breaks.
-BACKEND_PUBLIC_URL = "https://worker-production-67bd.up.railway.app"
 
 # ==========================================
 # FASTAPI WEB APP API ROUTER (/api/deck)

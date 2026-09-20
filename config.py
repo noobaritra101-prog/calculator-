@@ -14,7 +14,7 @@ from aiogram.enums import ParseMode
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BOT_TOKEN           = "7658617809:AAFRLp0x2R4qdHrxbDrp9Ltw3DsM2DXowJ8"
+BOT_TOKEN           = "7658617809:AAGEYNtWaLh-859dyn4pLcd_7Rdw3mLtWeM"
 ADMIN_IDS           = [5716292610, 5822885863, 7930421561, 7964904329]
 SUPREME_OWNER_ID    = 5716292610
 DB_GROUP_ID         = -1003799799158 # Used for uploading new cards
@@ -30,6 +30,15 @@ LOG_THREAD_TRADE    = 1452  # Topic ID for Card Trade logs (@anexlog)
 
 MAIN_GROUP_USERNAME = "@animex_nexus"
 MAIN_GROUP_LINK     = "https://t.me/animex_nexus"
+
+# ==========================================
+# BACKEND'S OWN PUBLIC URL (this Railway service)
+# ==========================================
+# Single source of truth. Used to build absolute URLs (e.g. card image links)
+# that must point back at THIS running app. Import it from config everywhere
+# instead of hardcoding it — if it drifts from the actual host, every image
+# link silently points at a dead service and every <img> in the Mini Apps breaks.
+BACKEND_PUBLIC_URL  = "https://worker-production-67bd.up.railway.app"
 OFFLINE_STORE_GROUP = -1003982098657  # 🏪 Peer-to-Peer Consignment Group/Channel ID
 
 # Fixed Shards Card Purchase Prices for Online Shop - Balanced Values
