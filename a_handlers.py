@@ -106,7 +106,7 @@ async def admin_log_cmd(message: Message):
     except Exception as e:
         await message.reply(f"⚠️ Failed to send log file: {e}", parse_mode=ParseMode.HTML)
 
-# ==========================================
+# =========================================
 # /dlog COMMAND (SEND dlog.txt — ADMIN ONLY)
 # Moved here from deck.py so every admin command lives in one place.
 # ==========================================
