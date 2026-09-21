@@ -97,7 +97,7 @@ from deck import deck_api  # <--- IMPORT DECK API ROUTER
 from store import store_api  # <--- IMPORT STORE API ROUTER
 
 
-# ==========================================
+# =========================================
 # BOT ADDED TO GROUP LOG
 # ==========================================
 @dp.my_chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
