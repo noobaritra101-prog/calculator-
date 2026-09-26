@@ -2234,12 +2234,12 @@ async def start_cmd(message: Message, command: CommandObject):
     db  = load_db()
     pic = db.get("settings", {}).get("start_pic")
     if pic:
-        await smart_reply_photo(message, 
+        await message.reply_photo(
             photo=pic, caption=build_start_text(message.from_user.id, message.from_user.first_name),
             reply_markup=build_start_keyboard(), parse_mode=ParseMode.HTML
         )
     else:
-        await smart_reply(message, 
+        await message.reply(
             build_start_text(message.from_user.id, message.from_user.first_name),
             reply_markup=build_start_keyboard(), parse_mode=ParseMode.HTML
         )
