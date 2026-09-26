@@ -161,8 +161,8 @@ def pick_redeemable_banner_id(db: dict, requested: str) -> Optional[str]:
     The current global default is always excluded from the eligible pool —
     every user already gets it for free on /profile, so "winning" it from
     a promo would be worthless. A banner an admin has locked with
-    /lock_drop is excluded the same way, whether it was requested randomly
-    or by specific id — see /lock_drop's docstring below. `requested == "r"`
+    /lock_banner is excluded the same way, whether it was requested randomly
+    or by specific id — see the /lock_banner section below. `requested == "r"`
     draws randomly from whatever remains; a specific id must exist and
     must not be the current default or locked. Returns None if nothing
     eligible is available."""
@@ -322,7 +322,7 @@ async def add_banner_cmd(message: Message, command: CommandObject):
 
     if not message.reply_to_message or not message.reply_to_message.photo:
         await message.reply(
-            "<b>Usage::</b> reply to a photo with <code>/ab &lt;name&gt;</code>\n"
+            "<b>Usage:</b> reply to a photo with <code>/ab &lt;name&gt;</code>\n"
             "The photo needs one plain white circular area — that's where each "
             "user's own profile picture gets composited in.",
             parse_mode=ParseMode.HTML
@@ -695,8 +695,8 @@ async def set_default_banner_cmd(message: Message, command: CommandObject):
 
 
 # ==========================================
-# /lock_drop <banner_id> — EXCLUDE FROM PROMO REWARD POOL (ADMIN ONLY)
-# /unlock_drop <banner_id> — RE-ALLOW IN PROMO REWARD POOL (ADMIN ONLY)
+# /lock_banner <banner_id> — EXCLUDE FROM PROMO REWARD POOL (ADMIN ONLY)
+# /unlock_banner <banner_id> — RE-ALLOW IN PROMO REWARD POOL (ADMIN ONLY)
 # ==========================================
 # Locking a banner excludes it from pick_redeemable_banner_id() — the
 # resolver /redeem uses for a promo's `banner:` reward — the same way the
@@ -707,13 +707,13 @@ async def set_default_banner_cmd(message: Message, command: CommandObject):
 # already owns it). A promo already referencing a banner by ID before it
 # gets locked simply stops paying out that reward on future redeems, the
 # same silent-skip behavior as a removed or now-default target.
-@main_router.message(Command("lock_drop"))
-async def lock_drop_cmd(message: Message, command: CommandObject):
+@main_router.message(Command("lock_banner"))
+async def lock_banner_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
     if not command.args or not command.args.strip():
-        await message.reply("<b>Usage:</b> <code>/lock_drop &lt;banner_id&gt;</code>", parse_mode=ParseMode.HTML)
+        await message.reply("<b>Usage:</b> <code>/lock_banner &lt;banner_id&gt;</code>", parse_mode=ParseMode.HTML)
         return
 
     banner_id = command.args.strip()
@@ -741,13 +741,13 @@ async def lock_drop_cmd(message: Message, command: CommandObject):
     )
 
 
-@main_router.message(Command("unlock_drop"))
-async def unlock_drop_cmd(message: Message, command: CommandObject):
+@main_router.message(Command("unlock_banner"))
+async def unlock_banner_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
     if not command.args or not command.args.strip():
-        await message.reply("<b>Usage:</b> <code>/unlock_drop &lt;banner_id&gt;</code>", parse_mode=ParseMode.HTML)
+        await message.reply("<b>Usage:</b> <code>/unlock_banner &lt;banner_id&gt;</code>", parse_mode=ParseMode.HTML)
         return
 
     banner_id = command.args.strip()

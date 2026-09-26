@@ -2,6 +2,7 @@ import io
 import os
 import sys
 import time
+import json
 import uuid
 import asyncio
 import traceback
@@ -106,7 +107,7 @@ async def admin_log_cmd(message: Message):
     except Exception as e:
         await message.reply(f"⚠️ Failed to send log file: {e}", parse_mode=ParseMode.HTML)
 
-# =========================================
+# ==========================================
 # /dlog COMMAND (SEND dlog.txt — ADMIN ONLY)
 # Moved here from deck.py so every admin command lives in one place.
 # ==========================================
@@ -411,15 +412,67 @@ async def ping_cmd(message: Message):
         parse_mode=ParseMode.HTML
     )
 
+# os.execv() replaces the running process image outright — nothing after that
+# call ever runs, so refresh_cmd can never edit its own status message once
+# the reload has actually finished. Instead we drop a small breadcrumb file
+# with the chat/message to edit, and a startup hook on the fresh process
+# picks it up and finishes the edit once the bot is back online.
+REFRESH_STATE_FILE = "refresh_pending.json"
+
 @main_router.message(Command("refresh"))
 async def refresh_cmd(message: Message):
     if message.from_user.id not in ADMIN_IDS: return
-    await message.reply("🔄 <b>Synchronizing cache & hot-restarting bot engines...</b>", parse_mode=ParseMode.HTML)
-    
+    status_msg = await message.reply("🔄 <b>Synchronizing cache & hot-restarting bot engines...</b>", parse_mode=ParseMode.HTML)
+
+    try:
+        with open(REFRESH_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "chat_id": status_msg.chat.id,
+                "message_id": status_msg.message_id,
+                "started_at": time.time(),
+            }, f)
+    except Exception:
+        pass
+
     save_db()
     await perform_backup()
-    
+
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+@main_router.startup()
+async def _finish_refresh_notice():
+    """Runs once whenever the bot (re)starts. If a /refresh just fired
+    os.execv on us, a breadcrumb file is sitting on disk — edit the original
+    'Synchronizing...' message into a completion notice and clean up.
+    On a normal boot (no breadcrumb) this is a silent no-op."""
+    if not os.path.exists(REFRESH_STATE_FILE):
+        return
+
+    try:
+        with open(REFRESH_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        state = None
+    finally:
+        try:
+            os.remove(REFRESH_STATE_FILE)
+        except Exception:
+            pass
+
+    if not state:
+        return
+
+    elapsed = time.time() - state.get("started_at", time.time())
+    try:
+        await bot.edit_message_text(
+            chat_id=state["chat_id"],
+            message_id=state["message_id"],
+            text=f"✅ <b>Refresh complete!</b> Bot engines are back online.\n⏱ <b>Downtime:</b> <code>{elapsed:.1f}s</code>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
 
 @main_router.message(Command("cleangroups"))
 async def clean_groups_cmd(message: Message):
@@ -1338,7 +1391,7 @@ def build_admin_help_text() -> str:
         "➷ /info\n〻 Interactive DB player & group list\n\n"
         "➷ /check [ID / Name]\n〻 Interactively inspect user or global card profiles [Admin Only]\n\n"
         "➷ /cards\n〻 Browse global database [Admin Only]\n\n"
-        "➷ /ab / /eb / /rb / /lbanner / /set_default / /lock_drop / /unlock_drop\n〻 Manage the profile banner pool [Admin Only]\n\n"
+        "➷ /ab / /eb / /rb / /lbanner / /set_default / /lock_banner / /unlock_banner\n〻 Manage the profile banner pool [Admin Only]\n\n"
         "➷ /add_promo\n〻 Generate promo codes [Admin Only]\n\n"
         "➷ /list_promos\n〻 View all active promotional codes [Admin Only]\n\n"
         "➷ /del_promo [Code]\n〻 Delete an active promotional code [Admin Only]\n\n"
@@ -1370,6 +1423,165 @@ BNXCAST_USAGE = (
     "┗ <code>fall</code> - Fᴏʀᴡᴀʀᴅ ᴛᴏ ᴇᴠᴇʀʏᴏɴᴇ"
 )
 BNXCAST_MODES = {"users", "gcs", "all", "fusers", "fgcs", "fall"}
+
+# 👈 FAST & SMART, WITHOUT STARVING OTHER COMMANDS:
+# - The whole send loop runs as a detached background task (asyncio.create_task),
+#   not awaited inside the command handler. The handler acks and returns
+#   immediately, so the dispatcher is free to process every other update
+#   (any command, any user) the instant it arrives — it's never stuck
+#   waiting on this handler to finish.
+# - A shared token-bucket rate limiter caps how many Telegram API calls the
+#   broadcast itself issues per second (well under Telegram's ~30 msg/sec
+#   global ceiling), leaving headroom in that global budget for whatever
+#   other commands need to send at the same time. Concurrency alone
+#   (workers) controls how many sends are in flight, not how fast Telegram
+#   actually lets them through — the limiter is what keeps a big broadcast
+#   from monopolizing that budget.
+BNXCAST_CONCURRENCY = 25
+BNXCAST_RATE_PER_SEC = 15         # broadcast's own share of Telegram's global rate limit
+BNXCAST_PROGRESS_INTERVAL = 1.5   # seconds between live progress edits
+
+_bnxcast_bg_tasks: set = set()    # keeps fire-and-forget tasks alive until done
+
+
+class _RateLimiter:
+    """Simple async token-bucket spacer: `await limiter.wait()` blocks just
+    long enough that calls across ALL callers stay under `rate`/sec, no
+    matter how many workers are hammering it at once."""
+    def __init__(self, rate_per_sec: float):
+        self._interval = 1.0 / rate_per_sec
+        self._lock = asyncio.Lock()
+        self._next_slot = 0.0
+
+    async def wait(self):
+        async with self._lock:
+            now = time.monotonic()
+            self._next_slot = max(self._next_slot, now) + self._interval
+            delay = self._next_slot - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+async def _run_broadcast(status_msg, mode: str, forward: bool, target_ids: list,
+                          src_chat_id: int, src_msg_id: int, src_reply_markup,
+                          admin_id: int, admin_name: str):
+    """The actual send loop — runs detached from the command handler (see
+    broadcast_cmd) so it can take as long as it needs without ever blocking
+    other commands from being handled in the meantime."""
+    total = len(target_ids)
+    sent = 0
+    failed = 0
+    done = 0
+    counters_lock = asyncio.Lock()
+    edit_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(BNXCAST_CONCURRENCY)
+    limiter = _RateLimiter(BNXCAST_RATE_PER_SEC)
+    last_edit = 0.0
+
+    def _bar(pct: int, width: int = 12) -> str:
+        filled = round(width * pct / 100)
+        return "▰" * filled + "▱" * (width - filled)
+
+    async def _maybe_update_progress(force: bool = False):
+        nonlocal last_edit
+        now = time.monotonic()
+        if not force and (now - last_edit) < BNXCAST_PROGRESS_INTERVAL:
+            return
+        async with edit_lock:
+            now = time.monotonic()
+            if not force and (now - last_edit) < BNXCAST_PROGRESS_INTERVAL:
+                return
+            last_edit = now
+            pct = int((done / total) * 100) if total else 100
+            try:
+                await status_msg.edit_text(
+                    f"📡 <b>Broadcasting...</b> ({'Forward' if forward else 'Copy'})\n"
+                    f"{_bar(pct)} <code>{pct}%</code>\n"
+                    f"• Progress: <code>{done}/{total}</code>\n"
+                    f"• ✅ Delivered: <code>{sent}</code>  •  Failed: <code>{failed}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+            except TelegramBadRequest:
+                pass  # "message not modified" or similar — harmless
+            except Exception:
+                pass
+
+    async def _send_one(raw_id):
+        nonlocal sent, failed, done
+        async with sem:
+            try:
+                chat_id_int = int(raw_id)
+            except (TypeError, ValueError):
+                async with counters_lock:
+                    failed += 1
+                    done += 1
+                await _maybe_update_progress()
+                return
+
+            for attempt in range(2):
+                await limiter.wait()  # 👈 shared throttle — other commands' sends aren't queued behind this
+                try:
+                    if forward:
+                        await bot.forward_message(chat_id=chat_id_int, from_chat_id=src_chat_id, message_id=src_msg_id)
+                    else:
+                        # reply_markup passed explicitly so buttons/formatting carry over 1:1
+                        await bot.copy_message(
+                            chat_id=chat_id_int,
+                            from_chat_id=src_chat_id,
+                            message_id=src_msg_id,
+                            reply_markup=src_reply_markup
+                        )
+                    async with counters_lock:
+                        sent += 1
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                    continue
+                except (TelegramForbiddenError, TelegramBadRequest):
+                    async with counters_lock:
+                        failed += 1
+                    break
+                except Exception:
+                    async with counters_lock:
+                        failed += 1
+                    break
+
+            async with counters_lock:
+                done += 1
+            await _maybe_update_progress()
+
+    t0 = time.monotonic()
+    await asyncio.gather(*(_send_one(rid) for rid in target_ids))
+    elapsed = time.monotonic() - t0
+    await _maybe_update_progress(force=True)
+
+    admin_mention = get_mention(admin_id, admin_name)
+    try:
+        await status_msg.edit_text(
+            f"<b>「 📡 BROADCAST COMPLETE 」</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"• 🧭 <b>Mode:</b> <code>{mode}</code>\n"
+            f"• ✅ <b>Delivered:</b> <code>{sent}</code>\n"
+            f"• <b>Failed:</b> <code>{failed}</code>\n"
+            f"• 📦 <b>Total Targets:</b> <code>{total}</code>\n"
+            f"• ⏱ <b>Time:</b> <code>{elapsed:.1f}s</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+    await send_log(
+        f"<b>「 📡 BROADCAST EXECUTED 」</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"• 🛡️ <b>Admin:</b> {admin_mention}\n"
+        f"• 🧭 <b>Mode:</b> <code>{mode}</code>\n"
+        f"• ✅ <b>Delivered:</b> <code>{sent}</code> / <b>Failed:</b> <code>{failed}</code>\n"
+        f"• ⏱ <b>Duration:</b> <code>{elapsed:.1f}s</code>\n"
+        f"• 🕐 <b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+        f"━━━━━━━━━━━━━━━━━━━"
+    )
+
 
 @main_router.message(Command("bnxcast"))
 async def broadcast_cmd(message: Message, command: CommandObject):
@@ -1405,67 +1617,25 @@ async def broadcast_cmd(message: Message, command: CommandObject):
     # and re-attach it on every copy so buttons survive the broadcast.
     src_reply_markup = message.reply_to_message.reply_markup
 
+    total = len(target_ids)
     status_msg = await message.reply(
         f"📡 <b>Broadcast started...</b>\n"
-        f"Target: <code>{len(target_ids)}</code> chats ({'Forward' if forward else 'Copy'})",
+        f"Target: <code>{total}</code> chats ({'Forward' if forward else 'Copy'})\n"
+        f"⚡ <code>{BNXCAST_CONCURRENCY}</code> parallel workers running in the background —"
+        f" other commands stay responsive.",
         parse_mode=ParseMode.HTML
     )
 
-    sent, failed = 0, 0
-    for raw_id in target_ids:
-        try:
-            chat_id_int = int(raw_id)
-        except (TypeError, ValueError):
-            failed += 1
-            continue
-
-        for attempt in range(2):
-            try:
-                if forward:
-                    await bot.forward_message(chat_id=chat_id_int, from_chat_id=src_chat_id, message_id=src_msg_id)
-                else:
-                    # reply_markup passed explicitly so buttons/formatting carry over 1:1
-                    await bot.copy_message(
-                        chat_id=chat_id_int,
-                        from_chat_id=src_chat_id,
-                        message_id=src_msg_id,
-                        reply_markup=src_reply_markup
-                    )
-                sent += 1
-                break
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-                continue
-            except (TelegramForbiddenError, TelegramBadRequest):
-                failed += 1
-                break
-            except Exception:
-                failed += 1
-                break
-
-        await asyncio.sleep(0.05)
-
-    admin_mention = get_mention(message.from_user.id, message.from_user.first_name)
-    await status_msg.edit_text(
-        f"<b>「 📡 BROADCAST COMPLETE 」</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"• 🧭 <b>Mode:</b> <code>{mode}</code>\n"
-        f"• ✅ <b>Delivered:</b> <code>{sent}</code>\n"
-        f"• <b>Failed:</b> <code>{failed}</code>\n"
-        f"• 📦 <b>Total Targets:</b> <code>{len(target_ids)}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML
-    )
-
-    await send_log(
-        f"<b>「 📡 BROADCAST EXECUTED 」</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"• 🛡️ <b>Admin:</b> {admin_mention}\n"
-        f"• 🧭 <b>Mode:</b> <code>{mode}</code>\n"
-        f"• ✅ <b>Delivered:</b> <code>{sent}</code> / <b>Failed:</b> <code>{failed}</code>\n"
-        f"• 🕐 <b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-        f"━━━━━━━━━━━━━━━━━━━"
-    )
+    # 👈 Detached task: broadcast_cmd returns right here. The send loop keeps
+    # running on its own; it never holds up this handler (or the dispatcher)
+    # from picking up the next update/command.
+    task = asyncio.create_task(_run_broadcast(
+        status_msg, mode, forward, target_ids,
+        src_chat_id, src_msg_id, src_reply_markup,
+        message.from_user.id, message.from_user.first_name
+    ))
+    _bnxcast_bg_tasks.add(task)
+    task.add_done_callback(_bnxcast_bg_tasks.discard)
 
 @main_router.message(Command("a_help"))
 async def admin_help_cmd(message: Message):
@@ -1577,14 +1747,14 @@ async def add_promo_cmd(message: Message, command: CommandObject):
                     return
                 if banners_pool[b_target].get("drop_locked"):
                     await message.reply(
-                        f"⚠️ Banner <code>{b_target}</code> is locked from drops (/lock_drop) and can't be used as a "
-                        "promo reward. Unlock it with /unlock_drop first, or pick a different ID.",
+                        f"⚠️ Banner <code>{b_target}</code> is locked from drops (/lock_banner) and can't be used as a "
+                        "promo reward. Unlock it with /unlock_banner first, or pick a different ID.",
                         parse_mode=ParseMode.HTML
                     )
                     return
             else:
                 if not [b for b, m in banners_pool.items() if b != default_id_peek and not m.get("drop_locked")]:
-                    await message.reply("⚠️ No non-default, unlocked banners exist yet to randomly award. Add one with /ab first, or /unlock_drop an existing one.", parse_mode=ParseMode.HTML)
+                    await message.reply("⚠️ No non-default, unlocked banners exist yet to randomly award. Add one with /ab first, or /unlock_banner an existing one.", parse_mode=ParseMode.HTML)
                     return
 
             rewards.append({"type": "banner", "amount": b_amount, "banner_id": b_target})
@@ -2076,11 +2246,14 @@ async def browse_filtered_cards(cq: CallbackQuery):
 # ==========================================
 # /lock_drop AND /unlock_drop CONTROLS
 # ==========================================
+# Series-level only: locks/unlocks a whole anime series, stored in
+# settings["locked_animes"]. Individual cards can't be locked. Banners have
+# their own commands: /lock_banner and /unlock_banner (see banners.py).
 @main_router.message(Command("lock_drop"))
 async def lock_drop_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
-    if not command.args:
-        await message.reply("⚠️ <b>Usage:</b> <code>/lock_drop <anime series name></code>", parse_mode=ParseMode.HTML)
+    if not command.args or not command.args.strip():
+        await message.reply("⚠️ <b>Usage:</b> <code>/lock_drop &lt;anime series name&gt;</code>", parse_mode=ParseMode.HTML)
         return
 
     anime_name = command.args.strip()
@@ -2118,8 +2291,8 @@ async def lock_drop_cmd(message: Message, command: CommandObject):
 @main_router.message(Command("unlock_drop"))
 async def unlock_drop_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
-    if not command.args:
-        await message.reply("⚠️ <b>Usage:</b> <code>/unlock_drop <anime series name></code>", parse_mode=ParseMode.HTML)
+    if not command.args or not command.args.strip():
+        await message.reply("⚠️ <b>Usage:</b> <code>/unlock_drop &lt;anime series name&gt;</code>", parse_mode=ParseMode.HTML)
         return
 
     anime_name = command.args.strip()
