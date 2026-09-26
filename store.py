@@ -4,7 +4,7 @@ import random
 import asyncio
 import logging
 from aiogram import F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputRichMessage
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputRichMessage, LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode, ButtonStyle
 from datetime import datetime, timezone, timedelta
@@ -108,6 +108,348 @@ async def _reject_stale_online_offer(cq: CallbackQuery, uid: str):
         pass
 
 # ==========================================
+# STAR SHOP (real Telegram Stars — XTR)
+# ==========================================
+# Catalog lives in the DB now, not in code, so it can be managed live:
+#   db["star_shop"][card_id] = {"price": <stars>, "limit": <int, 0=unlimited>, "sold": <int>}
+# Managed via the admin-only /astar, /rstar, /allstar commands below.
+# Every card, regardless of limit, can still only be bought ONCE per user
+# (tracked in star_purchases) — "limit" caps TOTAL copies sold across everyone.
+
+def _star_purchases(user_data: dict) -> list:
+    return user_data.setdefault("star_purchases", [])
+
+def _star_shop_catalog(db: dict) -> dict:
+    return db.setdefault("star_shop", {})
+
+def _is_star_admin(uid: int) -> bool:
+    return uid in config.ADMIN_IDS
+
+def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup]:
+    user_data = db["users"][uid]
+    bought = _star_purchases(user_data)
+    catalog = _star_shop_catalog(db)
+
+    text = (
+        "<b>「 ⭐ 𝗦𝗧𝗔𝗥 𝗦𝗛𝗢𝗣 」</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "<i>Buy these cards outright with real Telegram Stars.\n"
+        "Each card can only be bought once per account.</i>\n\n"
+    )
+    kb_list = []
+    for card_id, entry in catalog.items():
+        card_data = db["global_cards"].get(card_id)
+        if not card_data:
+            continue
+        rarity = format_rarity(card_data["rarity"])
+        price = entry.get("price", 0)
+        limit = entry.get("limit", 0)
+        sold = entry.get("sold", 0)
+
+        if card_id in bought:
+            text += f"✅ <b>{card_data['name']}</b> ({rarity}) — Owned\n"
+            continue
+
+        sold_out = limit > 0 and sold >= limit
+        stock_str = f" ({sold}/{limit} sold)" if limit > 0 else ""
+        if sold_out:
+            text += f"🚫 <b>{card_data['name']}</b> ({rarity}) — Sold Out{stock_str}\n"
+            kb_list.append([InlineKeyboardButton(text=f"Sold Out — {card_data['name']}", callback_data="noop", style=ButtonStyle.DANGER)])
+            continue
+
+        text += f"🃏 <b>{card_data['name']}</b> ({rarity}) ➜ {price} ⭐{stock_str}\n"
+        kb_list.append([InlineKeyboardButton(text=f"Buy {card_data['name']} — {price} ⭐", callback_data=f"buystar_{uid}_{card_id}", style=ButtonStyle.SUCCESS)])
+
+    if not catalog:
+        text += "\n<i>Nothing on sale right now — check back later!</i>\n"
+    text += "━━━━━━━━━━━━━━━━━"
+    kb_list.append([InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb_list)
+
+
+@main_router.message(Command("star_shop"))
+async def star_shop_cmd(message: Message):
+    """Standalone entry point — jumps straight into the Star Shop without
+    routing through /store first."""
+    uid = str(message.from_user.id)
+    db = ensure_user(uid, message.from_user.first_name, message.from_user.username)
+    text, kb = _build_star_shop_view(uid, db)
+    pic = db.get("settings", {}).get("pic_star_shop") or db.get("settings", {}).get("pic_store")
+    if pic:
+        await message.reply_photo(photo=pic, caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await message.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@main_router.callback_query(F.data.startswith("st_star_"))
+async def store_star_cb(cq: CallbackQuery):
+    uid = cq.data.split("_")[2]
+    if not await verify_user(cq, uid): return
+
+    db = ensure_user(uid, cq.from_user.first_name, cq.from_user.username)
+    text, kb = _build_star_shop_view(uid, db)
+
+    try:
+        if cq.message.photo:
+            await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await cq.answer()
+
+
+@main_router.callback_query(F.data.startswith("buystar_"))
+async def buy_star_invoice_cb(cq: CallbackQuery):
+    parts = cq.data.split("_")
+    uid, card_id = parts[1], parts[2]
+    if not await verify_user(cq, uid): return
+
+    db = ensure_user(uid, cq.from_user.first_name, cq.from_user.username)
+    catalog = _star_shop_catalog(db)
+    entry = catalog.get(card_id)
+    if not entry:
+        await cq.answer("This item is no longer for sale.", show_alert=True)
+        return
+    card_data = db["global_cards"].get(card_id)
+    if not card_data:
+        await cq.answer("This card no longer exists.", show_alert=True)
+        return
+    if card_id in _star_purchases(db["users"][uid]):
+        await cq.answer("You already own this Star Shop card!", show_alert=True)
+        return
+    limit = entry.get("limit", 0)
+    sold = entry.get("sold", 0)
+    if limit > 0 and sold >= limit:
+        await cq.answer("This card just sold out!", show_alert=True)
+        return
+
+    stars = entry["price"]
+    rarity = format_rarity(card_data["rarity"])
+
+    try:
+        await bot.send_invoice(
+            chat_id=cq.message.chat.id,
+            title=f"{card_data['name']} ({rarity})"[:32],
+            description=f"Unlock {card_data['name']} permanently — a one-time addition to your collection."[:255],
+            payload=f"starbuy_{uid}_{card_id}",
+            currency="XTR",
+            prices=[LabeledPrice(label=card_data["name"][:32], amount=stars)],
+            provider_token="",  # Telegram Stars payments always use an empty provider_token
+        )
+    except Exception as e:
+        dlog.error(f"[star_shop_invoice_CRASH] uid={uid} card={card_id}: {e}", exc_info=True)
+        await cq.answer("Couldn't open the payment sheet — please try again.", show_alert=True)
+        return
+    await cq.answer()
+
+
+@main_router.pre_checkout_query()
+async def star_shop_pre_checkout(pcq: PreCheckoutQuery):
+    """Telegram requires an answer within 10 seconds or the payment sheet
+    is cancelled client-side. Re-checks eligibility (including stock)
+    right before Telegram actually charges the user's Stars balance."""
+    payload = pcq.invoice_payload
+    if not payload.startswith("starbuy_"):
+        await pcq.answer(ok=False, error_message="Unknown order — please reopen the Star Shop.")
+        return
+    try:
+        _, uid, card_id = payload.split("_", 2)
+    except ValueError:
+        await pcq.answer(ok=False, error_message="Corrupted order — please reopen the Star Shop.")
+        return
+
+    db = load_db()
+    catalog = db.get("star_shop", {})
+    entry = catalog.get(card_id)
+    if not entry or card_id not in db.get("global_cards", {}):
+        await pcq.answer(ok=False, error_message="This card is no longer for sale.")
+        return
+    if card_id in db.get("users", {}).get(uid, {}).get("star_purchases", []):
+        await pcq.answer(ok=False, error_message="You already own this card.")
+        return
+    limit = entry.get("limit", 0)
+    if limit > 0 and entry.get("sold", 0) >= limit:
+        await pcq.answer(ok=False, error_message="This card just sold out.")
+        return
+
+    await pcq.answer(ok=True)
+
+
+@main_router.message(F.successful_payment)
+async def star_shop_payment_success(message: Message):
+    """Fires once Telegram confirms the Stars charge actually went through.
+    This is the only point where the card is granted — send_invoice and
+    pre_checkout only ever reserve the right to pay, never move Stars."""
+    sp = message.successful_payment
+    payload = sp.invoice_payload
+    if not payload.startswith("starbuy_"):
+        return
+    try:
+        _, uid, card_id = payload.split("_", 2)
+    except ValueError:
+        dlog.error(f"[star_shop_payment_CRASH] malformed payload={payload} charge_id={sp.telegram_payment_charge_id}")
+        return
+
+    # Locked per-CARD (not per-user) so a global stock limit can't be
+    # oversold by two different users paying for the last copy at once.
+    async with _get_lock(f"star_stock_{card_id}"):
+        db = ensure_user(uid, message.from_user.first_name, message.from_user.username)
+        user_data = db["users"][uid]
+        bought = _star_purchases(user_data)
+        catalog = _star_shop_catalog(db)
+        entry = catalog.get(card_id)
+        card_data = db["global_cards"].get(card_id)
+
+        async def _refund(reason: str):
+            try:
+                await bot.refund_star_payment(user_id=int(uid), telegram_payment_charge_id=sp.telegram_payment_charge_id)
+                note = "Your Stars were refunded."
+            except Exception as e:
+                dlog.error(f"[star_shop_refund_CRASH] uid={uid} card={card_id} charge_id={sp.telegram_payment_charge_id}: {e}", exc_info=True)
+                note = f"Refund failed automatically — contact support with order ID: {sp.telegram_payment_charge_id}"
+            await message.reply(f"⚠️ {reason} {note}")
+
+        if not card_data:
+            dlog.error(f"[star_shop_payment_CRASH] uid={uid} paid for missing card={card_id} charge_id={sp.telegram_payment_charge_id}")
+            await _refund("That card no longer exists.")
+            return
+        if not entry:
+            await _refund("That card was pulled from sale before your payment completed.")
+            return
+        if card_id in bought:
+            dlog.error(f"[star_shop_payment_DUPLICATE] uid={uid} card={card_id} charge_id={sp.telegram_payment_charge_id}")
+            await _refund("You already owned this card.")
+            return
+        limit = entry.get("limit", 0)
+        sold = entry.get("sold", 0)
+        if limit > 0 and sold >= limit:
+            await _refund("This card sold out right as your payment completed.")
+            return
+
+        my_cards = user_data.setdefault("cards", {})
+        if card_id not in my_cards:
+            my_cards[card_id] = {"name": card_data["name"], "rarity": card_data["rarity"], "amount": 0}
+        my_cards[card_id]["amount"] += 1
+        user_data["total_claimed"] = user_data.get("total_claimed", 0) + 1
+        bought.append(card_id)
+        user_data["stars_spent"] = user_data.get("stars_spent", 0) + sp.total_amount
+        entry["sold"] = sold + 1
+
+        save_db()
+        await config.flush_db_now()
+
+        rarity = format_rarity(card_data["rarity"])
+        log_action(db, uid, {
+            "type": "store_buy_star",
+            "card_name": card_data["name"],
+            "rarity": rarity,
+            "price": f"{sp.total_amount} ⭐",
+            "chat_id": message.chat.id,
+            "chat_title": message.chat.title or "Private Chat",
+        })
+
+    await message.reply(
+        f"<b>「 ⭐ STAR PURCHASE COMPLETE 」</b>\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"You now own <b>{card_data['name']}</b> ({rarity})!\n"
+        f"Paid: {sp.total_amount} ⭐",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ------------------------------------------
+# Admin catalog management: /astar, /rstar, /allstar
+# ------------------------------------------
+@main_router.message(Command("astar"))
+async def astar_cmd(message: Message, command: CommandObject):
+    if not _is_star_admin(message.from_user.id):
+        return
+    args = (command.args or "").strip()
+    parts = [p.strip() for p in args.split("|")]
+    if len(parts) != 3 or not all(parts):
+        await message.reply(
+            "Usage: <code>/astar card_id | price | limit</code>\n"
+            "<i>limit = 0 for unlimited stock.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    card_id, price_str, limit_str = parts
+
+    db = load_db()
+    if card_id not in db["global_cards"]:
+        await message.reply("⚠️ No card with that ID exists in global_cards.")
+        return
+    if not price_str.isdigit() or int(price_str) <= 0:
+        await message.reply("⚠️ Price must be a positive whole number of Stars.")
+        return
+    if not limit_str.isdigit():
+        await message.reply("⚠️ Limit must be a whole number (0 = unlimited).")
+        return
+
+    price = int(price_str)
+    limit = int(limit_str)
+    catalog = _star_shop_catalog(db)
+    existing_sold = catalog.get(card_id, {}).get("sold", 0)
+    catalog[card_id] = {"price": price, "limit": limit, "sold": existing_sold}
+    save_db()
+    await config.flush_db_now()
+
+    card_name = db["global_cards"][card_id]["name"]
+    limit_desc = "Unlimited" if limit == 0 else str(limit)
+    await message.reply(
+        f"✅ <b>{card_name}</b> is now on sale in the Star Shop.\n"
+        f"Price: {price} ⭐ | Stock limit: {limit_desc}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@main_router.message(Command("rstar"))
+async def rstar_cmd(message: Message, command: CommandObject):
+    if not _is_star_admin(message.from_user.id):
+        return
+    card_id = (command.args or "").strip()
+    if not card_id:
+        await message.reply("Usage: <code>/rstar card_id</code>", parse_mode=ParseMode.HTML)
+        return
+
+    db = load_db()
+    catalog = _star_shop_catalog(db)
+    if card_id not in catalog:
+        await message.reply("⚠️ That card isn't currently listed in the Star Shop.")
+        return
+
+    card_name = db["global_cards"].get(card_id, {}).get("name", card_id)
+    del catalog[card_id]
+    save_db()
+    await config.flush_db_now()
+    await message.reply(f"🗑️ <b>{card_name}</b> has been removed from the Star Shop.", parse_mode=ParseMode.HTML)
+
+
+@main_router.message(Command("allstar"))
+async def allstar_cmd(message: Message):
+    if not _is_star_admin(message.from_user.id):
+        return
+    db = load_db()
+    catalog = _star_shop_catalog(db)
+    if not catalog:
+        await message.reply("The Star Shop is currently empty.")
+        return
+
+    lines = ["<b>「 ⭐ STAR SHOP CATALOG 」</b>", "━━━━━━━━━━━━━━━━━"]
+    for card_id, entry in catalog.items():
+        card_data = db["global_cards"].get(card_id)
+        name = card_data["name"] if card_data else "⚠️ Missing card"
+        rarity = format_rarity(card_data["rarity"]) if card_data else "?"
+        price = entry.get("price", 0)
+        limit = entry.get("limit", 0)
+        sold = entry.get("sold", 0)
+        stock = f"{sold}/{limit}" if limit > 0 else f"{sold}/∞"
+        lines.append(f"🃏 <code>{card_id}</code> — <b>{name}</b> ({rarity})\n   {price} ⭐ | Sold: {stock}")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    await message.reply("\n".join(lines), parse_mode=ParseMode.HTML)
+
+# ==========================================
 # NEXUS MARKETPLACE (/store)
 # ==========================================
 @main_router.message(Command("store"))
@@ -123,6 +465,7 @@ async def store_cmd(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Online Store", callback_data=f"st_on_{uid}", style=ButtonStyle.PRIMARY)],
         [InlineKeyboardButton(text="🛍️ Manage Offline Store", callback_data=f"st_off_{uid}", style=ButtonStyle.PRIMARY)],
+        [InlineKeyboardButton(text="⭐ Star Shop", callback_data=f"st_star_{uid}", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="📋 All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")]
     ])
@@ -147,6 +490,7 @@ async def store_main_cb(cq: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Online Store", callback_data=f"st_on_{uid}", style=ButtonStyle.PRIMARY)],
         [InlineKeyboardButton(text="🛍️ Manage Offline Store", callback_data=f"st_off_{uid}", style=ButtonStyle.PRIMARY)],
+        [InlineKeyboardButton(text="⭐ Star Shop", callback_data=f"st_star_{uid}", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="📋 All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")]
     ])
