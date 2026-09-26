@@ -130,12 +130,7 @@ def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup
     bought = _star_purchases(user_data)
     catalog = _star_shop_catalog(db)
 
-    text = (
-        "<b>「 ⭐ 𝗦𝗧𝗔𝗥 𝗦𝗛𝗢𝗣 」</b>\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "<i>Buy these cards outright with real Telegram Stars.\n"
-        "Each card can only be bought once per account.</i>\n\n"
-    )
+    text = "「 ⭐ 𝗦𝗧𝗔𝗥 𝗦𝗛𝗢𝗣 」\n━━━━━━━━━━━━━━━━━\n"
     kb_list = []
     for card_id, entry in catalog.items():
         card_data = db["global_cards"].get(card_id)
@@ -145,24 +140,29 @@ def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup
         price = entry.get("price", 0)
         limit = entry.get("limit", 0)
         sold = entry.get("sold", 0)
+        label = f"<b>{card_data['name']} ({rarity}) :</b>"
 
         if card_id in bought:
-            text += f"✅ <b>{card_data['name']}</b> ({rarity}) — Owned\n"
+            text += f"{label} ✅ Owned\n"
             continue
 
         sold_out = limit > 0 and sold >= limit
         stock_str = f" ({sold}/{limit} sold)" if limit > 0 else ""
         if sold_out:
-            text += f"🚫 <b>{card_data['name']}</b> ({rarity}) — Sold Out{stock_str}\n"
+            text += f"{label} 🚫 Sold Out{stock_str}\n"
             kb_list.append([InlineKeyboardButton(text=f"Sold Out — {card_data['name']}", callback_data="noop", style=ButtonStyle.DANGER)])
             continue
 
-        text += f"🃏 <b>{card_data['name']}</b> ({rarity}) ➜ {price} ⭐{stock_str}\n"
+        text += f"{label} {price} ⭐{stock_str}\n"
         kb_list.append([InlineKeyboardButton(text=f"Buy {card_data['name']} — {price} ⭐", callback_data=f"buystar_{uid}_{card_id}", style=ButtonStyle.SUCCESS)])
 
     if not catalog:
-        text += "\n<i>Nothing on sale right now — check back later!</i>\n"
-    text += "━━━━━━━━━━━━━━━━━"
+        text += "<i>Nothing on sale right now — check back later!</i>\n"
+    text += (
+        "━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>Buy these cards outright with real Telegram Stars.\n"
+        "Each card can only be bought once per account.</blockquote>"
+    )
     kb_list.append([InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
     return text, InlineKeyboardMarkup(inline_keyboard=kb_list)
 
