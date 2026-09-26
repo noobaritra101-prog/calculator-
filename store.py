@@ -166,7 +166,6 @@ def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup
     )
     kb_list.append([InlineKeyboardButton(text="Custom Cards", callback_data=f"customcard_{uid}", style=ButtonStyle.PRIMARY)])
     kb_list.append([InlineKeyboardButton(text="Privacy Policy", callback_data=f"starpolicy_{uid}", style=ButtonStyle.PRIMARY)])
-    kb_list.append([InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
     return text, InlineKeyboardMarkup(inline_keyboard=kb_list)
 
 
@@ -208,9 +207,34 @@ async def star_shop_view_card_cb(cq: CallbackQuery):
 
 
 # ------------------------------------------
-# Custom Card commissions (DM-only request → notifies the owner)
+# Custom Card commissions (DM-only request → asks for character name +
+# series first, THEN notifies the owner with those details)
 # ------------------------------------------
 CUSTOM_CARD_OWNER_ID = 5716292610
+
+# uid -> True while we're waiting on their "Character Name, Series" reply.
+# Plain in-memory dict (same pattern as _action_locks above) since this only
+# needs to survive until their next message in the same runtime.
+_pending_custom_card: dict[str, bool] = {}
+
+@main_router.callback_query(F.data.startswith("customcard_cancel_"))
+async def custom_card_cancel_cb(cq: CallbackQuery):
+    uid = cq.data.split("_", 2)[2]
+    if not await verify_user(cq, uid): return
+
+    _pending_custom_card.pop(uid, None)
+
+    db = load_db()
+    text, kb = _build_star_shop_view(uid, db)
+    try:
+        if cq.message.photo:
+            await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await cq.answer("Cancelled.")
+
 
 @main_router.callback_query(F.data.startswith("customcard_"))
 async def custom_card_request_cb(cq: CallbackQuery):
@@ -221,7 +245,54 @@ async def custom_card_request_cb(cq: CallbackQuery):
         await cq.answer("⚠️ Custom Card requests only work in a private DM with the bot — message me directly to use this.", show_alert=True)
         return
 
-    user = cq.from_user
+    _pending_custom_card[uid] = True
+
+    prompt_text = (
+        "<b>「 🎨 CUSTOM CARD REQUEST 」</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Send me the <b>character name</b> and <b>series</b> you'd like made into a card, as a single message.\n\n"
+        "Format:\n<code>Character Name, Series Name</code>\n"
+        "<i>Example: Rem, Re:Zero</i>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>Your next message in this chat will be sent as your request.</blockquote>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data=f"customcard_cancel_{uid}", style=ButtonStyle.DANGER)]])
+
+    try:
+        if cq.message.photo:
+            await cq.message.edit_caption(caption=prompt_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(prompt_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await cq.answer()
+
+
+def _has_pending_custom_card(message: Message) -> bool:
+    return str(message.from_user.id) in _pending_custom_card
+
+
+@main_router.message(F.text, _has_pending_custom_card)
+async def custom_card_text_handler(message: Message):
+    """Catches the user's very next DM after they tap 🎨 Custom Cards and
+    forwards the character name + series to the owner. Only fires while
+    _pending_custom_card[uid] is set, so it never touches unrelated messages."""
+    uid = str(message.from_user.id)
+    _pending_custom_card.pop(uid, None)
+
+    raw = (message.text or "").strip()
+    if "," in raw:
+        char_name, _, series = raw.partition(",")
+        char_name = char_name.strip() or "—"
+        series = series.strip() or "—"
+    else:
+        char_name = raw or "—"
+        series = "Not specified"
+
+    safe_char = char_name.replace("<", "&lt;").replace(">", "&gt;")
+    safe_series = series.replace("<", "&lt;").replace(">", "&gt;")
+
+    user = message.from_user
     safe_name = str(user.first_name or "User").replace("<", "&lt;").replace(">", "&gt;")
     mention = f'<a href="tg://user?id={uid}">{safe_name}</a>'
     username_str = f"@{user.username}" if user.username else "—"
@@ -236,16 +307,19 @@ async def custom_card_request_cb(cq: CallbackQuery):
                 f"User ID: <code>{uid}</code>\n"
                 f"Username: {username_str}\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                "They tapped 🎨 Custom Cards in the Star Shop — DM them to discuss what they want made and the price."
+                f"Character: <b>{safe_char}</b>\n"
+                f"Series: <b>{safe_series}</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "DM them to discuss the price and delivery."
             ),
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
         dlog.error(f"[custom_card_request_CRASH] uid={uid}: {e}", exc_info=True)
-        await cq.answer("Couldn't send your request — please try again later.", show_alert=True)
+        await message.reply("⚠️ Couldn't send your request — please try again later.")
         return
 
-    await cq.answer("✅ Request sent! You'll be contacted directly to discuss your custom card.", show_alert=True)
+    await message.reply("✅ Request sent! You'll be contacted directly to discuss your custom card.")
 
 
 @main_router.callback_query(F.data.startswith("starpolicy_"))
