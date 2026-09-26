@@ -789,7 +789,7 @@ async def send_deck_page(message, db: dict, user_id: str, page=0, edit=False, mu
         card_name = cdata.get("name", "Unknown")
         card_amt = cdata.get("amount", 1)
         if cid in user_data.get("star_purchases", []):
-            card_name += " 🌟"
+            card_name += " (🌟)"
         
         if cid == special_card_id:
             text += f"✨ <b><i><code>{card_name}</code></i> - [{disp_rarity}]  ×{card_amt} </b>\n"
@@ -1166,7 +1166,7 @@ async def flex_cmd(message: Message, command: CommandObject):
 
     flex_name = matched_data.get('name', 'Card')
     if matched_cid in db["users"][user_id].get("star_purchases", []):
-        flex_name += " 🌟"
+        flex_name += " (🌟)"
 
     caption = (
         f"<i><b>Ooooh! Check out {mention}'s card!</b></i>\n\n"

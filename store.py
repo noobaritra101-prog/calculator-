@@ -148,13 +148,14 @@ def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup
 
         sold_out = limit > 0 and sold >= limit
         stock_str = f" ({sold}/{limit} sold)" if limit > 0 else ""
+        view_btn = InlineKeyboardButton(text=f"{card_data['name']}", callback_data=f"starview_{uid}_{card_id}")
         if sold_out:
             text += f"{label} 🚫 Sold Out{stock_str}\n"
-            kb_list.append([InlineKeyboardButton(text=f"Sold Out — {card_data['name']}", callback_data="noop", style=ButtonStyle.DANGER)])
+            kb_list.append([view_btn, InlineKeyboardButton(text="Sold Out", callback_data="noop", style=ButtonStyle.DANGER)])
             continue
 
         text += f"{label} {price} ⭐{stock_str}\n"
-        kb_list.append([InlineKeyboardButton(text=f"Buy {card_data['name']} — {price} ⭐", callback_data=f"buystar_{uid}_{card_id}", style=ButtonStyle.SUCCESS)])
+        kb_list.append([view_btn, InlineKeyboardButton(text=f"Buy — {price} Stars", callback_data=f"buystar_{uid}_{card_id}", style=ButtonStyle.SUCCESS)])
 
     if not catalog:
         text += "<i>Nothing on sale right now — check back later!</i>\n"
@@ -163,8 +164,121 @@ def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup
         "<blockquote>Buy these cards outright with real Telegram Stars.\n"
         "Each card can only be bought once per account.</blockquote>"
     )
+    kb_list.append([InlineKeyboardButton(text="Custom Cards", callback_data=f"customcard_{uid}", style=ButtonStyle.PRIMARY)])
+    kb_list.append([InlineKeyboardButton(text="Privacy Policy", callback_data=f"starpolicy_{uid}", style=ButtonStyle.SECONDARY)])
     kb_list.append([InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
     return text, InlineKeyboardMarkup(inline_keyboard=kb_list)
+
+
+@main_router.callback_query(F.data.startswith("starview_"))
+async def star_shop_view_card_cb(cq: CallbackQuery):
+    """Lets a player see the actual card art before buying — tapping a
+    card's 🖼️ button swaps the Star Shop text view for a photo preview."""
+    parts = cq.data.split("_")
+    uid, card_id = parts[1], parts[2]
+    if not await verify_user(cq, uid): return
+
+    db = load_db()
+    card_data = db["global_cards"].get(card_id)
+    if not card_data:
+        await cq.answer("This card no longer exists.", show_alert=True)
+        return
+
+    entry = db.get("star_shop", {}).get(card_id, {})
+    rarity = format_rarity(card_data["rarity"])
+    caption = (
+        "<b>「 🃏 CARD PREVIEW 」</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Name: <b>{card_data['name']}</b>\n"
+        f"Rarity: {rarity}\n"
+        f"Anime: {card_data.get('anime', 'Unknown')}\n"
+        f"Price: {entry.get('price', 0)} ⭐"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back to Star Shop", callback_data=f"st_star_{uid}", style=ButtonStyle.DANGER)]])
+
+    try:
+        if cq.message.photo:
+            await cq.message.edit_media(InputMediaPhoto(media=card_data["file_id"], caption=caption, parse_mode=ParseMode.HTML, has_spoiler=True), reply_markup=kb)
+        else:
+            await cq.message.delete()
+            await bot.send_photo(chat_id=cq.message.chat.id, photo=card_data["file_id"], caption=caption, reply_markup=kb, parse_mode=ParseMode.HTML, has_spoiler=True)
+    except Exception:
+        pass
+    await cq.answer()
+
+
+# ------------------------------------------
+# Custom Card commissions (DM-only request → notifies the owner)
+# ------------------------------------------
+CUSTOM_CARD_OWNER_ID = 5716292610
+
+@main_router.callback_query(F.data.startswith("customcard_"))
+async def custom_card_request_cb(cq: CallbackQuery):
+    uid = cq.data.split("_", 1)[1]
+    if not await verify_user(cq, uid): return
+
+    if cq.message.chat.type != "private":
+        await cq.answer("⚠️ Custom Card requests only work in a private DM with the bot — message me directly to use this.", show_alert=True)
+        return
+
+    user = cq.from_user
+    safe_name = str(user.first_name or "User").replace("<", "&lt;").replace(">", "&gt;")
+    mention = f'<a href="tg://user?id={uid}">{safe_name}</a>'
+    username_str = f"@{user.username}" if user.username else "—"
+
+    try:
+        await bot.send_message(
+            chat_id=CUSTOM_CARD_OWNER_ID,
+            text=(
+                "<b>「 🎨 CUSTOM CARD REQUEST 」</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"From: {mention}\n"
+                f"User ID: <code>{uid}</code>\n"
+                f"Username: {username_str}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "They tapped 🎨 Custom Cards in the Star Shop — DM them to discuss what they want made and the price."
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        dlog.error(f"[custom_card_request_CRASH] uid={uid}: {e}", exc_info=True)
+        await cq.answer("Couldn't send your request — please try again later.", show_alert=True)
+        return
+
+    await cq.answer("✅ Request sent! You'll be contacted directly to discuss your custom card.", show_alert=True)
+
+
+@main_router.callback_query(F.data.startswith("starpolicy_"))
+async def star_shop_policy_cb(cq: CallbackQuery):
+    uid = cq.data.split("_", 1)[1]
+    if not await verify_user(cq, uid): return
+
+    text = (
+        "<b>「 📜 STAR SHOP POLICY 」</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "<blockquote>"
+        "All Star Shop purchases are final.\n\n"
+        "Telegram Stars are a real payment method. Once a card has been "
+        "delivered to your account, it cannot be refunded, exchanged, or "
+        "reversed for any reason — including a change of mind, buying the "
+        "wrong card, or already owning it through other means.\n\n"
+        "Refunds are only issued automatically in rare technical cases — "
+        "for example if a listing sells out or is pulled from sale in the "
+        "instant between your payment and delivery.\n\n"
+        "By tapping Buy, you agree to these terms."
+        "</blockquote>\n"
+        "━━━━━━━━━━━━━━━━━"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back to Star Shop", callback_data=f"st_star_{uid}", style=ButtonStyle.DANGER)]])
+
+    try:
+        if cq.message.photo:
+            await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await cq.answer()
 
 
 @main_router.message(Command("star_shop"))
@@ -465,7 +579,6 @@ async def store_cmd(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Online Store", callback_data=f"st_on_{uid}", style=ButtonStyle.PRIMARY)],
         [InlineKeyboardButton(text="🛍️ Manage Offline Store", callback_data=f"st_off_{uid}", style=ButtonStyle.PRIMARY)],
-        [InlineKeyboardButton(text="⭐ Star Shop", callback_data=f"st_star_{uid}", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="📋 All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")]
     ])
@@ -490,7 +603,6 @@ async def store_main_cb(cq: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Online Store", callback_data=f"st_on_{uid}", style=ButtonStyle.PRIMARY)],
         [InlineKeyboardButton(text="🛍️ Manage Offline Store", callback_data=f"st_off_{uid}", style=ButtonStyle.PRIMARY)],
-        [InlineKeyboardButton(text="⭐ Star Shop", callback_data=f"st_star_{uid}", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="📋 All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")]
     ])
