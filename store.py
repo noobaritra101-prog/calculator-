@@ -165,7 +165,7 @@ def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup
         "Each card can only be bought once per account.</blockquote>"
     )
     kb_list.append([InlineKeyboardButton(text="Custom Cards", callback_data=f"customcard_{uid}", style=ButtonStyle.PRIMARY)])
-    kb_list.append([InlineKeyboardButton(text="Privacy Policy", callback_data=f"starpolicy_{uid}", style=ButtonStyle.SECONDARY)])
+    kb_list.append([InlineKeyboardButton(text="Privacy Policy", callback_data=f"starpolicy_{uid}", style=ButtonStyle.PRIMARY)])
     kb_list.append([InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
     return text, InlineKeyboardMarkup(inline_keyboard=kb_list)
 
