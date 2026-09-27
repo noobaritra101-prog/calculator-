@@ -783,12 +783,14 @@ async def star_give_cmd(message: Message, command: CommandObject):
     )
 
     try:
+        listed_price = entry.get("price", 0) if entry is not None else 0
         await bot.send_message(
             chat_id=int(target_uid),
             text=(
-                "<b>「 🎁 GIFT RECEIVED 」</b>\n"
+                "<b>「 ⭐ STAR PURCHASE COMPLETE 」</b>\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                f"You've been gifted <b>{card_data['name']}</b> ({rarity}) from the Star Shop!"
+                f"You now own <b>{card_data['name']}</b> ({rarity})!\n"
+                f"Paid: {listed_price} ⭐"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -915,19 +917,6 @@ async def star_remove_cmd(message: Message, command: CommandObject):
         f"🗑️ Removed <b>{card_name}</b> from user <code>{target_uid}</code>'s Star Shop purchases.",
         parse_mode=ParseMode.HTML
     )
-
-    try:
-        await bot.send_message(
-            chat_id=int(target_uid),
-            text=(
-                "<b>「 ⚠️ CARD REMOVED 」</b>\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"<b>{card_name}</b> was removed from your collection by an admin."
-            ),
-            parse_mode=ParseMode.HTML
-        )
-    except Exception:
-        pass
 
 # ==========================================
 # NEXUS MARKETPLACE (/store)
