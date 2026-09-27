@@ -142,6 +142,11 @@ def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup
         sold = entry.get("sold", 0)
         label = f"<b>{card_data['name']} ({rarity}) :</b>"
 
+        # /sale on stashes the pre-discount price here; its presence is what
+        # drives the strikethrough display below (and what /sale off restores).
+        original_price = entry.get("original_price")
+        price_str = f"<s>{original_price} ⭐</s> {price} ⭐" if original_price is not None else f"{price} ⭐"
+
         if card_id in bought:
             text += f"{label} ✅ Owned\n"
             continue
@@ -154,7 +159,7 @@ def _build_star_shop_view(uid: str, db: dict) -> tuple[str, InlineKeyboardMarkup
             kb_list.append([view_btn, InlineKeyboardButton(text="Sold Out", callback_data="noop", style=ButtonStyle.DANGER)])
             continue
 
-        text += f"{label} {price} ⭐{stock_str}\n"
+        text += f"{label} {price_str}{stock_str}\n"
         kb_list.append([view_btn, InlineKeyboardButton(text=f"Buy — {price} Stars", callback_data=f"buystar_{uid}_{card_id}", style=ButtonStyle.SUCCESS)])
 
     if not catalog:
@@ -185,13 +190,18 @@ async def star_shop_view_card_cb(cq: CallbackQuery):
 
     entry = db.get("star_shop", {}).get(card_id, {})
     rarity = format_rarity(card_data["rarity"])
+    original_price = entry.get("original_price")
+    price_line = (
+        f"<s>{original_price} ⭐</s> {entry.get('price', 0)} ⭐"
+        if original_price is not None else f"{entry.get('price', 0)} ⭐"
+    )
     caption = (
         "<b>「 🃏 CARD PREVIEW 」</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"Name: <b>{card_data['name']}</b>\n"
         f"Rarity: {rarity}\n"
         f"Anime: {card_data.get('anime', 'Unknown')}\n"
-        f"Price: {entry.get('price', 0)} ⭐"
+        f"Price: {price_line}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back to Star Shop", callback_data=f"st_star_{uid}", style=ButtonStyle.DANGER)]])
 
@@ -633,9 +643,291 @@ async def allstar_cmd(message: Message):
         limit = entry.get("limit", 0)
         sold = entry.get("sold", 0)
         stock = f"{sold}/{limit}" if limit > 0 else f"{sold}/∞"
-        lines.append(f"🃏 <code>{card_id}</code> — <b>{name}</b> ({rarity})\n   {price} ⭐ | Sold: {stock}")
+        original_price = entry.get("original_price")
+        price_str = f"<s>{original_price} ⭐</s> {price} ⭐ 🏷️" if original_price is not None else f"{price} ⭐"
+        lines.append(f"🃏 <code>{card_id}</code> — <b>{name}</b> ({rarity})\n   {price_str} | Sold: {stock}")
     lines.append("━━━━━━━━━━━━━━━━━")
     await message.reply("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ------------------------------------------
+# Admin: /sale on|off — put a Star Shop card on sale at a discounted
+# price (strikethrough shown for the old price), or take it off sale to
+# restore the original price. The original price is stashed in
+# entry["original_price"] while a sale is active; /sale off pops it back
+# out, so re-running /sale on with a different price mid-sale never loses
+# the true original.
+# ------------------------------------------
+@main_router.message(Command("sale"))
+async def sale_cmd(message: Message, command: CommandObject):
+    if not _is_star_admin(message.from_user.id):
+        return
+    args = (command.args or "").strip()
+    parts = [p.strip() for p in args.split("|")]
+
+    usage = (
+        "Usage:\n"
+        "<code>/sale on | card_id | new_price</code>\n"
+        "<code>/sale off | card_id</code>"
+    )
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        await message.reply(usage, parse_mode=ParseMode.HTML)
+        return
+
+    mode = parts[0].lower()
+    card_id = parts[1]
+
+    db = load_db()
+    catalog = _star_shop_catalog(db)
+    if card_id not in catalog:
+        await message.reply("⚠️ That card isn't currently listed in the Star Shop. Add it with /astar first.")
+        return
+    entry = catalog[card_id]
+    card_name = db["global_cards"].get(card_id, {}).get("name", card_id)
+
+    if mode == "on":
+        if len(parts) != 3 or not parts[2]:
+            await message.reply("Usage: <code>/sale on | card_id | new_price</code>", parse_mode=ParseMode.HTML)
+            return
+        price_str = parts[2]
+        if not price_str.isdigit() or int(price_str) <= 0:
+            await message.reply("⚠️ New price must be a positive whole number of Stars.")
+            return
+        new_price = int(price_str)
+
+        if "original_price" not in entry:
+            entry["original_price"] = entry.get("price", 0)
+        entry["price"] = new_price
+        save_db()
+        await config.flush_db_now()
+        await message.reply(
+            f"🏷️ <b>{card_name}</b> is now on sale: "
+            f"<s>{entry['original_price']} ⭐</s> → <b>{new_price} ⭐</b>",
+            parse_mode=ParseMode.HTML
+        )
+
+    elif mode == "off":
+        if "original_price" not in entry:
+            await message.reply(f"⚠️ <b>{card_name}</b> isn't currently on sale.", parse_mode=ParseMode.HTML)
+            return
+        restored = entry.pop("original_price")
+        entry["price"] = restored
+        save_db()
+        await config.flush_db_now()
+        await message.reply(f"✅ <b>{card_name}</b> price restored to {restored} ⭐.", parse_mode=ParseMode.HTML)
+
+    else:
+        await message.reply(usage, parse_mode=ParseMode.HTML)
+
+
+# ------------------------------------------
+# Admin: /star_give — grant a Star Shop card to a user for free, bypassing
+# payment entirely. Mirrors what star_shop_payment_success does on a real
+# purchase (add to cards, mark owned in star_purchases, bump sold/
+# total_claimed), just without touching stars_spent or requiring an
+# invoice. Works even if the card has since been pulled from sale
+# (/rstar) — it just won't bump a "sold" counter that no longer exists.
+# ------------------------------------------
+@main_router.message(Command("star_give"))
+async def star_give_cmd(message: Message, command: CommandObject):
+    if not _is_star_admin(message.from_user.id):
+        return
+    args = (command.args or "").strip()
+    parts = [p.strip() for p in args.split("|")]
+    if len(parts) != 2 or not all(parts):
+        await message.reply("Usage: <code>/star_give uid | card_id</code>", parse_mode=ParseMode.HTML)
+        return
+    target_uid, card_id = parts
+
+    db = ensure_user(target_uid, "User", None)
+    card_data = db["global_cards"].get(card_id)
+    if not card_data:
+        await message.reply("⚠️ No card with that ID exists in global_cards.")
+        return
+
+    user_data = db["users"][target_uid]
+    bought = _star_purchases(user_data)
+    if card_id in bought:
+        await message.reply(f"⚠️ That user already owns <b>{card_data['name']}</b>.", parse_mode=ParseMode.HTML)
+        return
+
+    async with _get_lock(f"star_stock_{card_id}"):
+        catalog = _star_shop_catalog(db)
+        entry = catalog.get(card_id)
+
+        my_cards = user_data.setdefault("cards", {})
+        if card_id not in my_cards:
+            my_cards[card_id] = {"name": card_data["name"], "rarity": card_data["rarity"], "amount": 0}
+        my_cards[card_id]["amount"] += 1
+        user_data["total_claimed"] = user_data.get("total_claimed", 0) + 1
+        bought.append(card_id)
+        if entry is not None:
+            entry["sold"] = entry.get("sold", 0) + 1
+
+        save_db()
+        await config.flush_db_now()
+
+    rarity = format_rarity(card_data["rarity"])
+    log_action(db, target_uid, {
+        "type": "store_buy_star",
+        "card_name": card_data["name"],
+        "rarity": rarity,
+        "price": "Gifted by admin",
+        "chat_id": message.chat.id,
+        "chat_title": message.chat.title or "Private Chat",
+    })
+
+    await message.reply(
+        f"🎁 Gave <b>{card_data['name']}</b> ({rarity}) to user <code>{target_uid}</code> for free.",
+        parse_mode=ParseMode.HTML
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=int(target_uid),
+            text=(
+                "<b>「 🎁 GIFT RECEIVED 」</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"You've been gifted <b>{card_data['name']}</b> ({rarity}) from the Star Shop!"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+# ------------------------------------------
+# Admin: /star_cards — lists every Star Shop card (whether still on sale
+# or pulled via /rstar) together with who currently owns it. Owners are
+# read straight off each user's star_purchases, so this stays accurate
+# even for cards handed out with /star_give (no separate "gifted" list
+# to keep in sync).
+# ------------------------------------------
+@main_router.message(Command("star_cards"))
+async def star_cards_cmd(message: Message):
+    if not _is_star_admin(message.from_user.id):
+        return
+    db = load_db()
+    catalog = _star_shop_catalog(db)
+
+    all_card_ids = set(catalog.keys())
+    for udata in db.get("users", {}).values():
+        all_card_ids.update(udata.get("star_purchases", []))
+
+    if not all_card_ids:
+        await message.reply("No Star Shop cards have been listed or owned yet.")
+        return
+
+    owners_by_card: dict[str, list[str]] = {cid: [] for cid in all_card_ids}
+    for uid, udata in db.get("users", {}).items():
+        for cid in udata.get("star_purchases", []):
+            if cid in owners_by_card:
+                safe_name = str(udata.get("name", "Unknown")).replace("<", "&lt;").replace(">", "&gt;")
+                owners_by_card[cid].append(f"{safe_name} [{uid}]")
+
+    lines = ["<b>「 ⭐ STAR SHOP — CARDS & OWNERS 」</b>", "━━━━━━━━━━━━━━━━━"]
+    for card_id in sorted(all_card_ids):
+        card_data = db["global_cards"].get(card_id)
+        name = card_data["name"] if card_data else "⚠️ Missing card"
+        rarity = format_rarity(card_data["rarity"]) if card_data else "?"
+        in_catalog = " (off sale)" if card_id not in catalog else ""
+        lines.append(f"🃏 <code>{card_id}</code> — <b>{name}</b> ({rarity}){in_catalog}")
+        owners = owners_by_card.get(card_id, [])
+        if owners:
+            for o in owners:
+                lines.append(f"   👤 {o}")
+        else:
+            lines.append("   <i>No owners yet</i>")
+    lines.append("━━━━━━━━━━━━━━━━━")
+
+    # Chunk into multiple messages if the catalog is big enough to blow
+    # past Telegram's ~4096 char message limit.
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3800:
+            await message.reply(chunk, parse_mode=ParseMode.HTML)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await message.reply(chunk, parse_mode=ParseMode.HTML)
+
+
+# ------------------------------------------
+# Admin: /star_remove — undo a Star Shop ownership (whether it came from
+# a real purchase or /star_give). Mirrors star_give_cmd in reverse: pulls
+# the card out of star_purchases and out of the user's collection, and
+# backs off the catalog's "sold" counter if the card is still listed.
+# ------------------------------------------
+@main_router.message(Command("star_remove"))
+async def star_remove_cmd(message: Message, command: CommandObject):
+    if not _is_star_admin(message.from_user.id):
+        return
+    args = (command.args or "").strip()
+    parts = [p.strip() for p in args.split("|")]
+    if len(parts) != 2 or not all(parts):
+        await message.reply("Usage: <code>/star_remove userid | card_id</code>", parse_mode=ParseMode.HTML)
+        return
+    target_uid, card_id = parts
+
+    db = load_db()
+    if target_uid not in db.get("users", {}):
+        await message.reply("⚠️ No such user on record.")
+        return
+    card_data = db["global_cards"].get(card_id)
+    card_name = card_data["name"] if card_data else card_id
+
+    user_data = db["users"][target_uid]
+    bought = _star_purchases(user_data)
+    if card_id not in bought:
+        await message.reply(f"⚠️ That user doesn't own <b>{card_name}</b> from the Star Shop.", parse_mode=ParseMode.HTML)
+        return
+
+    async with _get_lock(f"star_stock_{card_id}"):
+        bought.remove(card_id)
+
+        my_cards = user_data.get("cards", {})
+        if card_id in my_cards:
+            my_cards[card_id]["amount"] -= 1
+            if my_cards[card_id]["amount"] <= 0:
+                del my_cards[card_id]
+
+        user_data["total_claimed"] = max(0, user_data.get("total_claimed", 0) - 1)
+
+        catalog = _star_shop_catalog(db)
+        entry = catalog.get(card_id)
+        if entry is not None:
+            entry["sold"] = max(0, entry.get("sold", 0) - 1)
+
+        save_db()
+        await config.flush_db_now()
+
+    if card_data:
+        rarity = format_rarity(card_data["rarity"])
+        log_action(db, target_uid, {
+            "type": "store_remove_star",
+            "card_name": card_data["name"],
+            "rarity": rarity,
+            "price": "Removed by admin",
+            "chat_id": message.chat.id,
+            "chat_title": message.chat.title or "Private Chat",
+        })
+
+    await message.reply(
+        f"🗑️ Removed <b>{card_name}</b> from user <code>{target_uid}</code>'s Star Shop purchases.",
+        parse_mode=ParseMode.HTML
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=int(target_uid),
+            text=(
+                "<b>「 ⚠️ CARD REMOVED 」</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"<b>{card_name}</b> was removed from your collection by an admin."
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
 
 # ==========================================
 # NEXUS MARKETPLACE (/store)

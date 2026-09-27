@@ -2079,7 +2079,7 @@ def build_help_text() -> str:
         "➷ /throw\n〻 Play basketball for 10 tries!\n\n"
         "➷ /burn [Name]\n〻 Burn a card for quick Shards!\n\n"
         "➷ /referral\n〻 View your referral status and link!\n\n"
-        "➷ /redeem [Code]\n〻 Redeem active promotional codes!\n\n"
+        "➷ /redeem [Code]\n〻 Redeem active promotional codes! (DM only, must join our channel)\n\n"
         "➷ /mybanners\n〻 Browse your owned banners &amp; pick one as your profile's current banner!\n\n"
         "━━━━━━━━━━━━━━━━━\n"
         "々 Cards randomly appear in chats\n"
@@ -2362,6 +2362,21 @@ async def referral_cmd(message: Message):
 # ==========================================
 # PROMOTIONAL CODES ENGINE (/redeem)
 # ==========================================
+FORCE_JOIN_CHANNEL = "@animenx_news"
+FORCE_JOIN_LINK    = "https://t.me/animenx_news"
+
+async def _redeem_channel_joined(uid_int: int) -> bool:
+    """True if the user has joined the mandatory promo channel. Fails
+    closed on lookup errors (e.g. the bot losing admin rights in the
+    channel, or Telegram rate-limiting the check) so a broken check
+    can't silently let redemptions through unverified."""
+    try:
+        member = await bot.get_chat_member(FORCE_JOIN_CHANNEL, uid_int)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return False
+    return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
+
+
 @main_router.message(Command("redeem"))
 async def redeem_promo_cmd(message: Message, command: CommandObject):
     uid_int = message.from_user.id
@@ -2376,6 +2391,34 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
             await message.reply(text, **kwargs)
         except (TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest):
             pass
+
+    # /redeem is DM-only — mirrors the /data command's chat-type gate.
+    if message.chat.type != ChatType.PRIVATE:
+        bot_info = await bot.get_me()
+        dm_link = f"https://t.me/{bot_info.username}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Come here", url=dm_link)]
+        ])
+        await safe_reply(
+            "🔒 Promo codes can only be redeemed in the bot's DM.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
+        )
+        return
+
+    # Mandatory channel join gate — checked before anything else so an
+    # unjoined user never learns whether their code was even valid.
+    if not await _redeem_channel_joined(uid_int):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Join Channel", url=FORCE_JOIN_LINK)]
+        ])
+        await safe_reply(
+            "🔒 <b>Join our channel to redeem promo codes!</b>\n"
+            f"Join {FORCE_JOIN_LINK}, then send your <code>/redeem</code> command again.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb
+        )
+        return
 
     if not command.args:
         await safe_reply("<b>Usage:</b> <code>/redeem &lt;CODE&gt;</code>\nExample: <code>/redeem SUMMERSHARDS</code>", parse_mode=ParseMode.HTML)
