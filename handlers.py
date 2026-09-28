@@ -43,8 +43,8 @@ ACTION_COOLDOWN_SECS = 8
 
 # # Gifting limit configuration
 GIFT_COOLDOWN = 300           # 5-minute cooldown between gifts for regular users
-DAILY_GIFT_SEND_LIMIT = 3     # Maximum cards a user can send per day
-DAILY_GIFT_RECEIVE_LIMIT = 3  # Maximum cards a user can receive per day
+DAILY_GIFT_SEND_LIMIT = 4     # Maximum cards a user can send per day
+DAILY_GIFT_RECEIVE_LIMIT = 4  # Maximum cards a user can receive per day
 _gift_cooldowns: dict[str, float] = {}
 
 # Shards transfer cooldown tracking
@@ -942,6 +942,24 @@ async def seize_cmd(message: Message, command: CommandObject):
     cid_str = str(chat_id)
 
     if cid_str not in active_drops: return
+
+    # Channel lock — checked before the guess is evaluated, so an unjoined
+    # user learns nothing about the answer and the drop stays claimable.
+    if not await _seize_channel_joined(uid_int):
+        join_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Join Channel", url=FORCE_JOIN_LINK)]
+        ])
+        try:
+            await message.reply(
+                "🔒 <b>You must join our channel to use /seize!</b>\n"
+                "Tap the button below to join, then retry after joining.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=join_kb
+            )
+        except (TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest):
+            pass
+        return
+
     if not command.args:
         await message.reply("Provide the character name!\nFormat: <code>/seize</code> [name]", parse_mode=ParseMode.HTML)
         return
@@ -2079,7 +2097,7 @@ def build_help_text() -> str:
         "➷ /throw\n〻 Play basketball for 10 tries!\n\n"
         "➷ /burn [Name]\n〻 Burn a card for quick Shards!\n\n"
         "➷ /referral\n〻 View your referral status and link!\n\n"
-        "➷ /redeem [Code]\n〻 Redeem active promotional codes! (DM only, must join our channel)\n\n"
+        "➷ /redeem [Code]\n〻 Redeem active promotional codes! (must join our channel)\n\n"
         "➷ /mybanners\n〻 Browse your owned banners &amp; pick one as your profile's current banner!\n\n"
         "━━━━━━━━━━━━━━━━━\n"
         "々 Cards randomly appear in chats\n"
@@ -2377,6 +2395,34 @@ async def _redeem_channel_joined(uid_int: int) -> bool:
     return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
 
 
+# /seize channel lock. A busy group can fire /seize many times per drop, so
+# a positive result is cached briefly instead of calling get_chat_member on
+# every guess. Only "joined" is cached — someone who hasn't joined is
+# re-checked every time, so they're let through the moment they join.
+_SEIZE_JOIN_CACHE_TTL = 600  # seconds
+_seize_join_cache: dict[int, float] = {}
+
+async def _seize_channel_joined(uid_int: int) -> bool:
+    """Channel check for /seize. Unlike /redeem this FAILS OPEN on lookup
+    errors (bot lost admin in the channel, rate limit, network hiccup):
+    a broken check here would otherwise stop every player in every group
+    from claiming drops. Only a confirmed 'left'/'kicked' blocks."""
+    now = time.time()
+    exp = _seize_join_cache.get(uid_int)
+    if exp and exp > now:
+        return True
+    try:
+        member = await bot.get_chat_member(FORCE_JOIN_CHANNEL, uid_int)
+    except Exception:
+        return True
+    joined = member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
+    if joined:
+        if len(_seize_join_cache) > 5000:
+            _seize_join_cache.clear()
+        _seize_join_cache[uid_int] = now + _SEIZE_JOIN_CACHE_TTL
+    return joined
+
+
 @main_router.message(Command("redeem"))
 async def redeem_promo_cmd(message: Message, command: CommandObject):
     uid_int = message.from_user.id
@@ -2392,20 +2438,7 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
         except (TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest):
             pass
 
-    # /redeem is DM-only — mirrors the /data command's chat-type gate.
-    if message.chat.type != ChatType.PRIVATE:
-        bot_info = await bot.get_me()
-        dm_link = f"https://t.me/{bot_info.username}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Come here", url=dm_link)]
-        ])
-        await safe_reply(
-            "🔒 Promo codes can only be redeemed in the bot's DM.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb
-        )
-        return
-
+    # Works in DMs and groups; the channel join gate below applies everywhere.
     # Mandatory channel join gate — checked before anything else so an
     # unjoined user never learns whether their code was even valid.
     if not await _redeem_channel_joined(uid_int):

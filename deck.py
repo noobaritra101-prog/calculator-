@@ -274,6 +274,20 @@ async def claim_ad_reward(user_id: str):
 _file_url_cache: dict[str, tuple[str, float]] = {}  # file_id -> (url, resolved_at)
 _FILE_URL_TTL_SECONDS = 45 * 60  # 45 min, safely under Telegram's ~1hr guarantee
 
+# Burn payouts (Shards per card) — single source of truth for /burn, the
+# confirmation screen and the Web App burn API.
+BURN_PAYOUT_BASIC  = 200
+BURN_PAYOUT_ELITE  = 600
+BURN_PAYOUT_DIVINE = 3500
+
+def get_burn_payout(rarity_normalized: str) -> int:
+    if rarity_normalized == "Elite ⚓":
+        return BURN_PAYOUT_ELITE
+    if rarity_normalized == "Divine ❄️":
+        return BURN_PAYOUT_DIVINE
+    return BURN_PAYOUT_BASIC
+
+
 class BurnRequest(BaseModel):
     user_id: str
     card_id: str
@@ -489,9 +503,7 @@ async def api_burn_card(req: BurnRequest):
         card_data = user_cards[req.card_id]
         rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
 
-        burn_payout = 150
-        if rarity_normalized == "Elite ⚓": burn_payout = 450
-        elif rarity_normalized == "Divine ❄️": burn_payout = 1800
+        burn_payout = get_burn_payout(rarity_normalized)
 
         user_cards[req.card_id]["amount"] -= 1
         if user_cards[req.card_id]["amount"] <= 0:
@@ -1235,9 +1247,7 @@ async def burn_cmd(message: Message, command: CommandObject):
     global_data       = db["global_cards"].get(matched_cid, {})
     rarity_normalized = format_rarity(matched_data.get("rarity", "Common"))
 
-    burn_payout = 150
-    if rarity_normalized == "Elite ⚓":   burn_payout = 450
-    elif rarity_normalized == "Divine ❄️": burn_payout = 1800
+    burn_payout = get_burn_payout(rarity_normalized)
 
     caption = (
         f"<b>「 🔥 BURN CONFIRMATION 」</b>\n"
@@ -1281,9 +1291,7 @@ async def confirm_burn_cb(cq: CallbackQuery):
     card_data = my_cards[card_id]
     rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
 
-    burn_payout = 150
-    if rarity_normalized == "Elite ⚓":   burn_payout = 450
-    elif rarity_normalized == "Divine ❄️": burn_payout = 1800
+    burn_payout = get_burn_payout(rarity_normalized)
 
     my_cards[card_id]["amount"] -= 1
     if my_cards[card_id]["amount"] <= 0:
