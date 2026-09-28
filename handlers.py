@@ -3109,12 +3109,10 @@ async def who_owns_cb(cq: CallbackQuery):
     # list that never rendered. Text messages allow up to 4096 chars, so
     # paginate defensively at a much higher owner count instead.
     OWNERS_PER_MSG = 80
-    # Names and amounts only — user IDs stay private so this can't be used to
-    # target owners. Admins still see IDs for moderation.
+    # Names and amounts only — user IDs are never shown, to anyone.
     from html import escape as _esc
-    is_admin_viewer = cq.from_user.id in ADMIN_IDS
     owner_lines_all = [
-        (f"{_esc(str(name))} ({uid}) - {amount}" if is_admin_viewer else f"{_esc(str(name))} - {amount}")
+        f"{_esc(str(name))} - {amount}"
         for uid, name, amount in owners
     ]
 
