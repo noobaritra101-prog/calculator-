@@ -947,7 +947,7 @@ async def seize_cmd(message: Message, command: CommandObject):
     # user learns nothing about the answer and the drop stays claimable.
     if not await _seize_channel_joined(uid_int):
         join_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Join Channel", url=FORCE_JOIN_LINK)]
+            [InlineKeyboardButton(text="Join Channel", url=FORCE_JOIN_LINK)]
         ])
         try:
             await message.reply(
@@ -2443,11 +2443,12 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
     # unjoined user never learns whether their code was even valid.
     if not await _redeem_channel_joined(uid_int):
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Join Channel", url=FORCE_JOIN_LINK)]
+            [InlineKeyboardButton(text="Join Channel", url=FORCE_JOIN_LINK)]
         ])
         await safe_reply(
-            "🔒 <b>Join our channel to redeem promo codes!</b>\n"
-            f"Join {FORCE_JOIN_LINK}, then send your <code>/redeem</code> command again.",
+            "<b>▸ Join our channel to redeem promo codes!</b>\n\n"
+            "<b>↳ Join :</b> t.me/animenx_news\n\n"
+            "<b>↻ Then send your /redeem command again.</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb
         )
@@ -2609,7 +2610,10 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
 # ==========================================
 # CARD LOOKUP + OWNERSHIP SEARCH (/search)
 # ==========================================
-WHOOWNS_COST = 200
+WHOOWNS_COST = 200            # price when you own the card yourself
+WHOOWNS_COST_UNOWNED = 400    # price when you don't own it
+SEARCH_COOLDOWN_SECS = 5      # per-user /search cooldown (admins exempt)
+_search_cooldowns: dict[int, float] = {}
 
 
 def _find_owned_card(db: dict, user_id: str, query: str):
@@ -2650,15 +2654,64 @@ def _get_owners(db: dict, card_id: str):
     return owners
 
 
-def _build_card_lookup_caption(global_card: dict) -> str:
+def _build_card_lookup_caption(global_card: dict, owned_amount=None) -> str:
+    """owned_amount: None = no status line (used by the owner-list header),
+    0 = not owned, N>0 = owned N copies."""
     display_rarity = format_rarity(global_card["rarity"])
+    status_line = ""
+    if owned_amount is not None:
+        status = f"Owned ×{owned_amount}" if owned_amount > 0 else "Not owned"
+        status_line = f"⦿ <i>Status</i> » {status}\n"
     return (
         "<b>「 Card Lookup 🔍 」\n"
         "<blockquote>╺╺╺╺╺╺╺╺╺╺╺╺╺╺╺</blockquote>\n"
         f"⦿ <i>Character </i>» {global_card['name']} ⟪ {global_card['anime']} ⟫\n"
         f"⦾ <i>Rarity</i> » {display_rarity}\n"
+        f"{status_line}"
         "<blockquote>╺╺╺╺╺╺╺╺╺╺╺╺╺╺╺</blockquote></b>"
     )
+
+
+def _user_owned_amount(db: dict, user_id: str, card_id: str) -> int:
+    entry = db.get("users", {}).get(user_id, {}).get("cards", {}).get(card_id)
+    if not isinstance(entry, dict):
+        return 0
+    try:
+        return max(0, int(entry.get("amount", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _find_search_card(db: dict, user_id: str, query: str):
+    """Fuzzy-matches a query against the WHOLE card pool. Cards in hidden or
+    locked series are only findable by people who already own them, so
+    unreleased art can't be pulled out through /search. When two cards score
+    the same, the one the user owns wins."""
+    query = query.lower().strip()
+    settings = db.get("settings", {})
+    blocked = {a.lower().strip() for a in settings.get("hidden_animes", [])}
+    blocked |= {a.lower().strip() for a in settings.get("locked_animes", [])}
+
+    best_cid, best_score, best_owned = None, 0.0, False
+    for cid, cdata in db.get("global_cards", {}).items():
+        owned = _user_owned_amount(db, user_id, cid) > 0
+        if not owned and str(cdata.get("anime", "")).lower().strip() in blocked:
+            continue
+        name_lower = str(cdata.get("name", "")).lower()
+        if not name_lower:
+            continue
+        if query == name_lower:
+            score = 2.0
+        elif query in name_lower:
+            score = 0.8 + (len(query) / len(name_lower)) * 0.1
+        else:
+            ratio = difflib.SequenceMatcher(None, query, name_lower).ratio()
+            if ratio <= 0.6:
+                continue
+            score = ratio
+        if score > best_score or (score == best_score and owned and not best_owned):
+            best_cid, best_score, best_owned = cid, score, owned
+    return best_cid
 
 
 @main_router.message(Command("search"))
@@ -2670,34 +2723,51 @@ async def search_card_cmd(message: Message, command: CommandObject):
         await message.reply("<b>Usage:</b> <code>/search &lt;card name&gt;</code>\nExample: <code>/search Makima</code>", parse_mode=ParseMode.HTML)
         return
 
+    # Cooldown — this fuzzy-matches the whole card pool, so keep it from being spammed.
+    now = time.time()
+    if uid_int not in ADMIN_IDS:
+        wait = SEARCH_COOLDOWN_SECS - (now - _search_cooldowns.get(uid_int, 0))
+        if wait > 0:
+            await message.reply(f"Please wait {int(wait) + 1}s before searching again.", parse_mode=ParseMode.HTML)
+            return
+        if len(_search_cooldowns) > 5000:
+            _search_cooldowns.clear()
+        _search_cooldowns[uid_int] = now
+
     user_id = str(uid_int)
     db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
 
-    if not db["users"].get(user_id, {}).get("cards"):
-        await message.reply("You don't own any cards yet. Collect some first!", parse_mode=ParseMode.HTML)
-        return
-
-    card_id = _find_owned_card(db, user_id, command.args)
+    card_id = _find_search_card(db, user_id, command.args)
     if not card_id:
-        await message.reply(f"You don't own any card matching <b>{command.args}</b>.", parse_mode=ParseMode.HTML)
+        from html import escape as _esc
+        await message.reply(f"No card found matching <b>{_esc(command.args)}</b>.", parse_mode=ParseMode.HTML)
         return
 
-    global_data = db["global_cards"][card_id]
-    caption     = _build_card_lookup_caption(global_data)
+    global_data  = db["global_cards"][card_id]
+    owned_amount = _user_owned_amount(db, user_id, card_id)
+    price        = WHOOWNS_COST if owned_amount > 0 else WHOOWNS_COST_UNOWNED
+    caption      = _build_card_lookup_caption(global_data, owned_amount)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🌐 𝗪𝗵𝗼 𝗼𝘄𝗻? ({WHOOWNS_COST} 💠)", callback_data=f"whoowns_{user_id}_{card_id}")]
+        [InlineKeyboardButton(text=f"🌐 𝗪𝗵𝗼 𝗼𝘄𝗻? ({price} 💠)", callback_data=f"whoowns_{user_id}_{card_id}")]
     ])
 
+    # Cards the user doesn't own get the same treatment as /data: not
+    # forwardable/savable and removed after DATA_CARD_AUTODELETE_SECS.
+    unowned = owned_amount <= 0
     try:
-        await message.reply_photo(
+        sent = await message.reply_photo(
             photo=global_data.get("file_id"),
             caption=caption,
             reply_markup=kb,
             parse_mode=ParseMode.HTML,
-            has_spoiler=True
+            has_spoiler=True,
+            protect_content=unowned
         )
     except Exception:
-        await message.reply(caption, reply_markup=kb, parse_mode=ParseMode.HTML)
+        sent = await message.reply(caption, reply_markup=kb, parse_mode=ParseMode.HTML, protect_content=unowned)
+
+    if unowned:
+        asyncio.create_task(_autodelete_data_card(sent.chat.id, sent.message_id))
 
 
 DATA_CARD_AUTODELETE_SECS = 60
@@ -2807,8 +2877,12 @@ async def who_owns_cb(cq: CallbackQuery):
 
     user_data = db["users"].get(searcher_id, {})
     balance   = user_data.get("nexus_shards", 0)
-    if balance < WHOOWNS_COST:
-        await cq.answer(f"You need {WHOOWNS_COST} 💠 Shards to check owners. You have {balance} 💠.", show_alert=True)
+    # Price is decided here, from real ownership at click time (not from the
+    # button label), so it can't be dodged with a stale message.
+    searcher_owns = _user_owned_amount(db, searcher_id, card_id) > 0
+    price = WHOOWNS_COST if searcher_owns else WHOOWNS_COST_UNOWNED
+    if balance < price:
+        await cq.answer(f"You need {price} 💠 Shards to check owners. You have {balance} 💠.", show_alert=True)
         return
 
     owners = _get_owners(db, card_id)
@@ -2823,7 +2897,14 @@ async def who_owns_cb(cq: CallbackQuery):
     # list that never rendered. Text messages allow up to 4096 chars, so
     # paginate defensively at a much higher owner count instead.
     OWNERS_PER_MSG = 80
-    owner_lines_all = [f"{name} ({uid}) - {amount}" for uid, name, amount in owners]
+    # Names and amounts only — user IDs stay private so this can't be used to
+    # target owners. Admins still see IDs for moderation.
+    from html import escape as _esc
+    is_admin_viewer = cq.from_user.id in ADMIN_IDS
+    owner_lines_all = [
+        (f"{_esc(str(name))} ({uid}) - {amount}" if is_admin_viewer else f"{_esc(str(name))} - {amount}")
+        for uid, name, amount in owners
+    ]
 
     header = _build_card_lookup_caption(global_card)
     chunks = []
@@ -2836,19 +2917,34 @@ async def who_owns_cb(cq: CallbackQuery):
         # this never risks a length error since we're not rewriting the caption.
         await cq.message.edit_reply_markup(reply_markup=None)
 
+        async def _send_owner_msg(text: str):
+            # The search photo for an unowned card deletes itself, so the
+            # reply target can be gone by now — fall back to a plain send.
+            try:
+                return await cq.message.reply(text, parse_mode=ParseMode.HTML)
+            except TelegramBadRequest:
+                return await bot.send_message(cq.message.chat.id, text, parse_mode=ParseMode.HTML)
+
+        sent_msgs = []
         first_text = f"{header}\n\n👥 <b>{len(owners)} owner(s):</b>\n{chunks[0]}"
-        await cq.message.reply(first_text, parse_mode=ParseMode.HTML)
+        sent_msgs.append(await _send_owner_msg(first_text))
         for chunk in chunks[1:]:
-            await cq.message.reply(chunk, parse_mode=ParseMode.HTML)
+            sent_msgs.append(await _send_owner_msg(chunk))
+
+        # Owner lists for cards the user doesn't own vanish like the card
+        # preview does (same delay as /data).
+        if not searcher_owns:
+            for m in sent_msgs:
+                asyncio.create_task(_autodelete_data_card(m.chat.id, m.message_id))
     except Exception as e:
         print(f"[WHOOWNS] Failed to deliver owner list for {card_id}: {e}")
         await cq.answer("Something went wrong showing the owner list — you weren't charged.", show_alert=True)
         return
 
     # Only deduct shards after the list has actually been delivered.
-    db["users"][searcher_id]["nexus_shards"] = balance - WHOOWNS_COST
+    db["users"][searcher_id]["nexus_shards"] = balance - price
     save_db()
-    await cq.answer(f"{WHOOWNS_COST} 💠 Shards deducted.")
+    await cq.answer(f"{price} 💠 Shards deducted.")
 
 
 # ==========================================

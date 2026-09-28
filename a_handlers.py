@@ -8,6 +8,7 @@ import asyncio
 import traceback
 import random
 import difflib
+from html import escape as _html_esc
 import aiohttp
 from datetime import datetime, timezone
 from aiogram import F
@@ -1636,6 +1637,139 @@ async def broadcast_cmd(message: Message, command: CommandObject):
     ))
     _bnxcast_bg_tasks.add(task)
     task.add_done_callback(_bnxcast_bg_tasks.discard)
+
+# ==========================================
+# STAR CARDS (/star_give, /star_remove, /star_cards) [SUPREME OWNER ONLY]
+# Star cards live in users[uid]["star_purchases"] (list of card ids) and
+# cannot be burned (see deck.py).
+# ==========================================
+def _parse_star_args(args: str):
+    """'uid | card_id' -> (uid, CARD_ID) or None."""
+    if not args or "|" not in args:
+        return None
+    left, right = args.split("|", 1)
+    uid, cid = left.strip(), right.strip().upper()
+    if not uid or not cid:
+        return None
+    return uid, cid
+
+
+@main_router.message(Command("star_give"))
+async def star_give_cmd(message: Message, command: CommandObject):
+    if message.from_user.id != SUPREME_OWNER_ID: return
+    parsed = _parse_star_args(command.args)
+    if not parsed:
+        await message.reply("⚠️ Format: <code>/star_give user_id | card_id</code>", parse_mode=ParseMode.HTML)
+        return
+    uid, cid = parsed
+
+    db = load_db()
+    user = db.get("users", {}).get(uid)
+    if not user:
+        await message.reply(f"User <code>{uid}</code> not found.", parse_mode=ParseMode.HTML)
+        return
+    gcard = db.get("global_cards", {}).get(cid)
+    if not gcard:
+        await message.reply(f"Card <code>{cid}</code> not found.", parse_mode=ParseMode.HTML)
+        return
+
+    stars = user.setdefault("star_purchases", [])
+    if cid in stars:
+        await message.reply("🌟 That card is already a star card for this user.", parse_mode=ParseMode.HTML)
+        return
+
+    # If they don't own the card yet, give them one copy so the star has something to attach to.
+    cards = user.setdefault("cards", {})
+    granted = False
+    if cid not in cards or cards[cid].get("amount", 0) <= 0:
+        cards[cid] = {"name": gcard["name"], "rarity": gcard["rarity"], "amount": 1}
+        granted = True
+
+    stars.append(cid)
+    save_db()
+
+    log_admin_action(
+        message.from_user.id, message.from_user.first_name,
+        "STAR GIVE", f"{gcard['name']} ({cid}) -> {uid}" + (" [+1 copy granted]" if granted else "")
+    )
+    await message.reply(
+        f"🌟 <b>{_html_esc(gcard['name'])}</b> (<code>{cid}</code>) is now a star card for "
+        f"<b>{_html_esc(user.get('name', 'Unknown'))}</b> (<code>{uid}</code>)."
+        + ("\n🎁 They didn't own it, so 1 copy was added." if granted else ""),
+        parse_mode=ParseMode.HTML
+    )
+
+
+@main_router.message(Command("star_remove"))
+async def star_remove_cmd(message: Message, command: CommandObject):
+    if message.from_user.id != SUPREME_OWNER_ID: return
+    parsed = _parse_star_args(command.args)
+    if not parsed:
+        await message.reply("⚠️ Format: <code>/star_remove user_id | card_id</code>", parse_mode=ParseMode.HTML)
+        return
+    uid, cid = parsed
+
+    db = load_db()
+    user = db.get("users", {}).get(uid)
+    if not user:
+        await message.reply(f"User <code>{uid}</code> not found.", parse_mode=ParseMode.HTML)
+        return
+
+    stars = user.get("star_purchases", [])
+    if cid not in stars:
+        await message.reply("That card isn't a star card for this user.", parse_mode=ParseMode.HTML)
+        return
+
+    stars.remove(cid)
+    save_db()
+
+    name = user.get("cards", {}).get(cid, {}).get("name") or db.get("global_cards", {}).get(cid, {}).get("name", cid)
+    log_admin_action(
+        message.from_user.id, message.from_user.first_name,
+        "STAR REMOVE", f"{name} ({cid}) <- {uid}"
+    )
+    await message.reply(
+        f"✅ Star removed from <b>{_html_esc(name)}</b> (<code>{cid}</code>) for "
+        f"<b>{_html_esc(user.get('name', 'Unknown'))}</b> (<code>{uid}</code>).\n"
+        "The card itself stays in their inventory.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@main_router.message(Command("star_cards"))
+async def star_cards_cmd(message: Message):
+    if message.from_user.id != SUPREME_OWNER_ID: return
+
+    db = load_db()
+    blocks, total = [], 0
+    for uid, udata in db.get("users", {}).items():
+        stars = udata.get("star_purchases") or []
+        if not stars:
+            continue
+        lines = [f"👤 <b>{_html_esc(udata.get('name', 'Unknown'))}</b> (<code>{uid}</code>)"]
+        for cid in stars:
+            name = (udata.get("cards", {}).get(cid, {}).get("name")
+                    or db.get("global_cards", {}).get(cid, {}).get("name", "Unknown"))
+            lines.append(f"  🌟 {_html_esc(name)} — <code>{cid}</code>")
+            total += 1
+        blocks.append("\n".join(lines))
+
+    if not blocks:
+        await message.reply("No star cards found.", parse_mode=ParseMode.HTML)
+        return
+
+    header = f"<b>「 🌟 STAR CARDS 」</b>\nTotal: <b>{total}</b> across <b>{len(blocks)}</b> user(s)\n━━━━━━━━━━━━━━━━━\n\n"
+    chunks, current = [], header
+    for block in blocks:
+        if len(current) + len(block) + 2 > 3900:
+            chunks.append(current)
+            current = ""
+        current += block + "\n\n"
+    chunks.append(current)
+
+    for chunk in chunks:
+        await message.reply(chunk.rstrip(), parse_mode=ParseMode.HTML)
+
 
 @main_router.message(Command("a_help"))
 async def admin_help_cmd(message: Message):

@@ -1127,53 +1127,35 @@ async def confirm_special_cb(cq: CallbackQuery):
 # ==========================================
 # /flex SHOWCASE COMMAND
 # ==========================================
-@main_router.message(Command("flex"))
-async def flex_cmd(message: Message, command: CommandObject):
-    uid_int = message.from_user.id
-    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+FLEX_MAX_MATCHES = 4
 
-    user_id = str(uid_int)
-    db      = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
 
-    if not command.args:
-        await message.reply("⚠️ <b>Usage:</b> <code>/flex &lt;card name&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-
-    query    = command.args.lower().strip()
-    my_cards = db["users"][user_id].get("cards", {})
-
-    if not my_cards:
-        await message.reply("You don't own any cards to flex!", parse_mode=ParseMode.HTML)
-        return
-
-    best_match = None
-    best_ratio = 0.0
-
+def _flex_find_matches(my_cards: dict, query: str, limit: int = FLEX_MAX_MATCHES):
+    """Returns (matches, exact): up to `limit` owned card ids, best fuzzy score first.
+    exact=True when the query equals a card name exactly (matches then has 1 entry)."""
+    scored = []
     for cid, cdata in my_cards.items():
+        if cdata.get("amount", 0) <= 0: continue
         name_lower = cdata.get("name", "").lower()
         if query == name_lower:
-            best_match = (cid, cdata)
-            break
+            return [cid], True
         if query in name_lower:
-            ratio = 0.8 + (len(query) / len(name_lower)) * 0.1
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_match = (cid, cdata)
+            score = 0.8 + (len(query) / len(name_lower)) * 0.1
         else:
-            ratio = difflib.SequenceMatcher(None, query, name_lower).ratio()
-            if ratio > 0.6 and ratio > best_ratio:
-                best_ratio = ratio
-                best_match = (cid, cdata)
+            score = difflib.SequenceMatcher(None, query, name_lower).ratio()
+            if score <= 0.6: continue
+        scored.append((score, cid))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [cid for _, cid in scored[:limit]], False
 
-    if not best_match:
-        await message.reply(f"You do not own a card matching <b>{command.args}</b>.", parse_mode=ParseMode.HTML)
-        return
 
-    matched_cid, matched_data = best_match
+async def _send_flex_card(message: Message, db: dict, user_id: str, first_name: str, matched_cid: str):
+    """Sends the flex card. `message` is the message to reply to."""
+    matched_data   = db["users"][user_id]["cards"][matched_cid]
     global_data    = db["global_cards"].get(matched_cid, {})
     display_rarity = format_rarity(matched_data.get("rarity", "Common"))
 
-    safe_name = str(message.from_user.first_name).replace("<", "&lt;").replace(">", "&gt;")
+    safe_name = str(first_name).replace("<", "&lt;").replace(">", "&gt;")
     mention = f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
     flex_name = matched_data.get('name', 'Card')
@@ -1195,6 +1177,74 @@ async def flex_cmd(message: Message, command: CommandObject):
         )
     except Exception:
         await message.reply(caption, parse_mode=ParseMode.HTML)
+
+
+@main_router.message(Command("flex"))
+async def flex_cmd(message: Message, command: CommandObject):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+
+    user_id = str(uid_int)
+    db      = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
+
+    if not command.args:
+        await message.reply("⚠️ <b>Usage:</b> <code>/flex &lt;card name&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+
+    query    = command.args.lower().strip()
+    my_cards = db["users"][user_id].get("cards", {})
+
+    if not my_cards:
+        await message.reply("You don't own any cards to flex!", parse_mode=ParseMode.HTML)
+        return
+
+    matches, exact = _flex_find_matches(my_cards, query)
+
+    if not matches:
+        await message.reply(f"You do not own a card matching <b>{command.args}</b>.", parse_mode=ParseMode.HTML)
+        return
+
+    # Exact name match (or a single candidate): flex straight away, no picker.
+    if exact or len(matches) == 1:
+        await _send_flex_card(message, db, user_id, message.from_user.first_name, matches[0])
+        return
+
+    # Several fuzzy matches: let the user choose.
+    lines, buttons = ["<b>Multiple cards found</b>\n"], []
+    for i, cid in enumerate(matches, start=1):
+        cd = my_cards[cid]
+        lines.append(f"{i}) {cd.get('name', 'Card')} — {format_rarity(cd.get('rarity', 'Common'))}")
+        buttons.append(InlineKeyboardButton(text=str(i), callback_data=f"flexpick_{user_id}_{cid}"))
+
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]  # 1 2 / 3 4
+    await message.reply(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode=ParseMode.HTML
+    )
+
+
+@main_router.callback_query(F.data.startswith("flexpick_"))
+async def flex_pick_cb(cq: CallbackQuery):
+    _, owner_id, cid = cq.data.split("_", 2)
+    if str(cq.from_user.id) != owner_id:
+        await cq.answer("This isn't your menu.", show_alert=True)
+        return
+
+    db = ensure_user(owner_id, cq.from_user.first_name, cq.from_user.username)
+    cdata = db["users"][owner_id].get("cards", {}).get(cid)
+    if not cdata or cdata.get("amount", 0) <= 0:
+        await cq.answer("You no longer own this card.", show_alert=True)
+        return
+
+    await cq.answer()
+    # Reply to the user's original /flex message if it still exists, else to the picker.
+    target = cq.message.reply_to_message or cq.message
+    await _send_flex_card(target, db, owner_id, cq.from_user.first_name, cid)
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
 
 
 # ==========================================
