@@ -2692,54 +2692,116 @@ def _search_blocked_series(db: dict) -> set:
     return blocked
 
 
-def _find_search_matches(db: dict, user_id: str, query: str, limit: int = SEARCH_MAX_MATCHES):
-    """Fuzzy-matches a query against the WHOLE card pool.
-    Returns (matches, exact): up to `limit` card ids, best score first;
-    exact=True when the query equals a card name exactly.
-    Cards in hidden or locked series are only findable by people who already
-    own them, so unreleased art can't be pulled out through /search. When two
-    cards score the same, the one the user owns wins."""
-    query = query.lower().strip()
-    blocked = _search_blocked_series(db)
+def _fz_norm(text: str) -> str:
+    """Lowercase, strip accents, turn punctuation into spaces, collapse whitespace.
+    "Satōru  Gojō!" -> "satoru gojo"."""
+    text = unicodedata.normalize("NFKD", str(text)).lower()
+    out = []
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        out.append(ch if ch.isalnum() else " ")
+    return " ".join("".join(out).split())
 
-    scored = []          # (score, owned, cid)
-    exact_hits = []      # (owned, cid)
+
+def _fz_token_score(qt: str, nt: str) -> float:
+    """How well one query word matches one name word (0..1)."""
+    if qt == nt:
+        return 1.0
+    if nt.startswith(qt):
+        # prefix: "gok" -> "goku". Very short prefixes are weak evidence.
+        return 0.9 if len(qt) >= 3 else 0.5
+    if len(qt) >= 3 and qt in nt:
+        return 0.75
+    if len(qt) >= 4 and qt.startswith(nt) and len(nt) >= 3:
+        return 0.7                      # user typed extra letters: "gokuu" vs "goku"
+    if len(qt) >= 3 and len(nt) >= 3:   # typo tolerance only for real words
+        r = difflib.SequenceMatcher(None, qt, nt).ratio()
+        if r >= 0.8:
+            return r * 0.85
+    return 0.0
+
+
+def _fz_score(query: str, name: str) -> float:
+    """Score a card name against a search query. 0 = no match.
+    >= 100 exact, ~1.0 strong match, ~0.6 weak match.
+
+    Handles: accents/punctuation, any word order ("satoru gojo"), partial
+    words ("gok"), one-word searches for multi-word names ("goku" ->
+    "Son Goku"), and typos ("nezuku")."""
+    q = _fz_norm(query)
+    n = _fz_norm(name)
+    if not q or not n:
+        return 0.0
+    if q == n:
+        return 100.0
+
+    qtoks, ntoks = q.split(), n.split()
+
+    # --- word-by-word matching: every query word must match some name word ---
+    used, scores = set(), []
+    for qt in qtoks:
+        best, best_i = 0.0, -1
+        for i, nt in enumerate(ntoks):
+            if i in used:
+                continue
+            sc = _fz_token_score(qt, nt)
+            if sc > best:
+                best, best_i = sc, i
+        if best_i >= 0:
+            used.add(best_i)
+        scores.append(best)
+
+    token_score = 0.0
+    if scores and min(scores) > 0:
+        avg = sum(scores) / len(scores)
+        coverage = min(1.0, len(qtoks) / len(ntoks))
+        token_score = avg * (0.85 + 0.15 * coverage)
+        if n.startswith(q):
+            token_score = min(0.99, token_score + 0.05)   # typed the beginning of the name
+        elif q in n:
+            token_score = min(0.99, token_score + 0.03)
+
+    # --- whole-string typo tolerance (handles run-together / mangled spelling) ---
+    sm = difflib.SequenceMatcher
+    whole = max(
+        sm(None, q, n).ratio(),
+        sm(None, " ".join(sorted(qtoks)), " ".join(sorted(ntoks))).ratio(),   # word order ignored
+        sm(None, q.replace(" ", ""), n.replace(" ", "")).ratio(),             # spacing ignored
+    )
+    whole_score = whole * 0.9 if whole >= 0.72 else 0.0
+
+    return max(token_score, whole_score)
+
+
+SEARCH_MIN_SCORE = 0.6
+
+
+def _find_search_matches(db: dict, user_id: str, query: str, limit: int = SEARCH_MAX_MATCHES):
+    """Fuzzy-searches the WHOLE card pool and returns up to `limit` card ids,
+    best match first. Cards in hidden or locked series are only findable by
+    people who already own them, so unreleased art can't be pulled out through
+    /search. On equal scores, cards the user owns come first."""
+    blocked = _search_blocked_series(db)
+    scored = []
     for cid, cdata in db.get("global_cards", {}).items():
         owned = _user_owned_amount(db, user_id, cid) > 0
         if not owned and str(cdata.get("anime", "")).lower().strip() in blocked:
             continue
-        name_lower = str(cdata.get("name", "")).lower()
-        if not name_lower:
+        name = str(cdata.get("name", ""))
+        if not name:
             continue
-        if query == name_lower:
-            exact_hits.append((owned, cid))
-            continue
-        if query in name_lower:
-            score = 0.8 + (len(query) / len(name_lower)) * 0.1
-        else:
-            ratio = difflib.SequenceMatcher(None, query, name_lower).ratio()
-            if ratio <= 0.6:
-                continue
-            score = ratio
-        scored.append((score, owned, cid))
+        score = _fz_score(query, name)
+        if score >= SEARCH_MIN_SCORE:
+            scored.append((score, owned, name.lower(), cid))
 
-    # Exactly one card has this exact name -> no picker needed.
-    if len(exact_hits) == 1:
-        return [exact_hits[0][1]], True
-
-    # Several cards share the exact name (e.g. same character in different
-    # series): show them all as choices, owned ones first.
-    if exact_hits:
-        exact_hits.sort(key=lambda x: x[0], reverse=True)
-        return [cid for _, cid in exact_hits[:limit]], False
-
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    return [cid for _, _, cid in scored[:limit]], False
+    scored.sort(key=lambda x: (-x[0], not x[1], x[2]))
+    return [cid for _, _, _, cid in scored[:limit]]
 
 
 def _find_search_card(db: dict, user_id: str, query: str):
     """Best single match (kept for any caller that only wants one card)."""
-    matches, _ = _find_search_matches(db, user_id, query, limit=1)
+    matches = _find_search_matches(db, user_id, query, limit=1)
     return matches[0] if matches else None
 
 
@@ -2794,25 +2856,22 @@ async def search_card_cmd(message: Message, command: CommandObject):
     user_id = str(uid_int)
     db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
 
-    matches, exact = _find_search_matches(db, user_id, command.args)
+    from html import escape as _esc
+    matches = _find_search_matches(db, user_id, command.args)
     if not matches:
-        from html import escape as _esc
         await message.reply(f"No card found matching <b>{_esc(command.args)}</b>.", parse_mode=ParseMode.HTML)
         return
 
-    # Exact name match (or a single candidate): show the card straight away.
-    if exact or len(matches) == 1:
-        await _send_search_card(message, db, user_id, matches[0])
-        return
-
-    # Several fuzzy matches: let the user choose (max SEARCH_MAX_MATCHES).
-    from html import escape as _esc
+    # Always show the results list (max SEARCH_MAX_MATCHES), even for an exact
+    # name or a single hit. Names are shown whether or not the user owns the card.
     lines, buttons = ["<b>Multiple cards found</b>\n"], []
     for i, cid in enumerate(matches, start=1):
         cd = db["global_cards"][cid]
+        amt = _user_owned_amount(db, user_id, cid)
+        status = f"Owned ×{amt}" if amt > 0 else "Not owned"
         lines.append(
             f"{i}) <b>{_esc(str(cd.get('name', 'Card')))}</b> — "
-            f"{format_rarity(cd.get('rarity', 'Common'))} · <i>{_esc(str(cd.get('anime', 'Unknown')))}</i>"
+            f"{format_rarity(cd.get('rarity', 'Common'))} · <i>{_esc(str(cd.get('anime', 'Unknown')))}</i> · {status}"
         )
         buttons.append(InlineKeyboardButton(text=str(i), callback_data=f"srchpick_{user_id}_{cid}"))
 
