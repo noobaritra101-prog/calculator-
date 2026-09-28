@@ -1,5 +1,6 @@
 import math
 import difflib
+from html import escape as _html_esc
 import re
 import unicodedata
 import traceback
@@ -499,6 +500,9 @@ async def api_burn_card(req: BurnRequest):
 
         if req.card_id not in user_cards or user_cards[req.card_id].get("amount", 0) <= 0:
             raise HTTPException(status_code=400, detail="Card not owned.")
+
+        if req.card_id in user_data.get("star_purchases", []):
+            raise HTTPException(status_code=400, detail="Star cards cannot be burned.")
 
         card_data = user_cards[req.card_id]
         rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
@@ -1213,7 +1217,7 @@ async def flex_cmd(message: Message, command: CommandObject):
     lines, buttons = ["<b>Multiple cards found</b>\n"], []
     for i, cid in enumerate(matches, start=1):
         cd = my_cards[cid]
-        lines.append(f"{i}) {cd.get('name', 'Card')} — {format_rarity(cd.get('rarity', 'Common'))}")
+        lines.append(f"{i}) <b>{_html_esc(cd.get('name', 'Card'))}</b> — {format_rarity(cd.get('rarity', 'Common'))}")
         buttons.append(InlineKeyboardButton(text=str(i), callback_data=f"flexpick_{user_id}_{cid}"))
 
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]  # 1 2 / 3 4
@@ -1294,6 +1298,10 @@ async def burn_cmd(message: Message, command: CommandObject):
         return
 
     matched_cid, matched_data = best_match
+    if matched_cid in db["users"][user_id].get("star_purchases", []):
+        await smart_reply(message, "🌟 <b>Star cards cannot be burned.</b>", parse_mode=ParseMode.HTML)
+        return
+
     global_data       = db["global_cards"].get(matched_cid, {})
     rarity_normalized = format_rarity(matched_data.get("rarity", "Common"))
 
@@ -1335,6 +1343,10 @@ async def confirm_burn_cb(cq: CallbackQuery):
 
     if not user_data or card_id not in user_data.get("cards", {}) or user_data["cards"][card_id].get("amount", 0) <= 0:
         await cq.answer("You don't own this card anymore!", show_alert=True)
+        return
+
+    if card_id in user_data.get("star_purchases", []):
+        await cq.answer("🌟 Star cards cannot be burned.", show_alert=True)
         return
 
     my_cards = user_data["cards"]

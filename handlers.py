@@ -2682,17 +2682,28 @@ def _user_owned_amount(db: dict, user_id: str, card_id: str) -> int:
         return 0
 
 
-def _find_search_card(db: dict, user_id: str, query: str):
-    """Fuzzy-matches a query against the WHOLE card pool. Cards in hidden or
-    locked series are only findable by people who already own them, so
-    unreleased art can't be pulled out through /search. When two cards score
-    the same, the one the user owns wins."""
-    query = query.lower().strip()
+SEARCH_MAX_MATCHES = 6
+
+
+def _search_blocked_series(db: dict) -> set:
     settings = db.get("settings", {})
     blocked = {a.lower().strip() for a in settings.get("hidden_animes", [])}
     blocked |= {a.lower().strip() for a in settings.get("locked_animes", [])}
+    return blocked
 
-    best_cid, best_score, best_owned = None, 0.0, False
+
+def _find_search_matches(db: dict, user_id: str, query: str, limit: int = SEARCH_MAX_MATCHES):
+    """Fuzzy-matches a query against the WHOLE card pool.
+    Returns (matches, exact): up to `limit` card ids, best score first;
+    exact=True when the query equals a card name exactly.
+    Cards in hidden or locked series are only findable by people who already
+    own them, so unreleased art can't be pulled out through /search. When two
+    cards score the same, the one the user owns wins."""
+    query = query.lower().strip()
+    blocked = _search_blocked_series(db)
+
+    scored = []          # (score, owned, cid)
+    exact_hits = []      # (owned, cid)
     for cid, cdata in db.get("global_cards", {}).items():
         owned = _user_owned_amount(db, user_id, cid) > 0
         if not owned and str(cdata.get("anime", "")).lower().strip() in blocked:
@@ -2701,48 +2712,38 @@ def _find_search_card(db: dict, user_id: str, query: str):
         if not name_lower:
             continue
         if query == name_lower:
-            score = 2.0
-        elif query in name_lower:
+            exact_hits.append((owned, cid))
+            continue
+        if query in name_lower:
             score = 0.8 + (len(query) / len(name_lower)) * 0.1
         else:
             ratio = difflib.SequenceMatcher(None, query, name_lower).ratio()
             if ratio <= 0.6:
                 continue
             score = ratio
-        if score > best_score or (score == best_score and owned and not best_owned):
-            best_cid, best_score, best_owned = cid, score, owned
-    return best_cid
+        scored.append((score, owned, cid))
+
+    # Exactly one card has this exact name -> no picker needed.
+    if len(exact_hits) == 1:
+        return [exact_hits[0][1]], True
+
+    # Several cards share the exact name (e.g. same character in different
+    # series): show them all as choices, owned ones first.
+    if exact_hits:
+        exact_hits.sort(key=lambda x: x[0], reverse=True)
+        return [cid for _, cid in exact_hits[:limit]], False
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [cid for _, _, cid in scored[:limit]], False
 
 
-@main_router.message(Command("search"))
-async def search_card_cmd(message: Message, command: CommandObject):
-    uid_int = message.from_user.id
-    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+def _find_search_card(db: dict, user_id: str, query: str):
+    """Best single match (kept for any caller that only wants one card)."""
+    matches, _ = _find_search_matches(db, user_id, query, limit=1)
+    return matches[0] if matches else None
 
-    if not command.args:
-        await message.reply("<b>Usage:</b> <code>/search &lt;card name&gt;</code>\nExample: <code>/search Makima</code>", parse_mode=ParseMode.HTML)
-        return
 
-    # Cooldown — this fuzzy-matches the whole card pool, so keep it from being spammed.
-    now = time.time()
-    if uid_int not in ADMIN_IDS:
-        wait = SEARCH_COOLDOWN_SECS - (now - _search_cooldowns.get(uid_int, 0))
-        if wait > 0:
-            await message.reply(f"Please wait {int(wait) + 1}s before searching again.", parse_mode=ParseMode.HTML)
-            return
-        if len(_search_cooldowns) > 5000:
-            _search_cooldowns.clear()
-        _search_cooldowns[uid_int] = now
-
-    user_id = str(uid_int)
-    db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
-
-    card_id = _find_search_card(db, user_id, command.args)
-    if not card_id:
-        from html import escape as _esc
-        await message.reply(f"No card found matching <b>{_esc(command.args)}</b>.", parse_mode=ParseMode.HTML)
-        return
-
+async def _send_search_card(message: Message, db: dict, user_id: str, card_id: str):
     global_data  = db["global_cards"][card_id]
     owned_amount = _user_owned_amount(db, user_id, card_id)
     price        = WHOOWNS_COST if owned_amount > 0 else WHOOWNS_COST_UNOWNED
@@ -2768,6 +2769,87 @@ async def search_card_cmd(message: Message, command: CommandObject):
 
     if unowned:
         asyncio.create_task(_autodelete_data_card(sent.chat.id, sent.message_id))
+
+
+@main_router.message(Command("search"))
+async def search_card_cmd(message: Message, command: CommandObject):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+
+    if not command.args:
+        await message.reply("<b>Usage:</b> <code>/search &lt;card name&gt;</code>\nExample: <code>/search Makima</code>", parse_mode=ParseMode.HTML)
+        return
+
+    # Cooldown — this fuzzy-matches the whole card pool, so keep it from being spammed.
+    now = time.time()
+    if uid_int not in ADMIN_IDS:
+        wait = SEARCH_COOLDOWN_SECS - (now - _search_cooldowns.get(uid_int, 0))
+        if wait > 0:
+            await message.reply(f"Please wait {int(wait) + 1}s before searching again.", parse_mode=ParseMode.HTML)
+            return
+        if len(_search_cooldowns) > 5000:
+            _search_cooldowns.clear()
+        _search_cooldowns[uid_int] = now
+
+    user_id = str(uid_int)
+    db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
+
+    matches, exact = _find_search_matches(db, user_id, command.args)
+    if not matches:
+        from html import escape as _esc
+        await message.reply(f"No card found matching <b>{_esc(command.args)}</b>.", parse_mode=ParseMode.HTML)
+        return
+
+    # Exact name match (or a single candidate): show the card straight away.
+    if exact or len(matches) == 1:
+        await _send_search_card(message, db, user_id, matches[0])
+        return
+
+    # Several fuzzy matches: let the user choose (max SEARCH_MAX_MATCHES).
+    from html import escape as _esc
+    lines, buttons = ["<b>Multiple cards found</b>\n"], []
+    for i, cid in enumerate(matches, start=1):
+        cd = db["global_cards"][cid]
+        lines.append(
+            f"{i}) <b>{_esc(str(cd.get('name', 'Card')))}</b> — "
+            f"{format_rarity(cd.get('rarity', 'Common'))} · <i>{_esc(str(cd.get('anime', 'Unknown')))}</i>"
+        )
+        buttons.append(InlineKeyboardButton(text=str(i), callback_data=f"srchpick_{user_id}_{cid}"))
+
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]  # 1 2 / 3 4 / 5 6
+    await message.reply(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode=ParseMode.HTML
+    )
+
+
+@main_router.callback_query(F.data.startswith("srchpick_"))
+async def search_pick_cb(cq: CallbackQuery):
+    _, owner_id, cid = cq.data.split("_", 2)
+    if str(cq.from_user.id) != owner_id:
+        await cq.answer("This isn't your menu.", show_alert=True)
+        return
+
+    db = ensure_user(owner_id, cq.from_user.first_name, cq.from_user.username)
+    gcard = db.get("global_cards", {}).get(cid)
+    if not gcard:
+        await cq.answer("This card no longer exists.", show_alert=True)
+        return
+
+    # Re-apply the hidden/locked-series rule in case it changed since the picker was shown.
+    owned = _user_owned_amount(db, owner_id, cid) > 0
+    if not owned and str(gcard.get("anime", "")).lower().strip() in _search_blocked_series(db):
+        await cq.answer("This card is unavailable.", show_alert=True)
+        return
+
+    await cq.answer()
+    target = cq.message.reply_to_message or cq.message
+    await _send_search_card(target, db, owner_id, cid)
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
 
 
 DATA_CARD_AUTODELETE_SECS = 60
