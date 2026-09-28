@@ -2686,9 +2686,9 @@ SEARCH_MAX_MATCHES = 6
 
 
 def _search_blocked_series(db: dict) -> set:
+    """Hidden series only. Locked-drop series (/lock_drop) ARE searchable."""
     settings = db.get("settings", {})
     blocked = {a.lower().strip() for a in settings.get("hidden_animes", [])}
-    blocked |= {a.lower().strip() for a in settings.get("locked_animes", [])}
     return blocked
 
 
@@ -2774,29 +2774,100 @@ def _fz_score(query: str, name: str) -> float:
     return max(token_score, whole_score)
 
 
-SEARCH_MIN_SCORE = 0.6
+def _search_blocked_for(db: dict, user_id: str) -> set:
+    """Series this user must NOT be able to find unless they own the card.
+    Admins are exempt (they can see every card through /check anyway)."""
+    try:
+        if int(user_id) in ADMIN_IDS:
+            return set()
+    except (TypeError, ValueError):
+        pass
+    return _search_blocked_series(db)
+
+
+SEARCH_MIN_SCORE = 0.6      # a "real" match
+SEARCH_LOOSE_SCORE = 0.4    # last-resort filler when there are too few real matches
 
 
 def _find_search_matches(db: dict, user_id: str, query: str, limit: int = SEARCH_MAX_MATCHES):
     """Fuzzy-searches the WHOLE card pool and returns up to `limit` card ids,
-    best match first. Cards in hidden or locked series are only findable by
-    people who already own them, so unreleased art can't be pulled out through
-    /search. On equal scores, cards the user owns come first."""
-    blocked = _search_blocked_series(db)
-    scored = []
+    best match first. The list is topped up to `limit` whenever the pool
+    allows it:
+      1. real name matches (score >= SEARCH_MIN_SCORE), best first
+      2. cards whose ANIME matches the query ("dragon ball" -> its cards)
+      3. other cards from the same anime as the best real matches
+      4. loosely similar names (score >= SEARCH_LOOSE_SCORE)
+    Cards in hidden or locked series are only findable by people who already
+    own them, so unreleased art can't be pulled out through /search. On equal
+    scores, cards the user owns come first."""
+    blocked = _search_blocked_for(db, user_id)
+    q_norm = _fz_norm(query)
+
+    pool = []   # (cid, name, anime, owned)
     for cid, cdata in db.get("global_cards", {}).items():
         owned = _user_owned_amount(db, user_id, cid) > 0
-        if not owned and str(cdata.get("anime", "")).lower().strip() in blocked:
+        anime = str(cdata.get("anime", ""))
+        if not owned and anime.lower().strip() in blocked:
             continue
         name = str(cdata.get("name", ""))
         if not name:
             continue
-        score = _fz_score(query, name)
-        if score >= SEARCH_MIN_SCORE:
-            scored.append((score, owned, name.lower(), cid))
+        pool.append((cid, name, anime, owned))
 
-    scored.sort(key=lambda x: (-x[0], not x[1], x[2]))
-    return [cid for _, _, _, cid in scored[:limit]]
+    result, seen = [], set()
+
+    def add(cids):
+        for cid in cids:
+            if cid not in seen and len(result) < limit:
+                seen.add(cid)
+                result.append(cid)
+
+    # 1) real name matches
+    real = []
+    for cid, name, anime, owned in pool:
+        sc = _fz_score(query, name)
+        if sc >= SEARCH_MIN_SCORE:
+            real.append((sc, owned, name.lower(), cid, anime))
+    real.sort(key=lambda x: (-x[0], not x[1], x[2]))
+    add(x[3] for x in real)
+    if len(result) >= limit:
+        return result
+
+    # 2) the query names an anime
+    by_anime = []
+    for cid, name, anime, owned in pool:
+        sc = _fz_score(query, anime)
+        if sc >= SEARCH_MIN_SCORE:
+            by_anime.append((sc, owned, name.lower(), cid))
+    by_anime.sort(key=lambda x: (-x[0], not x[1], x[2]))
+    add(x[3] for x in by_anime)
+
+    # 3) same anime as the best real matches (closest match's anime first)
+    for _, _, _, _, anime in real:
+        same = sorted(
+            ((not owned, name.lower(), cid) for cid, name, a, owned in pool if a == anime),
+        )
+        add(x[2] for x in same)
+        if len(result) >= limit:
+            return result
+
+    # 4) loosely similar names
+    if len(result) < limit and q_norm:
+        loose = []
+        for cid, name, anime, owned in pool:
+            if cid in seen:
+                continue
+            n_norm = _fz_norm(name)
+            best = max(
+                difflib.SequenceMatcher(None, q_norm, n_norm).ratio(),
+                max((difflib.SequenceMatcher(None, q_norm, t).ratio() for t in n_norm.split()), default=0.0),
+            )
+            if best >= SEARCH_LOOSE_SCORE:
+                loose.append((best, owned, name.lower(), cid))
+        loose.sort(key=lambda x: (-x[0], not x[1], x[2]))
+        add(x[3] for x in loose)
+
+    return result
 
 
 def _find_search_card(db: dict, user_id: str, query: str):
@@ -2898,7 +2969,7 @@ async def search_pick_cb(cq: CallbackQuery):
 
     # Re-apply the hidden/locked-series rule in case it changed since the picker was shown.
     owned = _user_owned_amount(db, owner_id, cid) > 0
-    if not owned and str(gcard.get("anime", "")).lower().strip() in _search_blocked_series(db):
+    if not owned and str(gcard.get("anime", "")).lower().strip() in _search_blocked_for(db, owner_id):
         await cq.answer("This card is unavailable.", show_alert=True)
         return
 
