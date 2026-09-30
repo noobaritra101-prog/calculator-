@@ -679,6 +679,38 @@ async def fad_cmd(message: Message, command: CommandObject):
         await smart_reply(message, "⚠️ <b>Usage:</b> <code>/fad on</code> | <code>/fad off</code>", parse_mode=ParseMode.HTML)
 
 
+@main_router.message(Command("resetads"))
+async def resetads_cmd(message: Message):
+    """Admin only: resets today's ad progress for EVERY user so anyone who
+    already watched (or already claimed) can watch the ads and claim again."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    db = load_db()
+    today = _today_str()
+    reset_count = 0
+    for user_data in db.get("users", {}).values():
+        progress = user_data.get("ad_progress")
+        if not progress:
+            continue
+        # Only count users who actually had activity today
+        if progress.get("date") == today and (progress.get("watched", 0) > 0 or progress.get("claimed")):
+            reset_count += 1
+        progress["date"] = today
+        progress["watched"] = 0
+        progress["claimed"] = False
+    save_db()
+
+    await smart_reply(
+        message,
+        "🔄 <b>Ads Reset</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Today's ad progress was reset for <b>{reset_count}</b> user(s).\n"
+        "<blockquote>They can watch the ads and claim their airdrop card again.</blockquote>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # NOTE: /dlog, /bug, and /adstats used to live here — they've moved to
 # a_handlers.py so every admin command lives in one place.
 
