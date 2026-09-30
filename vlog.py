@@ -30,6 +30,7 @@ _TYPE_LABELS = {
     "gift_sent":      "🎁 CARD GIFT — SENT",
     "gift_received":  "🎁 CARD GIFT — RECEIVED",
     "burn":           "🔥 CARD BURNED",
+    "web_burn":       "🔥 CARD BURNED — WEB APP",
     "trade_sent":     "🔄 CARD TRADE",
     "store_buy_online":   "🛒 STORE PURCHASE — ONLINE",
     "store_buy_offline":  "🛍️ STORE PURCHASE — OFFLINE",
@@ -150,7 +151,7 @@ def _format_entry(entry: dict, idx: int) -> str:
         lines.append(f"Card         : {entry.get('card_name', 'Unknown')}")
         lines.append(f"Rarity       : {entry.get('rarity', 'Unknown')}")
         lines.append(f"Counterparty : {entry.get('cp_name', 'Unknown')} (ID: {entry.get('cp_id', '?')})")
-    elif etype == "burn":
+    elif etype in ("burn", "web_burn"):
         lines.append(f"Card         : {entry.get('card_name', 'Unknown')}")
         lines.append(f"Rarity       : {entry.get('rarity', 'Unknown')}")
         lines.append(f"Shards Earned: +{entry.get('shards_earned', 0):,}")

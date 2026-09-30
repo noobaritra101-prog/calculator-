@@ -289,6 +289,35 @@ def get_burn_payout(rarity_normalized: str) -> int:
     return BURN_PAYOUT_BASIC
 
 
+# Burn limits: Divine can never be burned, Elite has a daily cap (resets at
+# 00:00 UTC), Basic is unlimited. Shared by /burn and the Web App burn API.
+BURN_ELITE_DAILY_LIMIT = 10
+
+def _get_burn_progress(user_data: dict) -> dict:
+    """Today's burn counters for this user, reset when the UTC date rolls over."""
+    progress = user_data.setdefault("burn_progress", {})
+    if progress.get("date") != _today_str():
+        progress["date"] = _today_str()
+        progress["elite"] = 0
+    return progress
+
+def check_burn_allowed(user_data: dict, rarity_normalized: str):
+    """Returns an error message if this card can't be burned, else None."""
+    if rarity_normalized == "Divine ❄️":
+        return "Divine cards cannot be burned."
+    if rarity_normalized == "Elite ⚓":
+        used = _get_burn_progress(user_data).get("elite", 0)
+        if used >= BURN_ELITE_DAILY_LIMIT:
+            return f"Daily Elite burn limit reached ({BURN_ELITE_DAILY_LIMIT}/{BURN_ELITE_DAILY_LIMIT}). Resets at 00:00 UTC."
+    return None
+
+def record_burn(user_data: dict, rarity_normalized: str):
+    """Count a successful burn toward today's limit."""
+    if rarity_normalized == "Elite ⚓":
+        progress = _get_burn_progress(user_data)
+        progress["elite"] = progress.get("elite", 0) + 1
+
+
 class BurnRequest(BaseModel):
     user_id: str
     card_id: str
@@ -507,7 +536,12 @@ async def api_burn_card(req: BurnRequest):
         card_data = user_cards[req.card_id]
         rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
 
+        burn_error = check_burn_allowed(user_data, rarity_normalized)
+        if burn_error:
+            raise HTTPException(status_code=400, detail=burn_error)
+
         burn_payout = get_burn_payout(rarity_normalized)
+        record_burn(user_data, rarity_normalized)
 
         user_cards[req.card_id]["amount"] -= 1
         if user_cards[req.card_id]["amount"] <= 0:
@@ -521,7 +555,9 @@ async def api_burn_card(req: BurnRequest):
             "type": "web_burn",
             "card_name": card_data.get("name", "Card"),
             "rarity": rarity_normalized,
-            "shards_earned": burn_payout
+            "shards_earned": burn_payout,
+            "chat_id": "web",
+            "chat_title": "Web App"
         })
         save_db()
 
@@ -1337,6 +1373,11 @@ async def burn_cmd(message: Message, command: CommandObject):
     global_data       = db["global_cards"].get(matched_cid, {})
     rarity_normalized = format_rarity(matched_data.get("rarity", "Common"))
 
+    burn_error = check_burn_allowed(db["users"][user_id], rarity_normalized)
+    if burn_error:
+        await smart_reply(message, f"🚫 <b>{burn_error}</b>", parse_mode=ParseMode.HTML)
+        return
+
     burn_payout = get_burn_payout(rarity_normalized)
 
     caption = (
@@ -1385,7 +1426,13 @@ async def confirm_burn_cb(cq: CallbackQuery):
     card_data = my_cards[card_id]
     rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
 
+    burn_error = check_burn_allowed(user_data, rarity_normalized)
+    if burn_error:
+        await cq.answer(f"🚫 {burn_error}", show_alert=True)
+        return
+
     burn_payout = get_burn_payout(rarity_normalized)
+    record_burn(user_data, rarity_normalized)
 
     my_cards[card_id]["amount"] -= 1
     if my_cards[card_id]["amount"] <= 0:
