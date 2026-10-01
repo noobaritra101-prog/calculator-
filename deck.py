@@ -289,33 +289,38 @@ def get_burn_payout(rarity_normalized: str) -> int:
     return BURN_PAYOUT_BASIC
 
 
-# Burn limits: Divine can never be burned, Elite has a daily cap (resets at
-# 00:00 UTC), Basic is unlimited. Shared by /burn and the Web App burn API.
-BURN_ELITE_DAILY_LIMIT = 10
+# Daily burn limits per rarity (reset at 00:00 UTC). Basic rarities have no
+# limit. Shared by /burn and the Web App burn API.
+BURN_DAILY_LIMITS = {
+    "Elite ⚓":  ("elite", 20),
+    "Divine ❄️": ("divine", 2),
+}
 
 def _get_burn_progress(user_data: dict) -> dict:
     """Today's burn counters for this user, reset when the UTC date rolls over."""
     progress = user_data.setdefault("burn_progress", {})
     if progress.get("date") != _today_str():
+        progress.clear()
         progress["date"] = _today_str()
-        progress["elite"] = 0
     return progress
 
 def check_burn_allowed(user_data: dict, rarity_normalized: str):
-    """Returns an error message if this card can't be burned, else None."""
-    if rarity_normalized == "Divine ❄️":
-        return "Divine cards cannot be burned."
-    if rarity_normalized == "Elite ⚓":
-        used = _get_burn_progress(user_data).get("elite", 0)
-        if used >= BURN_ELITE_DAILY_LIMIT:
-            return f"Daily Elite burn limit reached ({BURN_ELITE_DAILY_LIMIT}/{BURN_ELITE_DAILY_LIMIT}). Resets at 00:00 UTC."
+    """Returns an error message if this card can't be burned today, else None."""
+    rule = BURN_DAILY_LIMITS.get(rarity_normalized)
+    if not rule:
+        return None
+    key, limit = rule
+    if _get_burn_progress(user_data).get(key, 0) >= limit:
+        name = rarity_normalized.split()[0]
+        return f"Daily {name} burn limit reached ({limit}/{limit}). Resets at 00:00 UTC."
     return None
 
 def record_burn(user_data: dict, rarity_normalized: str):
     """Count a successful burn toward today's limit."""
-    if rarity_normalized == "Elite ⚓":
+    rule = BURN_DAILY_LIMITS.get(rarity_normalized)
+    if rule:
         progress = _get_burn_progress(user_data)
-        progress["elite"] = progress.get("elite", 0) + 1
+        progress[rule[0]] = progress.get(rule[0], 0) + 1
 
 
 class BurnRequest(BaseModel):
