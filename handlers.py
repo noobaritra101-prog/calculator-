@@ -1188,6 +1188,9 @@ async def gift_cmd(message: Message, command: CommandObject):
         return
 
     matched_cid, matched_data = best_match
+    if matched_cid in db["users"][user_id].get("star_purchases", []):
+        await message.reply("🌟 <b>Star cards cannot be gifted.</b>", parse_mode=ParseMode.HTML)
+        return
     global_data    = db["global_cards"].get(matched_cid, {})
     display_rarity = format_rarity(matched_data["rarity"])
 
@@ -1280,6 +1283,10 @@ async def confirm_gift_cb(cq: CallbackQuery):
 
     if card_id not in my_cards or my_cards[card_id]["amount"] <= 0:
         await cq.answer("You don't own this card anymore!", show_alert=True)
+        return
+
+    if card_id in db["users"][user_id].get("star_purchases", []):
+        await cq.answer("🌟 Star cards cannot be gifted.", show_alert=True)
         return
 
     if _check_action_cooldown(f"gift_{user_id}"):
@@ -1457,6 +1464,16 @@ async def trade_cmd(message: Message, command: CommandObject):
     my_cid, my_cdata       = my_match
     their_cid, their_cdata = their_match
 
+    if my_cid in db["users"][user_id].get("star_purchases", []):
+        await message.reply("🌟 <b>Star cards cannot be traded.</b>", parse_mode=ParseMode.HTML)
+        return
+    if their_cid in db["users"][target_id].get("star_purchases", []):
+        await message.reply(
+            f"🌟 <b>{their_cdata['name']}</b> is a Star card and cannot be traded.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     my_rarity    = format_rarity(my_cdata["rarity"])
     their_rarity = format_rarity(their_cdata["rarity"])
 
@@ -1539,6 +1556,21 @@ async def accept_trade_cb(cq: CallbackQuery):
         try:
             await cq.message.edit_text(
                 "<b>「 TRADE CANCELLED 」</b>\n━━━━━━━━━━━━━━━━━\nOne of the cards is no longer available.",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
+    # Star cards can never be traded (re-checked here in case it was bought after the offer)
+    if my_cid in db["users"].get(sender_id, {}).get("star_purchases", []) or \
+       their_cid in db["users"].get(target_id, {}).get("star_purchases", []):
+        trade["status"] = "cancelled"
+        active_trades.pop(trade_id, None)
+        await cq.answer("🌟 Star cards cannot be traded.", show_alert=True)
+        try:
+            await cq.message.edit_text(
+                "<b>「 TRADE CANCELLED 」</b>\n━━━━━━━━━━━━━━━━━\n🌟 Star cards cannot be traded.",
                 parse_mode=ParseMode.HTML
             )
         except Exception:
