@@ -1,6 +1,11 @@
 import asyncio
+import hashlib
+import hmac
+import json
+import os
 import random
 import time
+from urllib.parse import parse_qsl
 from datetime import date
 from typing import Dict, Any
 
@@ -43,6 +48,39 @@ RECOVERY_SCALE = 5000
 # In-memory active round state, keyed by str(user_id).
 active_games: dict = {}
 
+# Telegram Mini App auth. Set BOT_TOKEN in your environment to enforce it.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+INITDATA_MAX_AGE = 86400
+
+
+def verify_init_data(init_data: str, uid: str) -> None:
+    """Rejects requests whose Telegram initData is missing, forged, stale or for another user."""
+    if not BOT_TOKEN:
+        return  # verification stays off until BOT_TOKEN is configured
+    try:
+        pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not got or not hmac.compare_digest(calc, got):
+            raise ValueError("bad hash")
+        if time.time() - int(pairs.get("auth_date", "0")) > INITDATA_MAX_AGE:
+            raise ValueError("stale")
+        if str(json.loads(pairs["user"])["id"]) != str(uid):
+            raise ValueError("uid mismatch")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Session invalid. Reopen the Mini App from Telegram.")
+
+
+def expire_game(uid: str, game: dict) -> None:
+    """Ends a timed-out round: the bet is forfeited and counted as house take."""
+    active_games.pop(uid, None)
+    db = load_db()
+    gs = db.setdefault("mines_global", {})
+    gs["total_taken"] = gs.get("total_taken", 0) + game["bet"]
+    save_db()
+
 # FastAPI Router for Web Mini App
 mines_router = APIRouter(prefix="/api/mines", tags=["Mines Web App"])
 
@@ -54,13 +92,16 @@ class StartGameReq(BaseModel):
     user_id: str
     bet: int
     mines: int
+    init_data: str = ""
 
 class RevealTileReq(BaseModel):
     user_id: str
     tile_index: int
+    init_data: str = ""
 
 class CashoutReq(BaseModel):
     user_id: str
+    init_data: str = ""
 
 
 # ==========================================
@@ -207,7 +248,8 @@ async def edit_game_message(cq: CallbackQuery, text: str, reply_markup: InlineKe
 # REST API ENDPOINTS (FOR WEB MINI APP)
 # ==========================================
 @mines_router.get("/state/{user_id}")
-async def api_get_state(user_id: str):
+async def api_get_state(user_id: str, init_data: str = ""):
+    verify_init_data(init_data, user_id)
     db = load_db()
     ensure_user(user_id, "User", None)
     user_data = db["users"].get(user_id, {})
@@ -237,6 +279,8 @@ async def api_get_state(user_id: str):
         "cashout_value": cashout_val,
         "can_cash_out": can_cash,
         "gems_found": game["gems_found"],
+        "bet": game["bet"],
+        "mines": game["mines"],
         "revealed": revealed_map
     }
 
@@ -244,6 +288,7 @@ async def api_get_state(user_id: str):
 @mines_router.post("/start")
 async def api_start_game(req: StartGameReq):
     uid = str(req.user_id)
+    verify_init_data(req.init_data, uid)
     db = load_db()
     ensure_user(uid, "User", None)
 
@@ -296,6 +341,7 @@ async def api_start_game(req: StartGameReq):
 @mines_router.post("/reveal")
 async def api_reveal_tile(req: RevealTileReq):
     uid = str(req.user_id)
+    verify_init_data(req.init_data, uid)
     game = active_games.get(uid)
     if not game:
         raise HTTPException(status_code=400, detail="No active round found.")
@@ -305,6 +351,12 @@ async def api_reveal_tile(req: RevealTileReq):
         raise HTTPException(status_code=400, detail="Invalid tile index.")
 
     async with game["lock"]:
+        # A queued request can wake up after the round already ended (e.g. mine hit) - never act on a dead round.
+        if active_games.get(uid) is not game:
+            raise HTTPException(status_code=400, detail="No active round found.")
+        if time.time() - game["start_time"] > GAME_TIMEOUT:
+            expire_game(uid, game)
+            raise HTTPException(status_code=400, detail="Round expired.")
         if idx in game["revealed"]:
             raise HTTPException(status_code=400, detail="Tile already revealed.")
 
@@ -325,6 +377,7 @@ async def api_reveal_tile(req: RevealTileReq):
                 "result": "mine",
                 "full_board": full_board,
                 "boom_at": idx,
+                "bet": game["bet"],
                 "balance": db["users"][uid].get("nexus_shards", 0)
             }
 
@@ -361,6 +414,7 @@ async def api_reveal_tile(req: RevealTileReq):
             return {
                 "result": "cleared",
                 "payout": payout,
+                "bet": game["bet"],
                 "full_board": full_board,
                 "balance": db["users"][uid].get("nexus_shards", 0)
             }
@@ -380,11 +434,17 @@ async def api_reveal_tile(req: RevealTileReq):
 @mines_router.post("/cashout")
 async def api_cashout(req: CashoutReq):
     uid = str(req.user_id)
+    verify_init_data(req.init_data, uid)
     game = active_games.get(uid)
     if not game:
         raise HTTPException(status_code=400, detail="No active round found.")
 
     async with game["lock"]:
+        if active_games.get(uid) is not game:
+            raise HTTPException(status_code=400, detail="No active round found.")
+        if time.time() - game["start_time"] > GAME_TIMEOUT:
+            expire_game(uid, game)
+            raise HTTPException(status_code=400, detail="Round expired.")
         if game["gems_found"] < MIN_CASHOUT_GEMS:
             raise HTTPException(status_code=400, detail="Must reveal at least 3 gems before cashing out.")
 
@@ -415,6 +475,7 @@ async def api_cashout(req: CashoutReq):
 
         return {
             "payout": payout,
+            "bet": game["bet"],
             "full_board": full_board,
             "balance": db["users"][uid].get("nexus_shards", 0)
         }
@@ -527,7 +588,7 @@ async def mines_cmd(message: Message, command: CommandObject):
         "start_time": time.time(),
     }
 
-    mines_image = db["settings"].get("mines_image")
+    mines_image = db.get("settings", {}).get("mines_image")
     status_text = build_status_text(bet, mines, 0, 1.0)
     reply_markup = build_keyboard(uid, board, set(), can_cash_out=False)
 
@@ -558,6 +619,13 @@ async def mines_tile_cb(cq: CallbackQuery):
     idx = int(idx_str)
 
     async with game["lock"]:
+        if active_games.get(owner_id) is not game:
+            await cq.answer("This round has already ended.", show_alert=True)
+            return
+        if time.time() - game["start_time"] > GAME_TIMEOUT:
+            expire_game(owner_id, game)
+            await cq.answer("This round expired.", show_alert=True)
+            return
         if idx in game["revealed"]:
             await cq.answer()
             return
@@ -646,6 +714,13 @@ async def mines_cashout_cb(cq: CallbackQuery):
         return
 
     async with game["lock"]:
+        if active_games.get(owner_id) is not game:
+            await cq.answer("This round has already ended.", show_alert=True)
+            return
+        if time.time() - game["start_time"] > GAME_TIMEOUT:
+            expire_game(owner_id, game)
+            await cq.answer("This round expired.", show_alert=True)
+            return
         if game["gems_found"] < MIN_CASHOUT_GEMS:
             remaining = MIN_CASHOUT_GEMS - game["gems_found"]
             await cq.answer(f"Reveal {remaining} more tile{'s' if remaining != 1 else ''} before cashing out!", show_alert=True)
@@ -748,7 +823,7 @@ async def imm_cmd(message: Message):
 
     file_id = message.reply_to_message.photo[-1].file_id
     db = load_db()
-    db["settings"]["mines_image"] = file_id
+    db.setdefault("settings", {})["mines_image"] = file_id
     save_db()
 
     await message.reply("✅ Mines background image saved.", parse_mode=ParseMode.HTML)
