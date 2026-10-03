@@ -40,6 +40,14 @@ def is_divine_day() -> bool:
     """The Divine slot only appears on Sundays (UTC, matching the daily shop reset)."""
     return datetime.now(timezone.utc).weekday() == 6  # Monday=0 ... Sunday=6
 
+def _sunday_special_ids(db: dict) -> set:
+    """Card IDs the admin added to the Sunday Special pool (can be from locked series)."""
+    return {str(x) for x in db.get("settings", {}).get("sunday_special_cards", [])}
+
+def _is_sunday_special(db: dict, card_id) -> bool:
+    """True only on Sunday, for cards on the admin's Sunday Special list."""
+    return is_divine_day() and str(card_id) in _sunday_special_ids(db)
+
 def time_until_shop_reset() -> str:
     """Returns a human-readable 'Xh Ym' countdown until the next midnight UTC
     shop reset, matching the existing 'Resets at midnight UTC' rotation."""
@@ -193,6 +201,61 @@ def _fmt_stats_section(title: str, b: dict) -> list:
         for name, n in sorted(by_rarity.items(), key=lambda x: -x[1]):
             lines.append(f"  {name}: {n:,}")
     return lines
+
+@main_router.message(Command("sundaycard"))
+async def sundaycard_cmd(message: Message, command: CommandObject):
+    """Admin: /sundaycard add <card_id> | remove <card_id> | list
+    Cards on this list can spawn in the Sunday Divine slot even if their series is locked."""
+    if message.chat.type != "private":
+        return
+    if not message.from_user or message.from_user.id not in config.ADMIN_IDS:
+        return
+
+    db = load_db()
+    settings = db.setdefault("settings", {})
+    ids = [str(x) for x in settings.get("sunday_special_cards", [])]
+    args = (command.args or "").split()
+    action = args[0].lower() if args else "list"
+
+    if action == "list":
+        if not ids:
+            await message.reply("No Sunday Special cards set.\nUse /sundaycard add &lt;card_id&gt;")
+            return
+        lines = []
+        for cid in ids:
+            c = db["global_cards"].get(cid)
+            lines.append(f"• <code>{cid}</code> — {c['name'] if c else '⚠️ missing'}")
+        await message.reply("<b>❄️ Sunday Special cards</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    if action not in ("add", "remove") or len(args) < 2:
+        await message.reply("Usage: /sundaycard add|remove &lt;card_id&gt; | list", parse_mode=ParseMode.HTML)
+        return
+
+    cid = args[1]
+    if action == "add":
+        card = db["global_cards"].get(cid)
+        if not card:
+            await message.reply("❌ Card ID not found.")
+            return
+        if format_rarity(card["rarity"]) != "Divine ❄️":
+            await message.reply("❌ Only Divine cards can be Sunday Specials.")
+            return
+        if cid in ids:
+            await message.reply("Already on the list.")
+            return
+        ids.append(cid)
+        settings["sunday_special_cards"] = ids
+        save_db()
+        await message.reply(f"✅ Added <b>{card['name']}</b> to Sunday Special.", parse_mode=ParseMode.HTML)
+    else:
+        if cid not in ids:
+            await message.reply("That card isn't on the list.")
+            return
+        ids.remove(cid)
+        settings["sunday_special_cards"] = ids
+        save_db()
+        await message.reply("✅ Removed from Sunday Special.")
 
 @main_router.message(Command("store_stats"))
 async def store_stats_cmd(message: Message):
@@ -371,7 +434,7 @@ async def store_online_cb(cq: CallbackQuery):
         # Divine slot only rolls in on Sundays.
         divines = {}
         if divine_day:
-            divines = {k: v for k, v in db["global_cards"].items() if format_rarity(v["rarity"]) == "Divine ❄️" and v["anime"].lower().strip() not in locked_animes_lower}
+            divines = {k: v for k, v in db["global_cards"].items() if format_rarity(v["rarity"]) == "Divine ❄️" and (v["anime"].lower().strip() not in locked_animes_lower or str(k) in _sunday_special_ids(db))}
 
         # Basic/Elite/Divine re-roll on refresh — their seed includes the offset.
         seed = f"{today}_{uid}_{offset}"
@@ -517,7 +580,7 @@ async def buy_online_confirm_cb(cq: CallbackQuery):
 
     card_data = db["global_cards"][card_id]
     locked_animes_lower = [a.lower().strip() for a in db.get("settings", {}).get("locked_animes", [])]
-    if card_data["anime"].lower().strip() in locked_animes_lower:
+    if card_data["anime"].lower().strip() in locked_animes_lower and not _is_sunday_special(db, card_id):
         await cq.answer("🔒 This card's series is currently locked and unavailable.", show_alert=True)
         return
 
@@ -584,7 +647,7 @@ async def buy_online_execute_cb(cq: CallbackQuery):
 
         card_data = db["global_cards"][card_id]
         locked_animes_lower = [a.lower().strip() for a in db.get("settings", {}).get("locked_animes", [])]
-        if card_data["anime"].lower().strip() in locked_animes_lower:
+        if card_data["anime"].lower().strip() in locked_animes_lower and not _is_sunday_special(db, card_id):
             await cq.answer("🔒 This card's series is currently locked and unavailable.", show_alert=True)
             return
 
@@ -1339,7 +1402,7 @@ async def api_get_online_store(user_id: str):
 
             divines = {}
             if divine_day:
-                divines = {k: v for k, v in db["global_cards"].items() if format_rarity(v["rarity"]) == "Divine ❄️" and v["anime"].lower().strip() not in locked_animes_lower}
+                divines = {k: v for k, v in db["global_cards"].items() if format_rarity(v["rarity"]) == "Divine ❄️" and (v["anime"].lower().strip() not in locked_animes_lower or str(k) in _sunday_special_ids(db))}
 
             seed = f"{today}_{user_id}_{offset}"
             random.seed(seed)
@@ -1449,7 +1512,7 @@ async def api_online_buy(req: OnlineBuyRequest):
 
             card_data = db["global_cards"][req.card_id]
             locked_animes_lower = [a.lower().strip() for a in db.get("settings", {}).get("locked_animes", [])]
-            if card_data["anime"].lower().strip() in locked_animes_lower:
+            if card_data["anime"].lower().strip() in locked_animes_lower and not _is_sunday_special(db, req.card_id):
                 raise HTTPException(status_code=403, detail="This card's series is currently locked and unavailable.")
 
             rarity = format_rarity(card_data["rarity"])
