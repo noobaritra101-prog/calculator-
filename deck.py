@@ -8,6 +8,10 @@ import os
 import time
 import random
 import logging
+import hmac
+import hashlib
+import json
+from urllib.parse import parse_qsl
 from datetime import datetime, timezone
 from aiogram import F
 from aiogram.types import (
@@ -18,7 +22,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode, ChatMemberStatus
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 import aiohttp
 
@@ -1463,3 +1467,257 @@ async def confirm_burn_cb(cq: CallbackQuery):
     )
     await cq.message.edit_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=None)
     await cq.answer("🔥 Card burned successfully!")
+
+
+# ==========================================
+# 🐔 CHICKEN CROSS (Mini App game)
+#   /c_cross  /c_top [level]  /c_help
+# Game page is served by this backend at /api/deck/chicken/game (chicken.html
+# must sit next to deck.py). Scores are posted by the game with Telegram
+# initData, which is verified with the bot token before anything is saved.
+# Data lives in users[uid]["chicken"] = {best:{level:score}, games, coins, last_ts}
+# ==========================================
+CHICKEN_LEVELS = {"peasy": "Peasy", "easy": "Easy", "medium": "Medium", "hard": "Hard", "vhard": "Very hard"}
+CHICKEN_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chicken.html")
+# Direct Mini App link (used in groups). Create it in BotFather: /newapp -> short name "chicken"
+# -> Web App URL = <BACKEND_PUBLIC_URL>/api/deck/chicken/game
+CHICKEN_APP_LINK = f"https://t.me/{BOT_USERNAME}/chicken"
+CHICKEN_MEDALS = ["🥇", "🥈", "🥉"]
+
+
+def _chicken_game_url() -> str:
+    base = str(BACKEND_PUBLIC_URL or "").strip().rstrip("/")
+    if base and not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    return f"{base}/api/deck/chicken/game"
+
+
+def _chicken_verify_init_data(init_data: str, max_age: int = 86400):
+    """Returns the Telegram user dict if initData is genuine and fresh, else None."""
+    try:
+        pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
+        recv_hash = pairs.pop("hash", None)
+        if not recv_hash:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", bot.token.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, recv_hash):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > max_age:
+            return None
+        return json.loads(pairs.get("user", "{}"))
+    except Exception:
+        return None
+
+
+class ChickenScoreReq(BaseModel):
+    init_data: str
+    score: int
+    coins: int = 0
+    level: str = "medium"
+    secs: float = 0
+
+
+@deck_api.get("/chicken/game")
+async def chicken_game_page():
+    if not os.path.exists(CHICKEN_HTML_PATH):
+        raise HTTPException(status_code=404, detail="Game file missing.")
+    return FileResponse(CHICKEN_HTML_PATH, media_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
+@deck_api.post("/chicken/score")
+async def chicken_submit_score(req: ChickenScoreReq):
+    try:
+        tg_user = _chicken_verify_init_data(req.init_data)
+        if not tg_user or "id" not in tg_user:
+            raise HTTPException(status_code=401, detail="Invalid Telegram session.")
+        uid = str(tg_user["id"])
+        if is_ghost_banned(int(uid)) or is_shadow_banned(int(uid)):
+            return {"success": True, "new_best": False}
+        if req.level not in CHICKEN_LEVELS:
+            raise HTTPException(status_code=400, detail="Bad level.")
+
+        score = max(0, min(int(req.score), 5000))
+        coins = max(0, min(int(req.coins), score + 5))
+        if score > max(0.0, float(req.secs)) * 9 + 3:   # faster than the chicken can physically hop
+            raise HTTPException(status_code=400, detail="Score rejected.")
+
+        db = load_db()
+        _, user_data = get_user_from_db(db, uid)
+        if not user_data:
+            ensure_user(uid, tg_user.get("first_name", "User"), tg_user.get("username"))
+            db = load_db()
+            _, user_data = get_user_from_db(db, uid)
+        if not isinstance(user_data, dict):
+            raise HTTPException(status_code=500, detail="Profile error.")
+
+        rec = user_data.setdefault("chicken", {})
+        now = time.time()
+        if now - rec.get("last_ts", 0) < 2:
+            raise HTTPException(status_code=429, detail="Too fast.")
+        best = rec.setdefault("best", {})
+        new_best = score > best.get(req.level, 0)
+        if new_best:
+            best[req.level] = score
+        rec["games"] = rec.get("games", 0) + 1
+        rec["coins"] = rec.get("coins", 0) + coins
+        rec["last_ts"] = now
+        save_db()
+        return {"success": True, "new_best": new_best, "best": best.get(req.level, 0)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[chicken_score_CRASH] {e}")
+        traceback.print_exc()
+        dlog.error(f"[chicken_score_CRASH] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Score save error.")
+
+
+def _chicken_board(db: dict, level=None):
+    """[(score, uid, name, level_of_that_score)] sorted high -> low."""
+    rows = []
+    users = db.get("users", {}) if isinstance(db, dict) else {}
+    for uid, u in (users or {}).items():
+        rec = u.get("chicken") if isinstance(u, dict) else None
+        best = rec.get("best") if isinstance(rec, dict) else None
+        if not isinstance(best, dict) or not best:
+            continue
+        if level:
+            sc, lv = best.get(level, 0), level
+        else:
+            lv = max(best, key=lambda k: best[k])
+            sc = best[lv]
+        if sc > 0:
+            rows.append((sc, str(uid), sanitize_display_name(u.get("name", "User")), lv))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    return rows
+
+
+def _chicken_level_arg(arg):
+    """None = no argument, '?' = unknown level."""
+    if not arg:
+        return None
+    a = re.sub(r"[^a-z]", "", arg.lower())
+    return {"peasy": "peasy", "easy": "easy", "medium": "medium", "med": "medium",
+            "hard": "hard", "veryhard": "vhard", "vhard": "vhard"}.get(a, "?")
+
+
+@main_router.message(Command("c_cross"))
+async def chicken_cross_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+
+    if message.chat.type == "private":
+        btn = InlineKeyboardButton(text="🐔 Play Chicken Cross", web_app=WebAppInfo(url=_chicken_game_url()))
+    else:  # web_app buttons only work in DMs; groups use the direct Mini App link
+        btn = InlineKeyboardButton(text="🐔 Play Chicken Cross", url=CHICKEN_APP_LINK)
+
+    await smart_reply(
+        message,
+        "<b>「 🐔 CHICKEN CROSS 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "Hop across roads and rivers in 3D, collect coins and climb the leaderboard.\n\n"
+        "🏆 /c_top  •  ❓ /c_help",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
+        parse_mode=ParseMode.HTML
+    )
+
+
+CHICKEN_LEVEL_ROWS = [["peasy", "easy"], ["medium", "hard"], ["vhard"]]
+CHICKEN_BTN_LABELS = {"peasy": "Peasy", "easy": "Easy", "medium": "Medium", "hard": "Hard", "vhard": "Very Hard"}
+
+
+def _chicken_top_kb(owner_uid, active=None):
+    rows = []
+    for row in CHICKEN_LEVEL_ROWS:
+        rows.append([
+            InlineKeyboardButton(
+                text=("✓ " if lv == active else "") + CHICKEN_BTN_LABELS[lv],
+                callback_data=f"ctop:{lv}:{owner_uid}"
+            ) for lv in row
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _chicken_top_text(db: dict, lvl, uid) -> str:
+    rows = _chicken_board(db, lvl)
+    title = f"TOP 10 • {CHICKEN_LEVELS[lvl].upper()}" if lvl else "TOP 10 • ALL LEVELS"
+    text = f"<b>「 🐔 CHICKEN CROSS • {title} 」</b>\n━━━━━━━━━━━━━━━━━\n"
+
+    if rows:
+        lines = []
+        for i, (sc, _uid, name, lv) in enumerate(rows[:10]):
+            medal = CHICKEN_MEDALS[i] if i < 3 else f"<b>{i + 1}.</b>"
+            tag = "" if lvl else f"  <i>({CHICKEN_LEVELS[lv]})</i>"
+            lines.append(f"{medal} <b>{_html_esc(name)}</b> — {sc} rows{tag}")
+        text += "\n".join(lines)
+    else:
+        text += "No scores yet. Be the first with /c_cross!"
+
+    me = str(uid)
+    idx = next((i for i, r in enumerate(rows) if r[1] == me), None)
+    if idx is None:
+        rank_line = "🎯 <b>Your rank:</b> Unranked — play with /c_cross"
+    else:
+        rank_line = f"🎯 <b>Your rank:</b> #{idx + 1} — {rows[idx][0]} rows"
+    return text + "\n━━━━━━━━━━━━━━━━━\n" + rank_line
+
+
+@main_router.message(Command("c_top"))
+async def chicken_top_cmd(message: Message, command: CommandObject):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+
+    lvl = _chicken_level_arg(command.args)
+    if lvl == "?":
+        await smart_reply(message, "Usage: <code>/c_top [peasy | easy | medium | hard | veryhard]</code>",
+                          parse_mode=ParseMode.HTML)
+        return
+
+    await smart_reply(
+        message,
+        _chicken_top_text(load_db(), lvl, uid_int),
+        reply_markup=_chicken_top_kb(uid_int, lvl),
+        parse_mode=ParseMode.HTML
+    )
+
+
+@main_router.callback_query(F.data.startswith("ctop:"))
+async def chicken_top_cb(cq: CallbackQuery):
+    if is_ghost_banned(cq.from_user.id) or is_shadow_banned(cq.from_user.id): return
+    try:
+        _, lvl, owner = cq.data.split(":")
+    except ValueError:
+        await cq.answer()
+        return
+    if lvl not in CHICKEN_LEVELS:
+        await cq.answer()
+        return
+    if str(cq.from_user.id) != owner:
+        await cq.answer("This leaderboard belongs to someone else. Send /c_top for your own.", show_alert=True)
+        return
+    try:
+        await cq.message.edit_text(
+            _chicken_top_text(load_db(), lvl, cq.from_user.id),
+            reply_markup=_chicken_top_kb(cq.from_user.id, lvl),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            print(f"[c_top_cb] edit failed: {e}")
+    await cq.answer()
+
+
+@main_router.message(Command("c_help"))
+async def chicken_help_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+    await smart_reply(
+        message,
+        "<b>「 🐔 CHICKEN CROSS COMMANDS 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "/c_cross — open the game\n"
+        "/c_top — global top 10\n"
+        "/c_top hard — top 10 for one level (peasy, easy, medium, hard, veryhard)\n"
+        "/c_help — this list",
+        parse_mode=ParseMode.HTML
+    )
