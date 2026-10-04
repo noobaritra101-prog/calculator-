@@ -1475,14 +1475,15 @@ async def confirm_burn_cb(cq: CallbackQuery):
 # Game page is served by this backend at /api/deck/chicken/game (chicken.html
 # must sit next to deck.py). Scores are posted by the game with Telegram
 # initData, which is verified with the bot token before anything is saved.
-# Data lives in users[uid]["chicken"] = {best:{level:score}, games, coins, last_ts}
+# Data lives in users[uid]["chicken"] = {coins, coins_by:{level:n}, best:{level:rows}, rows, games, save, last_ts}
+# Leaderboard ranks lifetime coins earned (after the level multiplier).
 # ==========================================
 CHICKEN_LEVELS = {"peasy": "Peasy", "easy": "Easy", "medium": "Medium", "hard": "Hard", "vhard": "Very hard"}
 CHICKEN_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chicken.html")
 # Direct Mini App link (used in groups). Create it in BotFather: /newapp -> short name "chicken"
 # -> Web App URL = <BACKEND_PUBLIC_URL>/api/deck/chicken/game
 CHICKEN_APP_LINK = f"https://t.me/{BOT_USERNAME}/chicken"
-CHICKEN_MEDALS = ["🥇", "🥈", "🥉"]
+CHICKEN_MULT = {"peasy": 1, "easy": 1.25, "medium": 1.5, "hard": 2, "vhard": 3}   # same as the game
 
 
 CHICKEN_WEB_URL = "https://nexusanimemonarch.netlify.app/chicken.html"   # where chicken.html is hosted
@@ -1556,15 +1557,19 @@ async def chicken_submit_score(req: ChickenScoreReq):
         now = time.time()
         if now - rec.get("last_ts", 0) < 2:
             raise HTTPException(status_code=429, detail="Too fast.")
+        earned = int(round(coins * CHICKEN_MULT[req.level]))
         best = rec.setdefault("best", {})
         new_best = score > best.get(req.level, 0)
         if new_best:
             best[req.level] = score
+        by = rec.setdefault("coins_by", {})
+        by[req.level] = by.get(req.level, 0) + earned
+        rec["coins"] = rec.get("coins", 0) + earned
+        rec["rows"] = rec.get("rows", 0) + score
         rec["games"] = rec.get("games", 0) + 1
-        rec["coins"] = rec.get("coins", 0) + coins
         rec["last_ts"] = now
         save_db()
-        return {"success": True, "new_best": new_best, "best": best.get(req.level, 0)}
+        return {"success": True, "earned": earned, "new_best": new_best, "best": best.get(req.level, 0)}
     except HTTPException:
         raise
     except Exception as e:
@@ -1630,6 +1635,7 @@ async def chicken_profile(req: ChickenProfileReq):
         return {
             "name": sanitize_display_name(user_data.get("name") or tg_user.get("first_name", "Player")),
             "best": rec.get("best", {}),
+            "coins": rec.get("coins", 0),
             "games": rec.get("games", 0),
             "ranks": ranks,
             "save": rec.get("save"),
@@ -1670,21 +1676,16 @@ async def chicken_sync(req: ChickenSyncReq):
 
 
 def _chicken_board(db: dict, level=None):
-    """[(score, uid, name, level_of_that_score)] sorted high -> low."""
+    """[(coins, uid, name)] sorted high -> low. level=None means lifetime total across all levels."""
     rows = []
     users = db.get("users", {}) if isinstance(db, dict) else {}
     for uid, u in (users or {}).items():
         rec = u.get("chicken") if isinstance(u, dict) else None
-        best = rec.get("best") if isinstance(rec, dict) else None
-        if not isinstance(best, dict) or not best:
+        if not isinstance(rec, dict):
             continue
-        if level:
-            sc, lv = best.get(level, 0), level
-        else:
-            lv = max(best, key=lambda k: best[k])
-            sc = best[lv]
-        if sc > 0:
-            rows.append((sc, str(uid), sanitize_display_name(u.get("name", "User")), lv))
+        c = (rec.get("coins_by") or {}).get(level, 0) if level else rec.get("coins", 0)
+        if c and c > 0:
+            rows.append((int(c), str(uid), sanitize_display_name(u.get("name", "User"))))
     rows.sort(key=lambda r: (-r[0], r[1]))
     return rows
 
@@ -1703,16 +1704,14 @@ async def chicken_cross_cmd(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
 
-    if message.chat.type == "private":
-        btn = InlineKeyboardButton(text="🐔 Play Chicken Cross", web_app=WebAppInfo(url=_chicken_game_url()))
-    else:  # web_app buttons only work in DMs; groups use the direct Mini App link
-        btn = InlineKeyboardButton(text="🐔 Play Chicken Cross", url=CHICKEN_APP_LINK)
+    # Same Mini App direct link in DMs and groups
+    btn = InlineKeyboardButton(text="Play Chicken Cross", url=CHICKEN_APP_LINK)
 
     await smart_reply(
         message,
-        "<b>「 🐔 CHICKEN CROSS 」</b>\n━━━━━━━━━━━━━━━━━\n"
-        "Hop across roads and rivers in 3D, collect coins and climb the leaderboard.\n\n"
-        "🏆 /c_top  •  ❓ /c_help",
+        "<b>「 CHICKEN CROSS 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "Hop across roads and rivers in 3D, collect coins and climb the coin leaderboard.\n\n"
+        "/c_top - coin leaderboard\n/c_help - all commands",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
         parse_mode=ParseMode.HTML
     )
@@ -1727,7 +1726,7 @@ def _chicken_top_kb(owner_uid, active=None):
     for row in CHICKEN_LEVEL_ROWS:
         rows.append([
             InlineKeyboardButton(
-                text=("✓ " if lv == active else "") + CHICKEN_BTN_LABELS[lv],
+                text=(f"[{CHICKEN_BTN_LABELS[lv]}]" if lv == active else CHICKEN_BTN_LABELS[lv]),
                 callback_data=f"ctop:{lv}:{owner_uid}"
             ) for lv in row
         ])
@@ -1736,26 +1735,31 @@ def _chicken_top_kb(owner_uid, active=None):
 
 def _chicken_top_text(db: dict, lvl, uid) -> str:
     rows = _chicken_board(db, lvl)
-    title = f"TOP 10 • {CHICKEN_LEVELS[lvl].upper()}" if lvl else "TOP 10 • ALL LEVELS"
-    text = f"<b>「 🐔 CHICKEN CROSS • {title} 」</b>\n━━━━━━━━━━━━━━━━━\n"
+    title = f"TOP 10 COINS - {CHICKEN_LEVELS[lvl].upper()}" if lvl else "TOP 10 COINS - ALL LEVELS"
+    text = f"<b>「 CHICKEN CROSS - {title} 」</b>\n━━━━━━━━━━━━━━━━━\n"
 
     if rows:
-        lines = []
-        for i, (sc, _uid, name, lv) in enumerate(rows[:10]):
-            medal = CHICKEN_MEDALS[i] if i < 3 else f"<b>{i + 1}.</b>"
-            tag = "" if lvl else f"  <i>({CHICKEN_LEVELS[lv]})</i>"
-            lines.append(f"{medal} <b>{_html_esc(name)}</b> — {sc} rows{tag}")
-        text += "\n".join(lines)
+        text += "\n".join(
+            f"<b>{i + 1}.</b> <b>{_html_esc(name)}</b> - {coins:,} coins"
+            for i, (coins, _uid, name) in enumerate(rows[:10])
+        )
     else:
-        text += "No scores yet. Be the first with /c_cross!"
+        text += "No coins collected yet. Be the first with /c_cross"
 
     me = str(uid)
     idx = next((i for i, r in enumerate(rows) if r[1] == me), None)
+    text += "\n━━━━━━━━━━━━━━━━━\n"
     if idx is None:
-        rank_line = "🎯 <b>Your rank:</b> Unranked — play with /c_cross"
+        text += "<b>Your rank:</b> Unranked"
     else:
-        rank_line = f"🎯 <b>Your rank:</b> #{idx + 1} — {rows[idx][0]} rows"
-    return text + "\n━━━━━━━━━━━━━━━━━\n" + rank_line
+        text += f"<b>Your rank:</b> #{idx + 1} with {rows[idx][0]:,} coins"
+
+    _, user_data = get_user_from_db(db, me)
+    rec = user_data.get("chicken") if isinstance(user_data, dict) else None
+    if isinstance(rec, dict) and rec.get("games"):
+        best_run = max((rec.get("best") or {"x": 0}).values())
+        text += f"\n<b>Games played:</b> {rec.get('games', 0)}   <b>Best run:</b> {best_run} rows"
+    return text
 
 
 @main_router.message(Command("c_top"))
@@ -1809,10 +1813,10 @@ async def chicken_help_cmd(message: Message):
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
     await smart_reply(
         message,
-        "<b>「 🐔 CHICKEN CROSS COMMANDS 」</b>\n━━━━━━━━━━━━━━━━━\n"
-        "/c_cross — open the game\n"
-        "/c_top — global top 10\n"
-        "/c_top hard — top 10 for one level (peasy, easy, medium, hard, veryhard)\n"
-        "/c_help — this list",
+        "<b>「 CHICKEN CROSS COMMANDS 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "/c_cross - open the game\n"
+        "/c_top - top 10 by coins collected\n"
+        "/c_top hard - top 10 for one level (peasy, easy, medium, hard, veryhard)\n"
+        "/c_help - this list",
         parse_mode=ParseMode.HTML
     )
