@@ -1471,7 +1471,7 @@ async def confirm_burn_cb(cq: CallbackQuery):
 
 # ==========================================
 # 🐔 CHICKEN CROSS (Mini App game)
-#   /c_cross  /c_top [level]  /c_help
+#   /chicken_cross  /c_top [level]
 # Game page is served by this backend at /api/deck/chicken/game (chicken.html
 # must sit next to deck.py). Scores are posted by the game with Telegram
 # initData, which is verified with the bot token before anything is saved.
@@ -1553,6 +1553,7 @@ async def chicken_submit_score(req: ChickenScoreReq):
         if not isinstance(user_data, dict):
             raise HTTPException(status_code=500, detail="Profile error.")
 
+        _chicken_fix_name(user_data, tg_user)
         rec = user_data.setdefault("chicken", {})
         now = time.time()
         if now - rec.get("last_ts", 0) < 2:
@@ -1599,6 +1600,14 @@ def _chicken_get_user(tg_user: dict):
     return db, user_data
 
 
+def _chicken_fix_name(user_data: dict, tg_user: dict) -> bool:
+    fn = sanitize_display_name(str(tg_user.get("first_name") or ""))
+    if fn != "User" and str(user_data.get("name") or "User").strip() in ("", "User"):
+        user_data["name"] = fn
+        return True
+    return False
+
+
 def _chicken_clean_save(sv: dict) -> dict:
     owned = [x[:20] for x in (sv.get("owned") or []) if isinstance(x, str)][:60]
     if "classic" not in owned:
@@ -1613,6 +1622,7 @@ def _chicken_clean_save(sv: dict) -> dict:
         "skin": skin,
         "streak": max(0, min(int(sv.get("streak", 0) or 0), 100000)),
         "last": last,
+        "ts": max(0, min(int(sv.get("ts", 0) or 0), 4_102_444_800_000)),
     }
 
 
@@ -1626,6 +1636,8 @@ async def chicken_profile(req: ChickenProfileReq):
         db, user_data = _chicken_get_user(tg_user)
         if not isinstance(user_data, dict):
             raise HTTPException(status_code=500, detail="Profile error.")
+        if _chicken_fix_name(user_data, tg_user):
+            save_db()
         rec = user_data.get("chicken") if isinstance(user_data.get("chicken"), dict) else {}
         ranks = {}
         for key in [None] + list(CHICKEN_LEVELS):
@@ -1685,7 +1697,7 @@ def _chicken_board(db: dict, level=None):
             continue
         c = (rec.get("coins_by") or {}).get(level, 0) if level else rec.get("coins", 0)
         if c and c > 0:
-            rows.append((int(c), str(uid), sanitize_display_name(u.get("name", "User"))))
+            rows.append((int(c), str(uid), sanitize_display_name(str(u.get("name") or "User"))))
     rows.sort(key=lambda r: (-r[0], r[1]))
     return rows
 
@@ -1695,11 +1707,13 @@ def _chicken_level_arg(arg):
     if not arg:
         return None
     a = re.sub(r"[^a-z]", "", arg.lower())
+    if a == "all":
+        return None
     return {"peasy": "peasy", "easy": "easy", "medium": "medium", "med": "medium",
             "hard": "hard", "veryhard": "vhard", "vhard": "vhard"}.get(a, "?")
 
 
-@main_router.message(Command("c_cross"))
+@main_router.message(Command("chicken_cross"))
 async def chicken_cross_cmd(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
@@ -1710,8 +1724,7 @@ async def chicken_cross_cmd(message: Message):
     await smart_reply(
         message,
         "<b>「 CHICKEN CROSS 」</b>\n━━━━━━━━━━━━━━━━━\n"
-        "Hop across roads and rivers in 3D, collect coins and climb the coin leaderboard.\n\n"
-        "/c_top - coin leaderboard\n/c_help - all commands",
+        "Hop across roads and rivers in 3D, collect coins and climb the coin leaderboard.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
         parse_mode=ParseMode.HTML
     )
@@ -1722,7 +1735,12 @@ CHICKEN_BTN_LABELS = {"peasy": "Peasy", "easy": "Easy", "medium": "Medium", "har
 
 
 def _chicken_top_kb(owner_uid, active=None):
-    rows = []
+    rows = [[
+        InlineKeyboardButton(
+            text=("[All]" if active is None else "All"),
+            callback_data=f"ctop:all:{owner_uid}"
+        )
+    ]]
     for row in CHICKEN_LEVEL_ROWS:
         rows.append([
             InlineKeyboardButton(
@@ -1744,7 +1762,7 @@ def _chicken_top_text(db: dict, lvl, uid) -> str:
             for i, (coins, _uid, name) in enumerate(rows[:10])
         )
     else:
-        text += "No coins collected yet. Be the first with /c_cross"
+        text += "No coins collected yet. Be the first with /chicken_cross"
 
     me = str(uid)
     idx = next((i for i, r in enumerate(rows) if r[1] == me), None)
@@ -1769,16 +1787,21 @@ async def chicken_top_cmd(message: Message, command: CommandObject):
 
     lvl = _chicken_level_arg(command.args)
     if lvl == "?":
-        await smart_reply(message, "Usage: <code>/c_top [peasy | easy | medium | hard | veryhard]</code>",
+        await smart_reply(message, "Usage: <code>/c_top [all | peasy | easy | medium | hard | veryhard]</code>",
                           parse_mode=ParseMode.HTML)
         return
 
-    await smart_reply(
-        message,
-        _chicken_top_text(load_db(), lvl, uid_int),
-        reply_markup=_chicken_top_kb(uid_int, lvl),
-        parse_mode=ParseMode.HTML
-    )
+    try:
+        text = _chicken_top_text(load_db(), lvl, uid_int)
+        kb = _chicken_top_kb(uid_int, lvl)
+    except Exception as e:
+        print(f"[c_top_CRASH] {e}")
+        traceback.print_exc()
+        dlog.error(f"[c_top_CRASH] {e}", exc_info=True)
+        await smart_reply(message, "The leaderboard is unavailable right now. Please try again in a moment.")
+        return
+
+    await smart_reply(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 @main_router.callback_query(F.data.startswith("ctop:"))
@@ -1789,7 +1812,9 @@ async def chicken_top_cb(cq: CallbackQuery):
     except ValueError:
         await cq.answer()
         return
-    if lvl not in CHICKEN_LEVELS:
+    if lvl == "all":
+        lvl = None
+    elif lvl not in CHICKEN_LEVELS:
         await cq.answer()
         return
     if str(cq.from_user.id) != owner:
@@ -1804,19 +1829,5 @@ async def chicken_top_cb(cq: CallbackQuery):
     except Exception as e:
         if "not modified" not in str(e).lower():
             print(f"[c_top_cb] edit failed: {e}")
+            dlog.error(f"[c_top_cb] edit failed: {e}", exc_info=True)
     await cq.answer()
-
-
-@main_router.message(Command("c_help"))
-async def chicken_help_cmd(message: Message):
-    uid_int = message.from_user.id
-    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
-    await smart_reply(
-        message,
-        "<b>「 CHICKEN CROSS COMMANDS 」</b>\n━━━━━━━━━━━━━━━━━\n"
-        "/c_cross - open the game\n"
-        "/c_top - top 10 by coins collected\n"
-        "/c_top hard - top 10 for one level (peasy, easy, medium, hard, veryhard)\n"
-        "/c_help - this list",
-        parse_mode=ParseMode.HTML
-    )
