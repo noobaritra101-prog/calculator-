@@ -1485,11 +1485,11 @@ CHICKEN_APP_LINK = f"https://t.me/{BOT_USERNAME}/chicken"
 CHICKEN_MEDALS = ["🥇", "🥈", "🥉"]
 
 
+CHICKEN_WEB_URL = "https://nexusanimemonarch.netlify.app/chicken.html"   # where chicken.html is hosted
+
+
 def _chicken_game_url() -> str:
-    base = str(BACKEND_PUBLIC_URL or "").strip().rstrip("/")
-    if base and not base.startswith(("http://", "https://")):
-        base = "https://" + base
-    return f"{base}/api/deck/chicken/game"
+    return CHICKEN_WEB_URL
 
 
 def _chicken_verify_init_data(init_data: str, max_age: int = 86400):
@@ -1572,6 +1572,101 @@ async def chicken_submit_score(req: ChickenScoreReq):
         traceback.print_exc()
         dlog.error(f"[chicken_score_CRASH] {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Score save error.")
+
+
+class ChickenProfileReq(BaseModel):
+    init_data: str
+
+
+class ChickenSyncReq(BaseModel):
+    init_data: str
+    save: dict
+
+
+def _chicken_get_user(tg_user: dict):
+    uid = str(tg_user["id"])
+    db = load_db()
+    _, user_data = get_user_from_db(db, uid)
+    if not user_data:
+        ensure_user(uid, tg_user.get("first_name", "User"), tg_user.get("username"))
+        db = load_db()
+        _, user_data = get_user_from_db(db, uid)
+    return db, user_data
+
+
+def _chicken_clean_save(sv: dict) -> dict:
+    owned = [x[:20] for x in (sv.get("owned") or []) if isinstance(x, str)][:60]
+    if "classic" not in owned:
+        owned.insert(0, "classic")
+    skin = sv.get("skin") if sv.get("skin") in owned else "classic"
+    last = str(sv.get("last", ""))[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", last):
+        last = ""
+    return {
+        "bank": max(0, min(int(sv.get("bank", 0) or 0), 10_000_000)),
+        "owned": owned,
+        "skin": skin,
+        "streak": max(0, min(int(sv.get("streak", 0) or 0), 100000)),
+        "last": last,
+    }
+
+
+@deck_api.post("/chicken/profile")
+async def chicken_profile(req: ChickenProfileReq):
+    try:
+        tg_user = _chicken_verify_init_data(req.init_data)
+        if not tg_user or "id" not in tg_user:
+            raise HTTPException(status_code=401, detail="Invalid Telegram session.")
+        uid = str(tg_user["id"])
+        db, user_data = _chicken_get_user(tg_user)
+        if not isinstance(user_data, dict):
+            raise HTTPException(status_code=500, detail="Profile error.")
+        rec = user_data.get("chicken") if isinstance(user_data.get("chicken"), dict) else {}
+        ranks = {}
+        for key in [None] + list(CHICKEN_LEVELS):
+            rows = _chicken_board(db, key)
+            idx = next((i for i, r in enumerate(rows) if r[1] == uid), None)
+            ranks[key or "overall"] = (idx + 1) if idx is not None else None
+        return {
+            "name": sanitize_display_name(user_data.get("name") or tg_user.get("first_name", "Player")),
+            "best": rec.get("best", {}),
+            "games": rec.get("games", 0),
+            "ranks": ranks,
+            "save": rec.get("save"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[chicken_profile_CRASH] {e}")
+        traceback.print_exc()
+        dlog.error(f"[chicken_profile_CRASH] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Profile load error.")
+
+
+@deck_api.post("/chicken/sync")
+async def chicken_sync(req: ChickenSyncReq):
+    try:
+        tg_user = _chicken_verify_init_data(req.init_data)
+        if not tg_user or "id" not in tg_user:
+            raise HTTPException(status_code=401, detail="Invalid Telegram session.")
+        try:
+            clean = _chicken_clean_save(req.save)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Bad save data.")
+        _, user_data = _chicken_get_user(tg_user)
+        if not isinstance(user_data, dict):
+            raise HTTPException(status_code=500, detail="Profile error.")
+        rec = user_data.setdefault("chicken", {})
+        rec["save"] = clean
+        save_db()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[chicken_sync_CRASH] {e}")
+        traceback.print_exc()
+        dlog.error(f"[chicken_sync_CRASH] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Sync error.")
 
 
 def _chicken_board(db: dict, level=None):
