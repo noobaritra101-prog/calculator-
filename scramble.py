@@ -14,6 +14,7 @@ import random
 import asyncio
 import secrets
 import traceback
+from collections import deque
 from html import escape as _html_esc
 
 from PIL import Image, ImageDraw, ImageFont   # pip install pillow
@@ -41,24 +42,136 @@ SCRAMBLE_ROWS = 3
 SCRAMBLE_MAX_WIDTH = 900            # working resolution of the puzzle image
 SCRAMBLE_TTL = 15 * 60              # idle seconds before a puzzle expires
 SCRAMBLE_MAX_GAMES = 150            # hard cap on puzzles held in memory
-SCRAMBLE_CLICK_COOLDOWN = 1.0       # seconds between button taps (flood guard)
+# Card pool: prepared card images kept ready so a board can be sent without downloading.
+# Each game CONSUMES one card from the pool. When the pool drops to SCRAMBLE_POOL_LOW it
+# is refilled in the background up to SCRAMBLE_POOL_SIZE, using cards that are neither
+# already in the pool nor among the last SCRAMBLE_RECENT_MAX cards played.
+SCRAMBLE_POOL_SIZE = 60
+SCRAMBLE_POOL_LOW = 30
+SCRAMBLE_RECENT_MAX = 100
+SCRAMBLE_REFILL_PARALLEL = 4        # simultaneous Telegram downloads while refilling
+
+# Button flood guard: taps closer together than the cooldown are dropped silently
+# (instant, no spinner). Too many dropped taps in a row locks the board briefly.
+SCRAMBLE_CLICK_COOLDOWN = 0.5       # min seconds between accepted taps
+SCRAMBLE_FLOOD_STRIKES = 5          # dropped taps in a row before the lock kicks in
+SCRAMBLE_FLOOD_LOCK = 5.0           # seconds the board stays locked after a flood
 
 # (solve under N seconds, shards). Anything slower than the last tier pays nothing.
 SCRAMBLE_REWARD_TIERS = [(60, 100), (120, 50)]
 
-# gid -> {owner, base (jpeg bytes), perm, selected, moves, started, touched, lock, name, rarity, anime}
+# gid -> {owner, chat_id, message_id, base (jpeg bytes), perm, selected, moves, started, touched,
+#          last_click, strikes, locked_until, lock, name, rarity, anime}
 _scramble_games: dict[str, dict] = {}
+_scramble_starting: set = set()      # owners whose puzzle is being built right now
+_scramble_pool: dict = {}            # card_id -> prepared JPEG, ready to play
+_scramble_recent: deque = deque(maxlen=SCRAMBLE_RECENT_MAX)   # card ids played lately
+_scramble_refilling = False
+_scramble_inflight: set = set()      # card ids being downloaded right now
+_scramble_bg: set = set()            # keeps background tasks alive
 
 
-def _scramble_purge(owner: int | None = None):
-    """Drop expired puzzles, any older puzzle of `owner`, and enforce the memory cap."""
+def _scramble_purge():
+    """Drop expired puzzles and enforce the memory cap."""
     now = time.time()
     for gid, g in list(_scramble_games.items()):
-        if now - g["touched"] > SCRAMBLE_TTL or (owner is not None and g["owner"] == owner):
+        if now - g["touched"] > SCRAMBLE_TTL:
             _scramble_games.pop(gid, None)
     while len(_scramble_games) >= SCRAMBLE_MAX_GAMES:
         oldest = min(_scramble_games, key=lambda k: _scramble_games[k]["touched"])
         _scramble_games.pop(oldest, None)
+
+
+def _scramble_active_game(owner: int):
+    """The owner's running puzzle, if any (expired ones are cleaned out first)."""
+    _scramble_purge()
+    for gid, g in _scramble_games.items():
+        if g["owner"] == owner:
+            return gid, g
+    return None, None
+
+
+async def _scramble_fetch(file_id: str) -> bytes:
+    """Download a card and prepare it (resize + crop to the grid)."""
+    buf = io.BytesIO()
+    await bot.download(file_id, destination=buf)
+    return await asyncio.to_thread(_scramble_prepare, buf.getvalue())
+
+
+def _scramble_valid_ids(db: dict) -> list:
+    """Card ids with art, skipping locked animes."""
+    locked = [a.lower().strip() for a in db.get("settings", {}).get("locked_animes", [])]
+    return [c for c, g in db.get("global_cards", {}).items()
+            if g.get("file_id") and str(g.get("anime", "")).lower().strip() not in locked]
+
+
+def _scramble_candidates(db: dict) -> list:
+    """Cards eligible to enter the pool: not in it, and not played recently.
+    A tiny catalogue relaxes the 'recent' rule so the pool can still fill."""
+    valid = _scramble_valid_ids(db)
+    taken = set(_scramble_pool) | _scramble_inflight
+    fresh = [c for c in valid if c not in taken and c not in _scramble_recent]
+    return fresh or [c for c in valid if c not in taken]
+
+
+def _scramble_take(db: dict):
+    """Consume one ready card from the pool -> (card_id, base), or (None, None)."""
+    valid = set(_scramble_valid_ids(db))
+    while _scramble_pool:
+        cid = random.choice(list(_scramble_pool))
+        base = _scramble_pool.pop(cid)
+        if cid in valid:   # card may have been removed/locked since it was pooled
+            return cid, base
+    return None, None
+
+
+async def _scramble_refill(db: dict):
+    """Top the pool back up to SCRAMBLE_POOL_SIZE in the background."""
+    global _scramble_refilling
+    if _scramble_refilling:
+        return
+    _scramble_refilling = True
+    try:
+        sem = asyncio.Semaphore(SCRAMBLE_REFILL_PARALLEL)
+
+        async def load(cid):
+            """Download one card and drop it into the pool the moment it is ready,
+            so players benefit before the whole batch has finished."""
+            async with sem:
+                base = await _scramble_fetch(db["global_cards"][cid]["file_id"])
+            if (cid not in _scramble_pool and cid not in _scramble_recent
+                    and len(_scramble_pool) < SCRAMBLE_POOL_SIZE):
+                _scramble_pool[cid] = base
+                return True
+            return False
+
+        while len(_scramble_pool) < SCRAMBLE_POOL_SIZE:
+            cands = _scramble_candidates(db)
+            if not cands:
+                break
+            batch = random.sample(cands, min(SCRAMBLE_POOL_SIZE - len(_scramble_pool), len(cands)))
+            _scramble_inflight.update(batch)
+            try:
+                results = await asyncio.gather(*(load(c) for c in batch), return_exceptions=True)
+            finally:
+                _scramble_inflight.difference_update(batch)
+            for r in results:
+                if isinstance(r, Exception):
+                    dlog.error(f"[scramble_refill] {r}")
+            if not any(r is True for r in results):   # nothing added - stop instead of looping forever
+                break
+    except Exception as e:
+        dlog.error(f"[scramble_refill] {e}", exc_info=True)
+    finally:
+        _scramble_refilling = False
+
+
+def _scramble_kick_refill(db: dict):
+    """Start a background refill when the pool is at/below the low-water mark."""
+    if len(_scramble_pool) <= SCRAMBLE_POOL_LOW and not _scramble_refilling:
+        task = asyncio.create_task(_scramble_refill(db))
+        _scramble_bg.add(task)
+        task.add_done_callback(_scramble_bg.discard)
 
 
 def _scramble_font(size: int):
@@ -83,7 +196,7 @@ def _scramble_prepare(raw: bytes) -> bytes:
     h = img.height - (img.height % SCRAMBLE_ROWS)
     img = img.crop((0, 0, w, h))
     out = io.BytesIO()
-    img.save(out, "JPEG", quality=92)
+    img.save(out, "JPEG", quality=85)
     return out.getvalue()
 
 
@@ -165,20 +278,27 @@ def _scramble_reward_for(elapsed: float) -> int:
     return 0
 
 
-def _scramble_pay(user_id: str, name: str, username, earned: int) -> int:
-    """Credits `earned` shards, limited by the daily minigame cap shared with
-    /gcard and Versus. Returns the amount actually paid."""
-    if earned <= 0:
-        return 0
+def _scramble_settle(user_id: str, name: str, username, elapsed: float, earned: int) -> int:
+    """Records the win (rounds, best time, shards) and credits `earned` shards, limited
+    by the daily minigame cap shared with /gcard and Versus. Returns shards actually paid."""
     db = ensure_user(user_id, name, username)
     user_data = db["users"][user_id]
-    rewards = get_daily_minigame_rewards(user_data)
-    used = rewards.get("shards", 0)
-    if used >= DAILY_MINIGAME_REWARD_CAP:
-        return 0
-    paid = min(earned, DAILY_MINIGAME_REWARD_CAP - used)
-    user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + paid
-    rewards["shards"] = used + paid
+
+    paid = 0
+    if earned > 0:
+        rewards = get_daily_minigame_rewards(user_data)
+        used = rewards.get("shards", 0)
+        if used < DAILY_MINIGAME_REWARD_CAP:
+            paid = min(earned, DAILY_MINIGAME_REWARD_CAP - used)
+            user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + paid
+            rewards["shards"] = used + paid
+
+    rec = user_data.setdefault("scramble", {})
+    rec["rounds"] = rec.get("rounds", 0) + 1
+    rec["shards"] = rec.get("shards", 0) + paid
+    best = rec.get("best_time")
+    if best is None or elapsed < best:
+        rec["best_time"] = round(elapsed, 2)
     save_db()
     return paid
 
@@ -187,12 +307,9 @@ def _scramble_caption(game: dict, selected: int | None = None) -> str:
     hint = (f"Swap <b>{selected + 1}</b> with…? Tap another number."
             if selected is not None else "Tap two numbers to swap those pieces.")
     return (
-        "<b>「 🧩 SCRAMBLE 」</b>\n"
+        "<b>「 SCRAMBLE 」</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
         "Put the card back together!\n"
-        "<blockquote>Under 1 min: <b>100 Shards</b>\n"
-        "Under 2 min: <b>50 Shards</b>\n"
-        "Slower: no shards</blockquote>\n"
         f"<b>Moves:</b> {game['moves']}\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"<i>{hint}</i>"
@@ -200,7 +317,7 @@ def _scramble_caption(game: dict, selected: int | None = None) -> str:
 
 
 def _scramble_end_caption(game: dict, won: bool, reward_text: str = "") -> str:
-    head = "「 🧩 SCRAMBLE SOLVED! 」" if won else "「 🏳️ SCRAMBLE GAVE UP 」"
+    head = "「 SCRAMBLE SOLVED! 」" if won else "「 SCRAMBLE GAVE UP 」"
     lines = (
         f"<b>{head}</b>\n━━━━━━━━━━━━━━━━━\n"
         f"<b>Character :</b> {_html_esc(str(game['name']))}\n"
@@ -221,52 +338,83 @@ async def scramble_cmd(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
 
-    user_id = str(uid_int)
-    db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
-    global_cards = db.get("global_cards", {})
+    # One puzzle per player at a time.
+    _, active = _scramble_active_game(uid_int)
+    if active or uid_int in _scramble_starting:
+        await message.reply(
+            "You already have a scramble running!\n"
+            "Finish it, or tap <b>Give Up</b> on it, before starting another.",
+            parse_mode=ParseMode.HTML)
+        return
 
+    _scramble_starting.add(uid_int)   # reserve the slot while the board is being built
+    gid = None
+    loading = None
     try:
-        # Bot picks any random card (skipping locked animes) — not limited to the player's deck.
-        locked = [a.lower().strip() for a in db.get("settings", {}).get("locked_animes", [])]
-        pool = [c for c, g in global_cards.items()
-                if g.get("file_id") and str(g.get("anime", "")).lower().strip() not in locked]
-        if not pool:
-            await message.reply("There are no cards to scramble yet.")
-            return
-        cid = random.choice(pool)
+        loading = await message.reply("Loading your scrambled card..")
+        user_id = str(uid_int)
+        db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
+        global_cards = db.get("global_cards", {})
 
+        # Take a ready card from the pool (instant). Cold pool: build one on demand.
+        cid, base = _scramble_take(db)
+        if cid is None:
+            cands = _scramble_candidates(db)
+            if not cands:
+                await loading.edit_text("There are no cards to scramble yet.")
+                loading = None
+                _scramble_kick_refill(db)
+                return
+            cid = random.choice(cands)
+            base = await _scramble_fetch(global_cards[cid]["file_id"])
+        _scramble_recent.append(cid)   # never offered again until it ages out of the recent list
         g = global_cards[cid]
-        await bot.send_chat_action(message.chat.id, "upload_photo")
-
-        buf = io.BytesIO()
-        await bot.download(g["file_id"], destination=buf)
-        base = await asyncio.to_thread(_scramble_prepare, buf.getvalue())
         perm = _scramble_shuffle(SCRAMBLE_COLS * SCRAMBLE_ROWS)
         img = await asyncio.to_thread(_scramble_render, base, perm)
 
-        _scramble_purge(owner=uid_int)   # one puzzle per player at a time
+        _scramble_purge()
         gid = secrets.token_hex(4)
+        now = time.time()
         game = {
-            "owner": uid_int, "base": base, "perm": perm, "selected": None, "moves": 0,
-            "started": time.time(), "touched": time.time(), "last_click": 0.0, "lock": asyncio.Lock(),
+            "owner": uid_int, "chat_id": None, "message_id": None, "base": base, "perm": perm,
+            "selected": None, "moves": 0, "started": now, "touched": now,
+            "last_click": 0.0, "strikes": 0, "locked_until": 0.0, "lock": asyncio.Lock(),
             "name": g.get("name", "Card"), "rarity": g.get("rarity", "Common"),
             "anime": g.get("anime", "Unknown"),
         }
         _scramble_games[gid] = game
 
-        await message.reply_photo(
+        sent = await message.reply_photo(
             photo=BufferedInputFile(img, filename="scramble.jpg"),
             caption=_scramble_caption(game),
             reply_markup=_scramble_kb(gid),
             parse_mode=ParseMode.HTML
         )
-        game["started"] = time.time()   # clock starts once the puzzle is actually on screen
-        game["touched"] = game["started"]
+        game["chat_id"], game["message_id"] = sent.chat.id, sent.message_id
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        loading = None
+        game["started"] = game["touched"] = time.time()   # clock starts once it's on screen
+
+        _scramble_kick_refill(db)   # pool at/below the low mark -> refill in the background
     except Exception as e:
+        if gid:
+            _scramble_games.pop(gid, None)   # never leave a dead puzzle blocking the player
         print(f"[scramble_CRASH] {e}")
         traceback.print_exc()
         dlog.error(f"[scramble_CRASH] {e}", exc_info=True)
-        await message.reply("Couldn't build the puzzle right now. Please try again in a moment.")
+        err = "Couldn't build the puzzle right now. Please try again in a moment."
+        try:
+            if loading:
+                await loading.edit_text(err)
+            else:
+                await message.reply(err)
+        except Exception:
+            pass
+    finally:
+        _scramble_starting.discard(uid_int)
 
 
 @main_router.callback_query(F.data.startswith("scr:"))
@@ -287,17 +435,32 @@ async def scramble_cb(cq: CallbackQuery):
         await cq.answer("This puzzle belongs to someone else. Send /scramble for your own.", show_alert=True)
         return
 
-    # Flood guard: ignore taps that arrive faster than the cooldown.
+    # ── Flood guard ──
     now = time.time()
-    if now - game["last_click"] < SCRAMBLE_CLICK_COOLDOWN:
-        await cq.answer("Slow down a little…")
+    if now < game["locked_until"]:
+        await cq.answer(f"Too fast! Wait {int(game['locked_until'] - now) + 1}s.")
         return
+    if now - game["last_click"] < SCRAMBLE_CLICK_COOLDOWN:
+        game["strikes"] += 1
+        if game["strikes"] >= SCRAMBLE_FLOOD_STRIKES:
+            game["strikes"] = 0
+            game["locked_until"] = now + SCRAMBLE_FLOOD_LOCK
+            await cq.answer(f"Too fast! Buttons locked for {int(SCRAMBLE_FLOOD_LOCK)}s.", show_alert=True)
+        else:
+            await cq.answer()   # dropped silently, instant
+        return
+    game["strikes"] = 0
     game["last_click"] = now
+
+    # Acknowledge right away so the button stops spinning; the redraw follows.
+    try:
+        await cq.answer()
+    except Exception:
+        pass
 
     try:
         async with game["lock"]:
             if gid not in _scramble_games:   # finished while we waited on the lock
-                await cq.answer()
                 return
             game["touched"] = time.time()
             n = SCRAMBLE_COLS * SCRAMBLE_ROWS
@@ -311,16 +474,13 @@ async def scramble_cb(cq: CallbackQuery):
                                           caption=_scramble_end_caption(game, won=False),
                                           parse_mode=ParseMode.HTML),
                     reply_markup=None)
-                await cq.answer()
                 return
 
             try:
                 idx = int(action)
             except ValueError:
-                await cq.answer()
                 return
             if not 0 <= idx < n:
-                await cq.answer()
                 return
 
             sel = game["selected"]
@@ -332,7 +492,6 @@ async def scramble_cb(cq: CallbackQuery):
                     caption=_scramble_caption(game, game["selected"]),
                     reply_markup=_scramble_kb(gid, game["selected"]),
                     parse_mode=ParseMode.HTML)
-                await cq.answer()
                 return
 
             # Second tap: swap the two pieces and redraw.
@@ -347,8 +506,9 @@ async def scramble_cb(cq: CallbackQuery):
                 _scramble_games.pop(gid, None)
                 game["finished"] = time.time()   # stop the clock before rendering/uploading
                 earned = _scramble_reward_for(game["finished"] - game["started"])
-                paid = _scramble_pay(str(cq.from_user.id), cq.from_user.first_name,
-                                     cq.from_user.username, earned)
+                paid = _scramble_settle(str(cq.from_user.id), cq.from_user.first_name,
+                                        cq.from_user.username,
+                                        game["finished"] - game["started"], earned)
                 if paid > 0:
                     reward_text = f"<b>Reward :</b> +{paid} Shards\n"
                 elif earned > 0:
@@ -362,13 +522,126 @@ async def scramble_cb(cq: CallbackQuery):
                     caption=_scramble_end_caption(game, won=True, reward_text=reward_text) if solved else _scramble_caption(game),
                     parse_mode=ParseMode.HTML),
                 reply_markup=_scramble_kb(gid, solved=solved))
-            await cq.answer("Solved!" if solved else None)
     except Exception as e:
         if "not modified" not in str(e).lower():
             print(f"[scramble_cb] failed: {e}")
             traceback.print_exc()
             dlog.error(f"[scramble_cb] failed: {e}", exc_info=True)
-        try:
-            await cq.answer()
-        except Exception:
-            pass
+
+
+# ==========================================
+# /scramble_lbd — LEADERBOARD
+# ==========================================
+SCRAMBLE_LB_TABS = {"time": "Time taken", "rounds": "Round", "shards": "Total shards collected"}
+SCRAMBLE_LB_TITLES = {"time": "FASTEST TIME", "rounds": "ROUNDS SOLVED", "shards": "TOTAL SHARDS"}
+
+
+def _scramble_fmt_best(t: float) -> str:
+    if t < 60:
+        return f"{t:.2f}s"
+    return f"{int(t // 60)}m {t % 60:04.1f}s"
+
+
+def _scramble_board(db: dict, tab: str):
+    """[(value, uid, name)] best first. Time: lowest wins; Round / Shards: highest wins."""
+    rows = []
+    for uid, u in (db.get("users") or {}).items():
+        rec = u.get("scramble") if isinstance(u, dict) else None
+        if not isinstance(rec, dict):
+            continue
+        if tab == "time":
+            v = rec.get("best_time")
+        elif tab == "rounds":
+            v = rec.get("rounds", 0)
+        else:
+            v = rec.get("shards", 0)
+        if v and v > 0:
+            name = str(u.get("name") or "User")[:24]
+            rows.append((v, str(uid), name))
+    if tab == "time":
+        rows.sort(key=lambda r: (r[0], r[1]))
+    else:
+        rows.sort(key=lambda r: (-r[0], r[1]))
+    return rows
+
+
+def _scramble_fmt_value(tab: str, v) -> str:
+    if tab == "time":
+        return _scramble_fmt_best(v)
+    if tab == "rounds":
+        return f"{int(v):,} round" + ("" if int(v) == 1 else "s")
+    return f"{int(v):,} shards"
+
+
+def _scramble_lb_text(db: dict, tab: str, uid) -> str:
+    rows = _scramble_board(db, tab)
+    text = f"<b>「 SCRAMBLE - {SCRAMBLE_LB_TITLES[tab]} 」</b>\n━━━━━━━━━━━━━━━━━\n"
+    if rows:
+        text += "\n".join(
+            f"<b>{i + 1}.</b> <b>{_html_esc(name)}</b> - {_scramble_fmt_value(tab, v)}"
+            for i, (v, _u, name) in enumerate(rows[:10])
+        )
+    else:
+        text += "Nobody has solved a scramble yet. Be the first with /scramble"
+    text += "\n━━━━━━━━━━━━━━━━━\n"
+    me = str(uid)
+    idx = next((i for i, r in enumerate(rows) if r[1] == me), None)
+    if idx is None:
+        text += "<b>Your rank:</b> Unranked"
+    else:
+        text += f"<b>Your rank:</b> #{idx + 1} with {_scramble_fmt_value(tab, rows[idx][0])}"
+    return text
+
+
+def _scramble_lb_kb(owner, active: str) -> InlineKeyboardMarkup:
+    def btn(tab):
+        return _scr_btn(SCRAMBLE_LB_TABS[tab], f"slb:{tab}:{owner}",
+                        "success" if tab == active else "primary")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("time"), btn("rounds")],
+        [btn("shards")],
+    ])
+
+
+@main_router.message(Command("scramble_lbd"))
+async def scramble_lbd_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+    try:
+        db = ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username)
+        await message.reply(
+            _scramble_lb_text(db, "time", uid_int),
+            reply_markup=_scramble_lb_kb(uid_int, "time"),
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[scramble_lbd_CRASH] {e}")
+        traceback.print_exc()
+        dlog.error(f"[scramble_lbd_CRASH] {e}", exc_info=True)
+        await message.reply("The leaderboard is unavailable right now. Please try again in a moment.")
+
+
+@main_router.callback_query(F.data.startswith("slb:"))
+async def scramble_lbd_cb(cq: CallbackQuery):
+    if is_ghost_banned(cq.from_user.id) or is_shadow_banned(cq.from_user.id): return
+    try:
+        _, tab, owner = cq.data.split(":")
+    except ValueError:
+        await cq.answer()
+        return
+    if tab not in SCRAMBLE_LB_TABS:
+        await cq.answer()
+        return
+    if str(cq.from_user.id) != owner:
+        await cq.answer("This leaderboard belongs to someone else. Send /scramble_lbd for your own.", show_alert=True)
+        return
+    try:
+        db = ensure_user(owner, cq.from_user.first_name, cq.from_user.username)
+        await cq.message.edit_text(
+            _scramble_lb_text(db, tab, cq.from_user.id),
+            reply_markup=_scramble_lb_kb(owner, tab),
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            print(f"[scramble_lbd_cb] failed: {e}")
+            dlog.error(f"[scramble_lbd_cb] failed: {e}", exc_info=True)
+    await cq.answer()

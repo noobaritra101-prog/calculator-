@@ -212,7 +212,7 @@ class GlobalGuardMiddleware(BaseMiddleware):
                             pass
                     return
 
-            if is_callback and not event.data.startswith("vs_"):
+            if is_callback and not event.data.startswith(("vs_", "scr:")):
                 now = time.time()
                 last = _cb_cooldown.get(uid, 0.0)
                 if now - last < CB_COOLDOWN_SEC:
