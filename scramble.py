@@ -38,6 +38,7 @@ from config import (
 )
 from fastapi import HTTPException
 from pydantic import BaseModel
+from vlog import log_action   # /vlog activity log
 from deck import dlog, deck_api   # same FastAPI router the deck / chicken Mini Apps use   # same error-only log file (dlog.txt) the deck uses
 
 # /scramble            -> the bot picks a random card and scrambles it
@@ -287,7 +288,9 @@ def _scramble_reward_for(elapsed: float, tiers=None) -> int:
     return 0
 
 
-def _scramble_settle(user_id: str, name: str, username, elapsed: float, earned: int) -> int:
+def _scramble_settle(user_id: str, name: str, username, elapsed: float, earned: int,
+                     mode: str = "chat", card: dict | None = None, moves: int | None = None,
+                     chat_id="?", chat_title: str = "Unknown") -> int:
     """Records the win (rounds, best time, shards) and credits `earned` shards, limited
     by the daily minigame cap shared with /gcard and Versus. Returns shards actually paid."""
     db = ensure_user(user_id, name, username)
@@ -308,6 +311,20 @@ def _scramble_settle(user_id: str, name: str, username, elapsed: float, earned: 
     best = rec.get("best_time")
     if best is None or elapsed < best:
         rec["best_time"] = round(elapsed, 2)
+    try:   # every solve goes into /vlog (a logging error must never block the reward)
+        card = card or {}
+        entry = {
+            "type": "scramble_web_win" if mode == "web" else "scramble_win",
+            "card_name": str(card.get("name", "Unknown")),
+            "rarity": format_rarity(card.get("rarity", "Common")),
+            "time": round(elapsed, 2), "earned": earned, "amount": paid,
+            "chat_id": chat_id, "chat_title": chat_title,
+        }
+        if moves is not None:
+            entry["moves"] = moves
+        log_action(db, user_id, entry)
+    except Exception as e:
+        dlog.error(f"[scramble_vlog] {e}", exc_info=True)
     save_db()
     return paid
 
@@ -582,7 +599,10 @@ async def scramble_cb(cq: CallbackQuery):
                 earned = _scramble_reward_for(game["finished"] - game["started"])
                 paid = _scramble_settle(str(cq.from_user.id), cq.from_user.first_name,
                                         cq.from_user.username,
-                                        game["finished"] - game["started"], earned)
+                                        game["finished"] - game["started"], earned,
+                                        mode="chat", card={"name": game["name"], "rarity": game["rarity"]},
+                                        moves=game["moves"], chat_id=game["chat_id"],
+                                        chat_title=getattr(cq.message.chat, "title", None) or "Private chat")
                 if paid > 0:
                     reward_text = f"<b>Reward :</b> +{paid} Shards\n"
                 elif earned > 0:
@@ -614,8 +634,8 @@ async def scramble_cb(cq: CallbackQuery):
 # The server times every run itself and verifies Telegram's signed initData, so players
 # can't send fake times. Shards use the same daily minigame cap as chat mode.
 SCRAMBLE_WEB_LINK = "https://t.me/Animenx_bot/scramble"   # Mini App direct link
-SCRAMBLE_WEB_REWARD_TIERS = [(60, 50), (120, 25)]          # web mode: lower than chat mode
-SCRAMBLE_WEB_MIN_SECONDS = 6                               # faster than this is not humanly possible
+SCRAMBLE_WEB_REWARD_TIERS = [(20, 50), (40, 25)]           # web mode: dragging is fast, so tighter limits
+SCRAMBLE_WEB_MIN_SECONDS = 2                               # a 9-piece board needs 5+ swaps, so faster than this is a bot
 _scramble_web_runs: dict = {}                              # run token -> {uid, started, card}
 
 
@@ -718,7 +738,8 @@ async def scramble_web_finish(req: ScrWebReq):
         if elapsed < SCRAMBLE_WEB_MIN_SECONDS:
             raise HTTPException(status_code=400, detail="Too fast.")
         earned = _scramble_reward_for(elapsed, SCRAMBLE_WEB_REWARD_TIERS)
-        paid = _scramble_settle(str(u["id"]), u.get("first_name", "User"), u.get("username"), elapsed, earned)
+        paid = _scramble_settle(str(u["id"]), u.get("first_name", "User"), u.get("username"), elapsed, earned,
+                                mode="web", card=run["card"], chat_id="web", chat_title="Scramble Web App")
         return {"ok": True, "earned": earned, "paid": paid, "time": round(elapsed, 2), "card": run["card"]}
     except HTTPException:
         raise
@@ -751,6 +772,32 @@ async def scramble_web_lb(req: ScrWebReq):
         "me": None if me is None else {"rank": me + 1, "value": _scramble_fmt_value(req.tab, rows[me][0])}}
 
 
+_scramble_avatar_cache: dict = {}   # uid -> (data_url | None, fetched_at)
+
+
+@deck_api.post("/scramble/avatar")
+async def scramble_web_avatar(req: ScrWebReq):
+    """Profile picture fallback for players whose Telegram launch data has no photo_url."""
+    u = _scramble_web_auth(req)
+    uid = int(u["id"])
+    hit = _scramble_avatar_cache.get(uid)
+    if hit and time.time() - hit[1] < 3600:
+        return {"ok": bool(hit[0]), "photo": hit[0]}
+    photo = None
+    try:
+        res = await bot.get_user_profile_photos(uid, limit=1)
+        if res.total_count and res.photos:
+            buf = io.BytesIO()
+            await bot.download(res.photos[0][0].file_id, destination=buf)   # smallest size is plenty
+            photo = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        dlog.error(f"[scramble_web_avatar] {e}", exc_info=True)
+    if len(_scramble_avatar_cache) > 500:
+        _scramble_avatar_cache.clear()
+    _scramble_avatar_cache[uid] = (photo, time.time())
+    return {"ok": bool(photo), "photo": photo}
+
+
 @main_router.message(Command("webscr", "scramble_web"))
 async def scramble_web_cmd(message: Message):
     uid_int = message.from_user.id
@@ -759,7 +806,7 @@ async def scramble_web_cmd(message: Message):
         _scr_url_btn("Play Web Mode", SCRAMBLE_WEB_LINK, "primary")]])
     await message.reply(
         "<b>「 SCRAMBLE WEB 」</b>\n━━━━━━━━━━━━━━━━━\n"
-        "Under 1 min : <b>50</b> Shards\nUnder 2 min : <b>25</b> Shards\n"
+        "Under 20 sec : <b>50</b> Shards\nUnder 40 sec : <b>25</b> Shards\n"
         "━━━━━━━━━━━━━━━━━\n<i>Tap the button to open the Mini App.</i>",
         reply_markup=kb, parse_mode=ParseMode.HTML)
 

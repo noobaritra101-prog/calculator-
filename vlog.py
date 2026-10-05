@@ -43,6 +43,8 @@ _TYPE_LABELS = {
     "market_liquidation": "📉 STOCK MARKET — FORCED LIQUIDATION",
     "mines_win":      "💣 MINES — SHARDS EARNED",
     "ad_reward":      "📺 ADSGRAM — DAILY CARD REWARD",
+    "scramble_win":     "🧩 SCRAMBLE — SOLVED (CHAT)",
+    "scramble_web_win": "🧩 SCRAMBLE — SOLVED (WEB APP)",
 }
 
 _vlogs_cache = {}
@@ -197,6 +199,15 @@ def _format_entry(entry: dict, idx: int) -> str:
         lines.append(f"Gems Found   : {entry.get('gems_found', 0)}")
         lines.append(f"Multiplier   : {entry.get('multiplier', 0)}x")
         lines.append(f"Payout       : +{entry.get('amount', 0):,} Shards")
+    elif etype in ("scramble_win", "scramble_web_win"):
+        lines.append(f"Card         : {entry.get('card_name', 'Unknown')}")
+        lines.append(f"Rarity       : {entry.get('rarity', 'Unknown')}")
+        lines.append(f"Solve Time   : {entry.get('time', 0)}s")
+        if entry.get("moves") is not None:
+            lines.append(f"Moves        : {entry.get('moves')}")
+        lines.append(f"Shards Earned: +{entry.get('amount', 0):,}")
+        if entry.get("earned", 0) > entry.get("amount", 0):
+            lines.append(f"Note         : Daily cap reached (tier was worth {entry.get('earned'):,})")
     elif etype == "ad_reward":
         lines.append(f"Card Earned  : {entry.get('card_name', 'Unknown')}")
         lines.append(f"Rarity       : {entry.get('rarity', 'Unknown')}")
