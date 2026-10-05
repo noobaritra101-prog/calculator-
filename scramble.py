@@ -36,8 +36,9 @@ from config import (
     is_ghost_banned, is_shadow_banned,
     get_daily_minigame_rewards, DAILY_MINIGAME_REWARD_CAP
 )
-from aiohttp import web
-from deck import dlog   # same error-only log file (dlog.txt) the deck uses
+from fastapi import HTTPException
+from pydantic import BaseModel
+from deck import dlog, deck_api   # same FastAPI router the deck / chicken Mini Apps use   # same error-only log file (dlog.txt) the deck uses
 
 # /scramble            -> the bot picks a random card and scrambles it
 # The card art is cut into SCRAMBLE_COLS x SCRAMBLE_ROWS pieces and shuffled.
@@ -605,39 +606,72 @@ async def scramble_cb(cq: CallbackQuery):
 # ==========================================
 # WEB MODE — Telegram Mini App (scramble.html)
 # ==========================================
-# Host scramble.html on your own https domain, point the BotFather Mini App 'scramble' at it, and mount
-# scramble_web_routes(app) on the aiohttp app that serves it (same origin = no CORS setup).
-# The server times every run itself and validates Telegram's signed initData, so the
-# client can't claim a fake time. Shards use the same daily minigame cap as chat mode.
-SCRAMBLE_WEB_LINK = "https://t.me/Animenx_bot/scramble"   # Mini App direct link (set in BotFather -> /newapp)
-SCRAMBLE_WEB_REWARD_TIERS = [(60, 50), (120, 25)]      # web mode: lower than chat mode
-SCRAMBLE_WEB_MIN_SECONDS = 6                           # faster than this is not humanly possible
-_scramble_web_runs: dict = {}                          # run token -> {uid, started, card:{name,rarity,anime}}
+# Same stack as the deck / chicken Mini Apps: the routes live on deck_api (FastAPI) at
+#   /api/deck/scramble/*      and scramble.html is hosted on Netlify next to chicken.html.
+# BotFather -> /newapp -> short name "scramble" -> Web App URL = where scramble.html is hosted.
+# IMPORTANT: import this module BEFORE the app calls include_router(deck_api); routes added
+# after that are not picked up. Check it: open <BACKEND>/api/deck/scramble/ping -> {"ok": true}
+# The server times every run itself and verifies Telegram's signed initData, so players
+# can't send fake times. Shards use the same daily minigame cap as chat mode.
+SCRAMBLE_WEB_LINK = "https://t.me/Animenx_bot/scramble"   # Mini App direct link
+SCRAMBLE_WEB_REWARD_TIERS = [(60, 50), (120, 25)]          # web mode: lower than chat mode
+SCRAMBLE_WEB_MIN_SECONDS = 6                               # faster than this is not humanly possible
+_scramble_web_runs: dict = {}                              # run token -> {uid, started, card}
+
+
+class ScrWebReq(BaseModel):
+    init_data: str = ""
+    run: str = ""
+    tab: str = "time"
 
 
 def _scramble_web_user(init_data: str):
     """Verify Telegram WebApp initData (HMAC) -> user dict, or None if invalid/stale."""
     try:
-        pairs = dict(parse_qsl(init_data, strict_parsing=True))
-        got = pairs.pop("hash")
+        pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
+        got = pairs.pop("hash", None)
+        if not got:
+            return None
         check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
         secret = hmac.new(b"WebAppData", bot.token.encode(), hashlib.sha256).digest()
         calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, got):
             return None
-        if time.time() - int(pairs.get("auth_date", 0)) > 86400:
+        if time.time() - int(pairs.get("auth_date", "0")) > 86400:
             return None
-        return json.loads(pairs["user"])
+        return json.loads(pairs.get("user", "{}"))
     except Exception:
         return None
 
 
-async def scramble_web_start(request):
-    """Pick a real card (same pool as /scramble), cut it on the client, clock starts at /begin."""
+def _scramble_web_auth(req: ScrWebReq) -> dict:
+    u = _scramble_web_user(req.init_data)
+    if not u or "id" not in u:
+        raise HTTPException(status_code=401, detail="Invalid Telegram session.")
+    if is_ghost_banned(int(u["id"])) or is_shadow_banned(int(u["id"])):
+        raise HTTPException(status_code=403, detail="Not allowed.")
+    return u
+
+
+def _scramble_web_run(req: ScrWebReq, u: dict, pop: bool):
+    run = _scramble_web_runs.get(req.run)
+    if not run or run["uid"] != str(u["id"]):
+        raise HTTPException(status_code=401, detail="Unknown run.")
+    if pop:
+        _scramble_web_runs.pop(req.run, None)   # one-time token: no replays
+    return run
+
+
+@deck_api.get("/scramble/ping")
+async def scramble_web_ping():
+    return {"ok": True}
+
+
+@deck_api.post("/scramble/start")
+async def scramble_web_start(req: ScrWebReq):
+    """Pick a real card (same pool as /scramble); the client cuts it, clock starts at /begin."""
+    u = _scramble_web_auth(req)
     try:
-        u = _scramble_web_user((await request.json()).get("initData", ""))
-        if not u or is_ghost_banned(u["id"]) or is_shadow_banned(u["id"]):
-            return web.json_response({"ok": False}, status=401)
         uid = str(u["id"])
         db = ensure_user(uid, u.get("first_name", "User"), u.get("username"))
         now = time.time()
@@ -649,7 +683,7 @@ async def scramble_web_start(request):
             cands = _scramble_candidates(db)
             if not cands:
                 _scramble_kick_refill(db)
-                return web.json_response({"ok": False, "error": "no_cards"})
+                return {"ok": False, "error": "no_cards"}
             cid = random.choice(cands)
             base = await _scramble_fetch(db["global_cards"][cid]["file_id"])
         _scramble_recent.append(cid)
@@ -659,91 +693,62 @@ async def scramble_web_start(request):
         _scramble_web_runs[run] = {"uid": uid, "started": now, "card": {
             "name": str(g.get("name", "Card")), "rarity": str(g.get("rarity", "Common")),
             "anime": str(g.get("anime", "Unknown"))}}
-        return web.json_response({"ok": True, "run": run,
-                                  "image": "data:image/jpeg;base64," + base64.b64encode(base).decode()})
+        return {"ok": True, "run": run,
+                "image": "data:image/jpeg;base64," + base64.b64encode(base).decode()}
     except Exception as e:
+        print(f"[scramble_web_start] {e}")
         dlog.error(f"[scramble_web_start] {e}", exc_info=True)
-        return web.json_response({"ok": False}, status=400)
+        raise HTTPException(status_code=500, detail="Couldn't build the puzzle.")
 
 
-def _scramble_web_run_for(body: dict, pop: bool = True):
-    """Validate the caller + their run token -> (user, run) or (None, None)."""
-    u = _scramble_web_user(body.get("initData", ""))
-    run = _scramble_web_runs.get(body.get("run"))
-    if not u or not run or run["uid"] != str(u["id"]):
-        return None, None
-    if pop:
-        _scramble_web_runs.pop(body.get("run"), None)   # one-time token: no replays
-    return u, run
-
-
-async def scramble_web_begin(request):
+@deck_api.post("/scramble/begin")
+async def scramble_web_begin(req: ScrWebReq):
     """Client calls this once the card art is on screen: that is when the clock starts."""
-    try:
-        u, run = _scramble_web_run_for(await request.json(), pop=False)
-        if not run:
-            return web.json_response({"ok": False}, status=401)
-        run["started"] = time.time()
-        return web.json_response({"ok": True})
-    except Exception:
-        return web.json_response({"ok": False}, status=400)
+    u = _scramble_web_auth(req)
+    _scramble_web_run(req, u, pop=False)["started"] = time.time()
+    return {"ok": True}
 
 
-async def scramble_web_finish(request):
+@deck_api.post("/scramble/finish")
+async def scramble_web_finish(req: ScrWebReq):
+    u = _scramble_web_auth(req)
+    run = _scramble_web_run(req, u, pop=True)
     try:
-        u, run = _scramble_web_run_for(await request.json())
-        if not run:
-            return web.json_response({"ok": False}, status=401)
         elapsed = time.time() - run["started"]
         if elapsed < SCRAMBLE_WEB_MIN_SECONDS:
-            return web.json_response({"ok": False}, status=400)
+            raise HTTPException(status_code=400, detail="Too fast.")
         earned = _scramble_reward_for(elapsed, SCRAMBLE_WEB_REWARD_TIERS)
         paid = _scramble_settle(str(u["id"]), u.get("first_name", "User"), u.get("username"), elapsed, earned)
-        return web.json_response({"ok": True, "earned": earned, "paid": paid,
-                                  "time": round(elapsed, 2), "card": run["card"]})
+        return {"ok": True, "earned": earned, "paid": paid, "time": round(elapsed, 2), "card": run["card"]}
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"[scramble_web_finish] {e}")
         dlog.error(f"[scramble_web_finish] {e}", exc_info=True)
-        return web.json_response({"ok": False}, status=400)
+        raise HTTPException(status_code=500, detail="Couldn't save the result.")
 
 
-async def scramble_web_giveup(request):
+@deck_api.post("/scramble/giveup")
+async def scramble_web_giveup(req: ScrWebReq):
     """Reveal the card (like chat mode's Give Up). No shards."""
-    try:
-        u, run = _scramble_web_run_for(await request.json())
-        if not run:
-            return web.json_response({"ok": False}, status=401)
-        return web.json_response({"ok": True, "card": run["card"]})
-    except Exception:
-        return web.json_response({"ok": False}, status=400)
+    u = _scramble_web_auth(req)
+    run = _scramble_web_run(req, u, pop=True)
+    return {"ok": True, "card": run["card"]}
 
 
-async def scramble_web_lb(request):
+@deck_api.post("/scramble/lb")
+async def scramble_web_lb(req: ScrWebReq):
     """Top 10 + the caller's own rank for one tab (time / rounds / shards)."""
-    try:
-        body = await request.json()
-        u = _scramble_web_user(body.get("initData", ""))
-        tab = body.get("tab", "time")
-        if not u or tab not in SCRAMBLE_LB_TABS:
-            return web.json_response({"ok": False}, status=401)
-        db = ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username"))
-        rows = _scramble_board(db, tab)
-        me = next((i for i, x in enumerate(rows) if x[1] == str(u["id"])), None)
-        return web.json_response({
-            "ok": True,
-            "rows": [{"name": n, "value": _scramble_fmt_value(tab, v)} for v, _u, n in rows[:10]],
-            "me": None if me is None else {"rank": me + 1, "value": _scramble_fmt_value(tab, rows[me][0])}})
-    except Exception as e:
-        dlog.error(f"[scramble_web_lb] {e}", exc_info=True)
-        return web.json_response({"ok": False}, status=400)
-
-
-def scramble_web_routes(app: "web.Application"):
-    """Call once on your aiohttp app: scramble_web_routes(app)"""
-    app.router.add_post("/scramble/start", scramble_web_start)
-    app.router.add_post("/scramble/begin", scramble_web_begin)
-    app.router.add_post("/scramble/finish", scramble_web_finish)
-    app.router.add_post("/scramble/giveup", scramble_web_giveup)
-    app.router.add_post("/scramble/lb", scramble_web_lb)
+    u = _scramble_web_auth(req)
+    if req.tab not in SCRAMBLE_LB_TABS:
+        raise HTTPException(status_code=400, detail="Bad tab.")
+    db = ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username"))
+    rows = _scramble_board(db, req.tab)
+    me = next((i for i, x in enumerate(rows) if x[1] == str(u["id"])), None)
+    return {
+        "ok": True,
+        "rows": [{"name": n, "value": _scramble_fmt_value(req.tab, v)} for v, _u, n in rows[:10]],
+        "me": None if me is None else {"rank": me + 1, "value": _scramble_fmt_value(req.tab, rows[me][0])}}
 
 
 @main_router.message(Command("webscr", "scramble_web"))
