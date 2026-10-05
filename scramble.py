@@ -14,13 +14,17 @@ import random
 import asyncio
 import secrets
 import traceback
+import hmac
+import json
+import hashlib
+from urllib.parse import parse_qsl
 from collections import deque
 from html import escape as _html_esc
 
 from PIL import Image, ImageDraw, ImageFont   # pip install pillow
 from aiogram import F
 from aiogram.types import (
-    Message, CallbackQuery,
+    WebAppInfo, Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, BufferedInputFile
 )
 from aiogram.filters import Command
@@ -31,6 +35,7 @@ from config import (
     is_ghost_banned, is_shadow_banned,
     get_daily_minigame_rewards, DAILY_MINIGAME_REWARD_CAP
 )
+from aiohttp import web
 from deck import dlog   # same error-only log file (dlog.txt) the deck uses
 
 # /scramble            -> the bot picks a random card and scrambles it
@@ -58,7 +63,7 @@ SCRAMBLE_FLOOD_STRIKES = 5          # dropped taps in a row before the lock kick
 SCRAMBLE_FLOOD_LOCK = 5.0           # seconds the board stays locked after a flood
 
 # (solve under N seconds, shards). Anything slower than the last tier pays nothing.
-SCRAMBLE_REWARD_TIERS = [(60, 100), (120, 50)]
+SCRAMBLE_REWARD_TIERS = [(60, 70), (120, 35)]          # chat mode
 
 # gid -> {owner, owner_name, chat_id, chat_username, message_id, base (jpeg bytes), perm, selected, moves, started, touched,
 #          last_click, strikes, locked_until, lock, name, rarity, anime}
@@ -273,8 +278,8 @@ def _scramble_time(seconds: float) -> str:
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def _scramble_reward_for(elapsed: float) -> int:
-    for limit, shards in SCRAMBLE_REWARD_TIERS:
+def _scramble_reward_for(elapsed: float, tiers=None) -> int:
+    for limit, shards in (tiers or SCRAMBLE_REWARD_TIERS):
         if elapsed < limit:
             return shards
     return 0
@@ -594,6 +599,111 @@ async def scramble_cb(cq: CallbackQuery):
             print(f"[scramble_cb] failed: {e}")
             traceback.print_exc()
             dlog.error(f"[scramble_cb] failed: {e}", exc_info=True)
+
+
+# ==========================================
+# WEB MODE — Telegram Mini App (scramble.html)
+# ==========================================
+# Host scramble.html on your own https domain, point the BotFather Mini App 'scramble' at it, and mount
+# scramble_web_routes(app) on the aiohttp app that serves it (same origin = no CORS setup).
+# The server times every run itself and validates Telegram's signed initData, so the
+# client can't claim a fake time. Shards use the same daily minigame cap as chat mode.
+SCRAMBLE_WEB_LINK = "https://t.me/Animenx_bot/scramble"   # Mini App direct link (set in BotFather -> /newapp)
+SCRAMBLE_WEB_REWARD_TIERS = [(60, 50), (120, 25)]      # web mode: lower than chat mode
+SCRAMBLE_WEB_MIN_SECONDS = 6                           # faster than this is not humanly possible
+_scramble_web_runs: dict = {}                          # run token -> (user_id, started)
+
+
+def _scramble_web_user(init_data: str):
+    """Verify Telegram WebApp initData (HMAC) -> user dict, or None if invalid/stale."""
+    try:
+        pairs = dict(parse_qsl(init_data, strict_parsing=True))
+        got = pairs.pop("hash")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", bot.token.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got):
+            return None
+        if time.time() - int(pairs.get("auth_date", 0)) > 86400:
+            return None
+        return json.loads(pairs["user"])
+    except Exception:
+        return None
+
+
+async def scramble_web_start(request):
+    try:
+        u = _scramble_web_user((await request.json()).get("initData", ""))
+        if not u or is_ghost_banned(u["id"]) or is_shadow_banned(u["id"]):
+            return web.json_response({"ok": False}, status=401)
+        now = time.time()
+        for k, (_, t) in list(_scramble_web_runs.items()):
+            if now - t > SCRAMBLE_TTL:
+                _scramble_web_runs.pop(k, None)
+        run = secrets.token_hex(8)
+        _scramble_web_runs[run] = (str(u["id"]), now)
+        return web.json_response({"ok": True, "run": run})
+    except Exception as e:
+        dlog.error(f"[scramble_web_start] {e}", exc_info=True)
+        return web.json_response({"ok": False}, status=400)
+
+
+async def scramble_web_finish(request):
+    try:
+        body = await request.json()
+        u = _scramble_web_user(body.get("initData", ""))
+        entry = _scramble_web_runs.pop(body.get("run"), None)   # one-time token: no replays
+        if not u or not entry or entry[0] != str(u["id"]):
+            return web.json_response({"ok": False}, status=401)
+        elapsed = time.time() - entry[1]
+        if elapsed < SCRAMBLE_WEB_MIN_SECONDS:
+            return web.json_response({"ok": False}, status=400)
+        earned = _scramble_reward_for(elapsed, SCRAMBLE_WEB_REWARD_TIERS)
+        paid = _scramble_settle(str(u["id"]), u.get("first_name", "User"), u.get("username"), elapsed, earned)
+        return web.json_response({"ok": True, "earned": earned, "paid": paid, "time": round(elapsed, 2)})
+    except Exception as e:
+        dlog.error(f"[scramble_web_finish] {e}", exc_info=True)
+        return web.json_response({"ok": False}, status=400)
+
+
+async def scramble_web_lb(request):
+    """Top 10 + the caller's own rank for one tab (time / rounds / shards)."""
+    try:
+        body = await request.json()
+        u = _scramble_web_user(body.get("initData", ""))
+        tab = body.get("tab", "time")
+        if not u or tab not in SCRAMBLE_LB_TABS:
+            return web.json_response({"ok": False}, status=401)
+        db = ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username"))
+        rows = _scramble_board(db, tab)
+        me = next((i for i, x in enumerate(rows) if x[1] == str(u["id"])), None)
+        return web.json_response({
+            "ok": True,
+            "rows": [{"name": n, "value": _scramble_fmt_value(tab, v)} for v, _u, n in rows[:10]],
+            "me": None if me is None else {"rank": me + 1, "value": _scramble_fmt_value(tab, rows[me][0])}})
+    except Exception as e:
+        dlog.error(f"[scramble_web_lb] {e}", exc_info=True)
+        return web.json_response({"ok": False}, status=400)
+
+
+def scramble_web_routes(app: "web.Application"):
+    """Call once on your aiohttp app: scramble_web_routes(app)"""
+    app.router.add_post("/scramble/start", scramble_web_start)
+    app.router.add_post("/scramble/finish", scramble_web_finish)
+    app.router.add_post("/scramble/lb", scramble_web_lb)
+
+
+@main_router.message(Command("webscr", "scramble_web"))
+async def scramble_web_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        _scr_url_btn("Play Web Mode", SCRAMBLE_WEB_LINK, "primary")]])
+    await message.reply(
+        "<b>「 SCRAMBLE WEB 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "Under 1 min : <b>50</b> Shards\nUnder 2 min : <b>25</b> Shards\n"
+        "━━━━━━━━━━━━━━━━━\n<i>Tap the button to open the Mini App.</i>",
+        reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 # ==========================================
