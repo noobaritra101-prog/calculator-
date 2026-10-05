@@ -21,7 +21,7 @@ from aiohttp import ClientConnectionError, ServerDisconnectedError
 
 # ==========================================
 # LOGGING CONFIGURATION
-# =========================================
+# ==========================================
 os.makedirs("logs", exist_ok=True)
 _log_formatter = logging.Formatter(
     "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
@@ -68,7 +68,7 @@ def create_logged_task(coro, name: str):
     return task
 
 
-# =========================================
+# ==========================================
 # SYSTEM IMPORTS & CONFIGURATION
 # ==========================================
 import config
@@ -87,7 +87,7 @@ import store
 import market
 import mines
 import gcard
-import scramble
+import scramble  # /scramble puzzle minigame
 
 from handlers import trigger_drop
 from market import market_engine_loop
@@ -98,7 +98,7 @@ from deck import deck_api  # <--- IMPORT DECK API ROUTER
 from store import store_api  # <--- IMPORT STORE API ROUTER
 
 
-# =========================================
+# ==========================================
 # BOT ADDED TO GROUP LOG
 # ==========================================
 @dp.my_chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
