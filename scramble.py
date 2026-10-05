@@ -59,10 +59,12 @@ SCRAMBLE_POOL_LOW = 30
 SCRAMBLE_RECENT_MAX = 100
 SCRAMBLE_REFILL_PARALLEL = 4        # simultaneous Telegram downloads while refilling
 
-# Button flood guard: taps closer together than the cooldown are dropped silently
-# (instant, no spinner). Too many dropped taps in a row locks the board briefly.
-SCRAMBLE_CLICK_COOLDOWN = 0.5       # min seconds between accepted taps
-SCRAMBLE_FLOOD_STRIKES = 5          # dropped taps in a row before the lock kicks in
+# Button flood guard: taps are applied strictly IN ORDER (never silently dropped, so a quick
+# "3 then 5" still swaps). Only taps piling up faster than the board can redraw are refused
+# (more than SCRAMBLE_MAX_PENDING waiting), and the board redraws once for the whole burst.
+# Too many refused taps in a row locks the board briefly.
+SCRAMBLE_MAX_PENDING = 3            # taps allowed to wait for the board at once
+SCRAMBLE_FLOOD_STRIKES = 5          # refused taps in a row before the lock kicks in
 SCRAMBLE_FLOOD_LOCK = 5.0           # seconds the board stays locked after a flood
 
 # (solve under N seconds, shards). Anything slower than the last tier pays nothing.
@@ -79,6 +81,15 @@ _scramble_recent: deque = deque(maxlen=SCRAMBLE_RECENT_MAX)   # card ids played 
 _scramble_refilling = False
 _scramble_inflight: set = set()      # card ids being downloaded right now
 _scramble_bg: set = set()            # keeps background tasks alive
+_scramble_done: dict = {}            # gid -> finish time; late taps on a finished board are ignored quietly
+
+
+def _scramble_mark_done(gid: str):
+    now = time.time()
+    _scramble_done[gid] = now
+    for k, t in list(_scramble_done.items()):
+        if now - t > 60:
+            _scramble_done.pop(k, None)
 
 
 def _scramble_purge():
@@ -468,7 +479,7 @@ async def scramble_cmd(message: Message):
             "owner": uid_int, "owner_name": str(message.from_user.first_name or "A player")[:24],
             "chat_id": chat_id, "chat_username": getattr(message.chat, "username", None), "message_id": None, "base": base, "perm": perm,
             "selected": None, "moves": 0, "started": now, "touched": now,
-            "last_click": 0.0, "strikes": 0, "locked_until": 0.0, "lock": asyncio.Lock(),
+            "last_click": 0.0, "pending": 0, "dirty": False, "strikes": 0, "locked_until": 0.0, "lock": asyncio.Lock(),
             "name": g.get("name", "Card"), "rarity": g.get("rarity", "Common"),
             "anime": g.get("anime", "Unknown"),
         }
@@ -508,6 +519,23 @@ async def scramble_cmd(message: Message):
         _scramble_starting_chats.discard(chat_id)
 
 
+async def _scramble_push(cq: CallbackQuery, gid: str, game: dict):
+    """Redraw the board message. Re-renders the image only if pieces moved since the last draw."""
+    if game.get("dirty"):
+        img = await asyncio.to_thread(_scramble_render, game["base"], game["perm"], True)
+        await cq.message.edit_media(
+            media=InputMediaPhoto(media=BufferedInputFile(img, filename="scramble.jpg"),
+                                  caption=_scramble_caption(game, game["selected"]),
+                                  parse_mode=ParseMode.HTML),
+            reply_markup=_scramble_kb(gid, game["selected"]))
+        game["dirty"] = False
+    else:
+        await cq.message.edit_caption(
+            caption=_scramble_caption(game, game["selected"]),
+            reply_markup=_scramble_kb(gid, game["selected"]),
+            parse_mode=ParseMode.HTML)
+
+
 @main_router.callback_query(F.data.startswith("scr:"))
 async def scramble_cb(cq: CallbackQuery):
     if is_ghost_banned(cq.from_user.id) or is_shadow_banned(cq.from_user.id): return
@@ -520,6 +548,9 @@ async def scramble_cb(cq: CallbackQuery):
     game = _scramble_games.get(gid)
     if not game or time.time() - game["touched"] > SCRAMBLE_TTL:
         _scramble_games.pop(gid, None)
+        if gid in _scramble_done:   # finished a moment ago: late taps from a fast burst, ignore quietly
+            await cq.answer()
+            return
         await cq.answer("This puzzle has expired. Send /scramble for a new one.", show_alert=True)
         return
     if cq.from_user.id != game["owner"]:
@@ -531,7 +562,7 @@ async def scramble_cb(cq: CallbackQuery):
     if now < game["locked_until"]:
         await cq.answer(f"Too fast! Wait {int(game['locked_until'] - now) + 1}s.")
         return
-    if now - game["last_click"] < SCRAMBLE_CLICK_COOLDOWN:
+    if game["pending"] >= SCRAMBLE_MAX_PENDING:   # board can't keep up: refuse the extra tap
         game["strikes"] += 1
         if game["strikes"] >= SCRAMBLE_FLOOD_STRIKES:
             game["strikes"] = 0
@@ -541,7 +572,7 @@ async def scramble_cb(cq: CallbackQuery):
             await cq.answer()   # dropped silently, instant
         return
     game["strikes"] = 0
-    game["last_click"] = now
+    game["pending"] += 1
 
     # Acknowledge right away so the button stops spinning; the redraw follows.
     try:
@@ -550,15 +581,17 @@ async def scramble_cb(cq: CallbackQuery):
         pass
 
     try:
-        async with game["lock"]:
+        async with game["lock"]:   # taps are applied one at a time, in the order they arrived
             if gid not in _scramble_games:   # finished while we waited on the lock
                 return
             game["touched"] = time.time()
             n = SCRAMBLE_COLS * SCRAMBLE_ROWS
+            more = game["pending"] > 1   # more taps already waiting -> skip this redraw, the last one draws
 
             # ── Give up: reveal the finished picture ──
             if action == "give":
                 _scramble_games.pop(gid, None)
+                _scramble_mark_done(gid)
                 img = await asyncio.to_thread(_scramble_render, game["base"], list(range(n)), False)
                 await cq.message.edit_media(
                     media=InputMediaPhoto(media=BufferedInputFile(img, filename="scramble.jpg"),
@@ -579,48 +612,54 @@ async def scramble_cb(cq: CallbackQuery):
             # First tap (or tapping the selected piece again): just update the highlight.
             if sel is None or sel == idx:
                 game["selected"] = idx if sel is None else None
-                await cq.message.edit_caption(
-                    caption=_scramble_caption(game, game["selected"]),
-                    reply_markup=_scramble_kb(gid, game["selected"]),
-                    parse_mode=ParseMode.HTML)
+                if not more:
+                    await _scramble_push(cq, gid, game)
                 return
 
-            # Second tap: swap the two pieces and redraw.
+            # Second tap: swap the two pieces.
             perm = game["perm"]
             perm[sel], perm[idx] = perm[idx], perm[sel]
             game["selected"] = None
             game["moves"] += 1
+            game["dirty"] = True
             solved = perm == list(range(n))
 
-            reward_text = ""
-            if solved:
-                _scramble_games.pop(gid, None)
-                game["finished"] = time.time()   # stop the clock before rendering/uploading
-                earned = _scramble_reward_for(game["finished"] - game["started"])
-                paid = _scramble_settle(str(cq.from_user.id), cq.from_user.first_name,
-                                        cq.from_user.username,
-                                        game["finished"] - game["started"], earned,
-                                        mode="chat", card={"name": game["name"], "rarity": game["rarity"]},
-                                        moves=game["moves"], chat_id=game["chat_id"],
-                                        chat_title=getattr(cq.message.chat, "title", None) or "Private chat")
-                if paid > 0:
-                    reward_text = f"<b>Reward :</b> +{paid} Shards\n"
-                elif earned > 0:
-                    reward_text = "<i>Daily reward cap reached</i>\n"
-                else:
-                    reward_text = "<i>No shards - solve under 2 min to earn some.</i>\n"
-            img = await asyncio.to_thread(_scramble_render, game["base"], perm, not solved)
+            if not solved:
+                if not more:
+                    await _scramble_push(cq, gid, game)
+                return
+
+            # Solved: always draw the win screen, even mid-burst.
+            _scramble_games.pop(gid, None)
+            _scramble_mark_done(gid)
+            game["finished"] = time.time()   # stop the clock before rendering/uploading
+            earned = _scramble_reward_for(game["finished"] - game["started"])
+            paid = _scramble_settle(str(cq.from_user.id), cq.from_user.first_name,
+                                    cq.from_user.username,
+                                    game["finished"] - game["started"], earned,
+                                    mode="chat", card={"name": game["name"], "rarity": game["rarity"]},
+                                    moves=game["moves"], chat_id=game["chat_id"],
+                                    chat_title=getattr(cq.message.chat, "title", None) or "Private chat")
+            if paid > 0:
+                reward_text = f"<b>Reward :</b> +{paid} Shards\n"
+            elif earned > 0:
+                reward_text = "<i>Daily reward cap reached</i>\n"
+            else:
+                reward_text = "<i>No shards - solve under 2 min to earn some.</i>\n"
+            img = await asyncio.to_thread(_scramble_render, game["base"], perm, False)
             await cq.message.edit_media(
                 media=InputMediaPhoto(
                     media=BufferedInputFile(img, filename="scramble.jpg"),
-                    caption=_scramble_end_caption(game, won=True, reward_text=reward_text) if solved else _scramble_caption(game),
+                    caption=_scramble_end_caption(game, won=True, reward_text=reward_text),
                     parse_mode=ParseMode.HTML),
-                reply_markup=_scramble_kb(gid, solved=solved))
+                reply_markup=None)
     except Exception as e:
         if "not modified" not in str(e).lower():
             print(f"[scramble_cb] failed: {e}")
             traceback.print_exc()
             dlog.error(f"[scramble_cb] failed: {e}", exc_info=True)
+    finally:
+        game["pending"] = max(0, game["pending"] - 1)
 
 
 # ==========================================
