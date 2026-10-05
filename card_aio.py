@@ -87,6 +87,7 @@ import store
 import market
 import mines
 import gcard
+import scramble
 
 from handlers import trigger_drop
 from market import market_engine_loop
