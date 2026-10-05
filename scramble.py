@@ -24,7 +24,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, BufferedInputFile
 )
 from aiogram.filters import Command
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatType
 
 from config import (
     bot, main_router, format_rarity, ensure_user, save_db,
@@ -60,10 +60,12 @@ SCRAMBLE_FLOOD_LOCK = 5.0           # seconds the board stays locked after a flo
 # (solve under N seconds, shards). Anything slower than the last tier pays nothing.
 SCRAMBLE_REWARD_TIERS = [(60, 100), (120, 50)]
 
-# gid -> {owner, chat_id, message_id, base (jpeg bytes), perm, selected, moves, started, touched,
+# gid -> {owner, owner_name, chat_id, chat_username, message_id, base (jpeg bytes), perm, selected, moves, started, touched,
 #          last_click, strikes, locked_until, lock, name, rarity, anime}
 _scramble_games: dict[str, dict] = {}
 _scramble_starting: set = set()      # owners whose puzzle is being built right now
+_scramble_starting_chats: set = set()   # group chats whose puzzle is being built right now
+_scramble_bot_username = None
 _scramble_pool: dict = {}            # card_id -> prepared JPEG, ready to play
 _scramble_recent: deque = deque(maxlen=SCRAMBLE_RECENT_MAX)   # card ids played lately
 _scramble_refilling = False
@@ -333,21 +335,84 @@ def _scramble_end_caption(game: dict, won: bool, reward_text: str = "") -> str:
     return lines
 
 
+def _scramble_chat_game(chat_id: int):
+    """The running puzzle in this chat, if any (expired ones are cleaned out first)."""
+    _scramble_purge()
+    for g in _scramble_games.values():
+        if g["chat_id"] == chat_id:
+            return g
+    return None
+
+
+def _scramble_game_link(game: dict):
+    """Link to the puzzle message inside a group, or None (private chats have no links)."""
+    mid, cid = game.get("message_id"), game.get("chat_id")
+    if not mid or not cid:
+        return None
+    if game.get("chat_username"):
+        return f"https://t.me/{game['chat_username']}/{mid}"
+    c = str(cid)
+    if c.startswith("-100"):
+        return f"https://t.me/c/{c[4:]}/{mid}"
+    return None
+
+
+async def _scramble_bot_link() -> str:
+    global _scramble_bot_username
+    if not _scramble_bot_username:
+        _scramble_bot_username = (await bot.get_me()).username
+    return f"https://t.me/{_scramble_bot_username}"
+
+
+def _scr_url_btn(text: str, url: str, style: str | None = None):
+    if style and _SCR_HAS_STYLE:
+        return InlineKeyboardButton(text=text, url=url, style=style)
+    return InlineKeyboardButton(text=text, url=url)
+
+
+async def _scramble_busy_kb(game: dict | None, dm_button: bool):
+    row = []
+    if dm_button:
+        row.append(_scr_url_btn("Play in DM", await _scramble_bot_link(), "primary"))
+    link = _scramble_game_link(game) if game else None
+    if link:
+        row.append(_scr_url_btn("View Game", link, "success"))
+    return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
+
+
 @main_router.message(Command("scramble"))
 async def scramble_cmd(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
 
+    is_group = message.chat.type != ChatType.PRIVATE
+    chat_id = message.chat.id
+
     # One puzzle per player at a time.
-    _, active = _scramble_active_game(uid_int)
-    if active or uid_int in _scramble_starting:
+    _, mine = _scramble_active_game(uid_int)
+    if mine or uid_int in _scramble_starting:
         await message.reply(
             "You already have a scramble running!\n"
             "Finish it, or tap <b>Give Up</b> on it, before starting another.",
+            reply_markup=await _scramble_busy_kb(mine, dm_button=False),
             parse_mode=ParseMode.HTML)
         return
 
-    _scramble_starting.add(uid_int)   # reserve the slot while the board is being built
+    # One puzzle per group chat at a time.
+    if is_group:
+        other = _scramble_chat_game(chat_id)
+        if other or chat_id in _scramble_starting_chats:
+            who = f"<b>{_html_esc(other['owner_name'])}</b>" if other else "Someone"
+            await message.reply(
+                f"{who} is already playing a scramble in this group.\n"
+                "Please play in the bot's DMs for a lag free experience.",
+                reply_markup=await _scramble_busy_kb(other, dm_button=True),
+                parse_mode=ParseMode.HTML)
+            return
+
+    _scramble_starting.add(uid_int)   # reserve the slots while the board is being built
+    if is_group:
+        _scramble_starting_chats.add(chat_id)
     gid = None
     loading = None
     try:
@@ -376,7 +441,8 @@ async def scramble_cmd(message: Message):
         gid = secrets.token_hex(4)
         now = time.time()
         game = {
-            "owner": uid_int, "chat_id": None, "message_id": None, "base": base, "perm": perm,
+            "owner": uid_int, "owner_name": str(message.from_user.first_name or "A player")[:24],
+            "chat_id": chat_id, "chat_username": getattr(message.chat, "username", None), "message_id": None, "base": base, "perm": perm,
             "selected": None, "moves": 0, "started": now, "touched": now,
             "last_click": 0.0, "strikes": 0, "locked_until": 0.0, "lock": asyncio.Lock(),
             "name": g.get("name", "Card"), "rarity": g.get("rarity", "Common"),
@@ -390,7 +456,7 @@ async def scramble_cmd(message: Message):
             reply_markup=_scramble_kb(gid),
             parse_mode=ParseMode.HTML
         )
-        game["chat_id"], game["message_id"] = sent.chat.id, sent.message_id
+        game["message_id"] = sent.message_id
         try:
             await loading.delete()
         except Exception:
@@ -415,6 +481,7 @@ async def scramble_cmd(message: Message):
             pass
     finally:
         _scramble_starting.discard(uid_int)
+        _scramble_starting_chats.discard(chat_id)
 
 
 @main_router.callback_query(F.data.startswith("scr:"))
