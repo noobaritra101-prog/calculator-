@@ -15,6 +15,7 @@ import asyncio
 import secrets
 import traceback
 import hmac
+import base64
 import json
 import hashlib
 from urllib.parse import parse_qsl
@@ -611,7 +612,7 @@ async def scramble_cb(cq: CallbackQuery):
 SCRAMBLE_WEB_LINK = "https://t.me/Animenx_bot/scramble"   # Mini App direct link (set in BotFather -> /newapp)
 SCRAMBLE_WEB_REWARD_TIERS = [(60, 50), (120, 25)]      # web mode: lower than chat mode
 SCRAMBLE_WEB_MIN_SECONDS = 6                           # faster than this is not humanly possible
-_scramble_web_runs: dict = {}                          # run token -> (user_id, started)
+_scramble_web_runs: dict = {}                          # run token -> {uid, started, card:{name,rarity,anime}}
 
 
 def _scramble_web_user(init_data: str):
@@ -632,37 +633,87 @@ def _scramble_web_user(init_data: str):
 
 
 async def scramble_web_start(request):
+    """Pick a real card (same pool as /scramble), cut it on the client, clock starts at /begin."""
     try:
         u = _scramble_web_user((await request.json()).get("initData", ""))
         if not u or is_ghost_banned(u["id"]) or is_shadow_banned(u["id"]):
             return web.json_response({"ok": False}, status=401)
+        uid = str(u["id"])
+        db = ensure_user(uid, u.get("first_name", "User"), u.get("username"))
         now = time.time()
-        for k, (_, t) in list(_scramble_web_runs.items()):
-            if now - t > SCRAMBLE_TTL:
+        for k, v in list(_scramble_web_runs.items()):   # expire old runs + one run per player
+            if now - v["started"] > SCRAMBLE_TTL or v["uid"] == uid:
                 _scramble_web_runs.pop(k, None)
+        cid, base = _scramble_take(db)
+        if cid is None:                                  # cold pool: build one on demand
+            cands = _scramble_candidates(db)
+            if not cands:
+                _scramble_kick_refill(db)
+                return web.json_response({"ok": False, "error": "no_cards"})
+            cid = random.choice(cands)
+            base = await _scramble_fetch(db["global_cards"][cid]["file_id"])
+        _scramble_recent.append(cid)
+        _scramble_kick_refill(db)
+        g = db["global_cards"][cid]
         run = secrets.token_hex(8)
-        _scramble_web_runs[run] = (str(u["id"]), now)
-        return web.json_response({"ok": True, "run": run})
+        _scramble_web_runs[run] = {"uid": uid, "started": now, "card": {
+            "name": str(g.get("name", "Card")), "rarity": str(g.get("rarity", "Common")),
+            "anime": str(g.get("anime", "Unknown"))}}
+        return web.json_response({"ok": True, "run": run,
+                                  "image": "data:image/jpeg;base64," + base64.b64encode(base).decode()})
     except Exception as e:
         dlog.error(f"[scramble_web_start] {e}", exc_info=True)
         return web.json_response({"ok": False}, status=400)
 
 
+def _scramble_web_run_for(body: dict, pop: bool = True):
+    """Validate the caller + their run token -> (user, run) or (None, None)."""
+    u = _scramble_web_user(body.get("initData", ""))
+    run = _scramble_web_runs.get(body.get("run"))
+    if not u or not run or run["uid"] != str(u["id"]):
+        return None, None
+    if pop:
+        _scramble_web_runs.pop(body.get("run"), None)   # one-time token: no replays
+    return u, run
+
+
+async def scramble_web_begin(request):
+    """Client calls this once the card art is on screen: that is when the clock starts."""
+    try:
+        u, run = _scramble_web_run_for(await request.json(), pop=False)
+        if not run:
+            return web.json_response({"ok": False}, status=401)
+        run["started"] = time.time()
+        return web.json_response({"ok": True})
+    except Exception:
+        return web.json_response({"ok": False}, status=400)
+
+
 async def scramble_web_finish(request):
     try:
-        body = await request.json()
-        u = _scramble_web_user(body.get("initData", ""))
-        entry = _scramble_web_runs.pop(body.get("run"), None)   # one-time token: no replays
-        if not u or not entry or entry[0] != str(u["id"]):
+        u, run = _scramble_web_run_for(await request.json())
+        if not run:
             return web.json_response({"ok": False}, status=401)
-        elapsed = time.time() - entry[1]
+        elapsed = time.time() - run["started"]
         if elapsed < SCRAMBLE_WEB_MIN_SECONDS:
             return web.json_response({"ok": False}, status=400)
         earned = _scramble_reward_for(elapsed, SCRAMBLE_WEB_REWARD_TIERS)
         paid = _scramble_settle(str(u["id"]), u.get("first_name", "User"), u.get("username"), elapsed, earned)
-        return web.json_response({"ok": True, "earned": earned, "paid": paid, "time": round(elapsed, 2)})
+        return web.json_response({"ok": True, "earned": earned, "paid": paid,
+                                  "time": round(elapsed, 2), "card": run["card"]})
     except Exception as e:
         dlog.error(f"[scramble_web_finish] {e}", exc_info=True)
+        return web.json_response({"ok": False}, status=400)
+
+
+async def scramble_web_giveup(request):
+    """Reveal the card (like chat mode's Give Up). No shards."""
+    try:
+        u, run = _scramble_web_run_for(await request.json())
+        if not run:
+            return web.json_response({"ok": False}, status=401)
+        return web.json_response({"ok": True, "card": run["card"]})
+    except Exception:
         return web.json_response({"ok": False}, status=400)
 
 
@@ -689,7 +740,9 @@ async def scramble_web_lb(request):
 def scramble_web_routes(app: "web.Application"):
     """Call once on your aiohttp app: scramble_web_routes(app)"""
     app.router.add_post("/scramble/start", scramble_web_start)
+    app.router.add_post("/scramble/begin", scramble_web_begin)
     app.router.add_post("/scramble/finish", scramble_web_finish)
+    app.router.add_post("/scramble/giveup", scramble_web_giveup)
     app.router.add_post("/scramble/lb", scramble_web_lb)
 
 
