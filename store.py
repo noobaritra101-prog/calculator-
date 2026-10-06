@@ -755,6 +755,12 @@ async def sell_cmd(message: Message, command: CommandObject):
         return
 
     matched_cid, matched_data = best_match
+
+    # Star cards are bound to their owner and can never be sold on the Offline Store
+    if matched_cid in user_data.get("star_purchases", []):
+        await message.reply_rich(InputRichMessage(html="🌟 <b>Star cards cannot be sold in the Offline Store.</b>"))
+        return
+
     global_data = db["global_cards"].get(matched_cid, {})
     
     # safeguard 2: Enforce rarity-based price floors to protect market value boundaries
@@ -819,6 +825,11 @@ async def confirm_sell_cb(cq: CallbackQuery):
 
     if card_id not in my_cards or my_cards[card_id]["amount"] <= 0:
         await cq.answer("You don't own this card anymore!", show_alert=True)
+        return
+
+    # Re-check at confirmation time (the card may have become a star card since /sell)
+    if card_id in db["users"][uid].get("star_purchases", []):
+        await cq.answer("🌟 Star cards cannot be sold in the Offline Store.", show_alert=True)
         return
 
     my_cards[card_id]["amount"] -= 1
