@@ -18,6 +18,7 @@ import hmac
 import base64
 import json
 import hashlib
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl
 from collections import deque
 from html import escape as _html_esc
@@ -33,7 +34,7 @@ from aiogram.enums import ParseMode, ChatType
 
 from config import (
     bot, main_router, format_rarity, ensure_user, save_db,
-    is_ghost_banned, is_shadow_banned,
+    is_ghost_banned, is_shadow_banned, ADMIN_IDS,
     get_daily_minigame_rewards, DAILY_MINIGAME_REWARD_CAP
 )
 from fastapi import HTTPException
@@ -299,6 +300,36 @@ def _scramble_reward_for(elapsed: float, tiers=None) -> int:
     return 0
 
 
+def _scr_stat(db: dict, event: str, uid=None, name: str = "", mode: str = "chat",
+              elapsed: float = 0.0, earned: int = 0, paid: int = 0):
+    """Counters for /scr_stats: one bucket for all time plus one per UTC day (30 days kept)."""
+    try:
+        root = db.setdefault("scramble_stats", {})
+        days = root.setdefault("days", {})
+        today = days.setdefault(datetime.now(timezone.utc).strftime("%Y-%m-%d"), {})
+        for b in (root.setdefault("all", {}), today):
+            if event == "start":
+                b["started"] = b.get("started", 0) + 1
+            elif event == "giveup":
+                b["gave_up"] = b.get("gave_up", 0) + 1
+            elif event == "solve":
+                k = "solved_web" if mode == "web" else "solved_chat"
+                b[k] = b.get(k, 0) + 1
+                b["shards_paid"] = b.get("shards_paid", 0) + paid
+                b["shards_capped"] = b.get("shards_capped", 0) + max(0, earned - paid)
+                b["time_sum"] = b.get("time_sum", 0.0) + elapsed
+                if b.get("fastest") is None or elapsed < b["fastest"]:
+                    b["fastest"], b["fastest_name"] = round(elapsed, 2), name
+        if uid is not None:
+            players = today.setdefault("players", [])
+            if str(uid) not in players:
+                players.append(str(uid))
+        for k in sorted(days)[:-30]:
+            days.pop(k, None)
+    except Exception as e:
+        dlog.error(f"[scr_stat] {e}", exc_info=True)
+
+
 def _scramble_settle(user_id: str, name: str, username, elapsed: float, earned: int,
                      mode: str = "chat", card: dict | None = None, moves: int | None = None,
                      chat_id="?", chat_title: str = "Unknown") -> int:
@@ -322,6 +353,7 @@ def _scramble_settle(user_id: str, name: str, username, elapsed: float, earned: 
     best = rec.get("best_time")
     if best is None or elapsed < best:
         rec["best_time"] = round(elapsed, 2)
+    _scr_stat(db, "solve", uid=user_id, name=name, mode=mode, elapsed=elapsed, earned=earned, paid=paid)
     try:   # every solve goes into /vlog (a logging error must never block the reward)
         card = card or {}
         entry = {
@@ -484,6 +516,8 @@ async def scramble_cmd(message: Message):
             "anime": g.get("anime", "Unknown"),
         }
         _scramble_games[gid] = game
+        _scr_stat(ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username),
+                  "start", uid=uid_int)
 
         sent = await message.reply_photo(
             photo=BufferedInputFile(img, filename="scramble.jpg"),
@@ -590,6 +624,8 @@ async def scramble_cb(cq: CallbackQuery):
 
             # ── Give up: reveal the finished picture ──
             if action == "give":
+                _scr_stat(ensure_user(str(cq.from_user.id), cq.from_user.first_name, cq.from_user.username),
+                          "giveup", uid=cq.from_user.id)
                 _scramble_games.pop(gid, None)
                 _scramble_mark_done(gid)
                 img = await asyncio.to_thread(_scramble_render, game["base"], list(range(n)), False)
@@ -748,6 +784,7 @@ async def scramble_web_start(req: ScrWebReq):
         _scramble_recent.append(cid)
         _scramble_kick_refill(db)
         g = db["global_cards"][cid]
+        _scr_stat(db, "start", uid=uid)
         run = secrets.token_hex(8)
         _scramble_web_runs[run] = {"uid": uid, "started": now, "card": {
             "name": str(g.get("name", "Card")), "rarity": str(g.get("rarity", "Common")),
@@ -793,6 +830,7 @@ async def scramble_web_giveup(req: ScrWebReq):
     """Reveal the card (like chat mode's Give Up). No shards."""
     u = _scramble_web_auth(req)
     run = _scramble_web_run(req, u, pop=True)
+    _scr_stat(ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username")), "giveup", uid=u["id"])
     return {"ok": True, "card": run["card"]}
 
 
@@ -855,6 +893,7 @@ async def scramble_web_cmd(message: Message):
 # ==========================================
 SCRAMBLE_LB_TABS = {"time": "Time taken", "rounds": "Round", "shards": "Total shards collected"}
 SCRAMBLE_LB_TITLES = {"time": "FASTEST TIME", "rounds": "ROUNDS SOLVED", "shards": "TOTAL SHARDS"}
+SCRAMBLE_LBD_IMAGE = "https://i.ibb.co/TMFbh2KY/IMG-20261006-113510.jpg"   # leaderboard banner (caption limit: 1024 chars)
 
 
 def _scramble_fmt_best(t: float) -> str:
@@ -899,7 +938,7 @@ def _scramble_lb_text(db: dict, tab: str, uid) -> str:
     text = f"<b>「 SCRAMBLE - {SCRAMBLE_LB_TITLES[tab]} 」</b>\n━━━━━━━━━━━━━━━━━\n"
     if rows:
         text += "\n".join(
-            f"<b>{i + 1}.</b> <b>{_html_esc(name)}</b> - {_scramble_fmt_value(tab, v)}"
+            f"<b>{i + 1}.</b> <b>{_html_esc(name[:18])}</b> - {_scramble_fmt_value(tab, v)}"
             for i, (v, _u, name) in enumerate(rows[:10])
         )
     else:
@@ -930,10 +969,14 @@ async def scramble_lbd_cmd(message: Message):
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
     try:
         db = ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username)
-        await message.reply(
-            _scramble_lb_text(db, "time", uid_int),
-            reply_markup=_scramble_lb_kb(uid_int, "time"),
-            parse_mode=ParseMode.HTML)
+        text = _scramble_lb_text(db, "time", uid_int)
+        kb = _scramble_lb_kb(uid_int, "time")
+        try:   # banner image with the leaderboard as its caption
+            await message.reply_photo(photo=SCRAMBLE_LBD_IMAGE, caption=text,
+                                      reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception as e:   # image unreachable: still show the leaderboard as text
+            dlog.error(f"[scramble_lbd_photo] {e}", exc_info=True)
+            await message.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception as e:
         print(f"[scramble_lbd_CRASH] {e}")
         traceback.print_exc()
@@ -957,12 +1000,89 @@ async def scramble_lbd_cb(cq: CallbackQuery):
         return
     try:
         db = ensure_user(owner, cq.from_user.first_name, cq.from_user.username)
-        await cq.message.edit_text(
-            _scramble_lb_text(db, tab, cq.from_user.id),
-            reply_markup=_scramble_lb_kb(owner, tab),
-            parse_mode=ParseMode.HTML)
+        text = _scramble_lb_text(db, tab, cq.from_user.id)
+        kb = _scramble_lb_kb(owner, tab)
+        if cq.message.photo:   # banner image: the leaderboard lives in the caption
+            await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:                  # older text-only leaderboard message
+            await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception as e:
         if "not modified" not in str(e).lower():
             print(f"[scramble_lbd_cb] failed: {e}")
             dlog.error(f"[scramble_lbd_cb] failed: {e}", exc_info=True)
     await cq.answer()
+
+
+# ==========================================
+# /scr_stats — ADMIN ONLY, DM ONLY
+# ==========================================
+def _scr_fmt_t(t) -> str:
+    if t is None:
+        return "-"
+    return f"{t:.2f}s" if t < 60 else f"{int(t // 60)}m {t % 60:.1f}s"
+
+
+def _scr_section(title: str, b: dict) -> str:
+    chat, web = b.get("solved_chat", 0), b.get("solved_web", 0)
+    solved = chat + web
+    started, gave = b.get("started", 0), b.get("gave_up", 0)
+    avg = (b.get("time_sum", 0.0) / solved) if solved else None
+    rate = f"{solved / started * 100:.0f}%" if started else "-"
+    fast = _scr_fmt_t(b.get("fastest"))
+    if b.get("fastest") is not None and b.get("fastest_name"):
+        fast += f" ({_html_esc(str(b['fastest_name'])[:18])})"
+    lines = [
+        f"<b>{title}</b>",
+        f"Games started   : <b>{started:,}</b>",
+        f"Solved          : <b>{solved:,}</b>  (Chat {chat:,} | Web {web:,})",
+        f"Given up        : <b>{gave:,}</b>",
+        f"Solve rate      : <b>{rate}</b>",
+        f"Average time    : <b>{_scr_fmt_t(avg)}</b>",
+        f"Fastest solve   : <b>{fast}</b>",
+        f"Shards paid     : <b>{b.get('shards_paid', 0):,}</b>",
+        f"Shards capped   : <b>{b.get('shards_capped', 0):,}</b>  (lost to daily cap)",
+    ]
+    if "players" in b:
+        lines.insert(1, f"Active players  : <b>{len(b['players']):,}</b>")
+    return "\n".join(lines)
+
+
+@main_router.message(Command("scr_stats"))
+async def scramble_stats_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return   # not an admin: behave as if the command doesn't exist
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply("Use /scr_stats in my DMs.")
+        return
+    try:
+        db = ensure_user(str(message.from_user.id), message.from_user.first_name, message.from_user.username)
+        root = db.get("scramble_stats") or {}
+        today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = (root.get("days") or {}).get(today_key, {})
+
+        # Records are the source of truth for history; tracked counters only start once this feature is live.
+        rounds_rows = _scramble_board(db, "rounds")
+        shard_rows = _scramble_board(db, "shards")
+        time_rows = _scramble_board(db, "time")
+        allb = dict(root.get("all") or {})
+        allt = (
+            "<b>ALL TIME</b>\n"
+            f"Players         : <b>{len(rounds_rows):,}</b>\n"
+            f"Rounds solved   : <b>{sum(v for v, _, _ in rounds_rows):,}</b>\n"
+            f"Shards paid     : <b>{sum(v for v, _, _ in shard_rows):,}</b>\n"
+            f"Fastest solve   : <b>{_scr_fmt_t(time_rows[0][0]) if time_rows else '-'}"
+            f"{' (' + _html_esc(time_rows[0][2][:18]) + ')' if time_rows else ''}</b>"
+        )
+        text = (
+            "<b>「 SCRAMBLE STATS 」</b>\n━━━━━━━━━━━━━━━━━\n"
+            + _scr_section(f"TODAY ({today_key} UTC)", today)
+            + "\n━━━━━━━━━━━━━━━━━\n" + allt
+            + "\n━━━━━━━━━━━━━━━━━\n"
+            + _scr_section("ALL TIME - SINCE TRACKING STARTED", allb)
+        )
+        await message.reply(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[scr_stats_CRASH] {e}")
+        traceback.print_exc()
+        dlog.error(f"[scr_stats_CRASH] {e}", exc_info=True)
+        await message.reply("Stats are unavailable right now.")
