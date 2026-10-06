@@ -640,6 +640,40 @@ async def open_web_deck_cmd(message: Message):
 
 
 # ==========================================
+# /web COMMAND — every Mini App in one place
+# ==========================================
+WEBAPP_LINKS = {
+    "deck":     f"https://t.me/{BOT_USERNAME}/webdeck",
+    "airdrop":  f"https://t.me/{BOT_USERNAME}/airdrop",
+    "mine":     f"https://t.me/{BOT_USERNAME}/webmine",
+    "scramble": f"https://t.me/{BOT_USERNAME}/scramble",
+    "chicken":  f"https://t.me/{BOT_USERNAME}/chicken",
+}
+
+
+@main_router.message(Command("web", "webs", "webapp", "webapps"))
+async def all_webapps_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+
+    L = WEBAPP_LINKS
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 Deck", url=L["deck"]),
+         InlineKeyboardButton(text="🪂 Airdrop", url=L["airdrop"])],
+        [InlineKeyboardButton(text="🐔 Chicken Cross", url=L["chicken"])],
+        [InlineKeyboardButton(text="💣 Mine", url=L["mine"]),
+         InlineKeyboardButton(text="🕵️ Scramble", url=L["scramble"])],
+    ])
+    await smart_reply(
+        message,
+        "<b>「 🌐 WEB APPS 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "Tap a game or tool below to open it.",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ==========================================
 # /airdrop COMMAND — opens the mini app directly to the ad-reward section
 # ==========================================
 AIRDROP_APP_LINK = f"https://t.me/{BOT_USERNAME}/webdeck?startapp=airdrop"
