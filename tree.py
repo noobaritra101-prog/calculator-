@@ -32,9 +32,21 @@ TREE_RICH_BALANCE = 80000    # Balance above this triggers rich-player correctio
 TREE_RICH_FORCE = 0.50
 TREE_FORCE_CAP = 0.90        # Cap on forced-loss chance
 
+# ------------------------------------------
+# PROFIT RECOVERY (drain)
+# When a player's net profit (all-time payouts minus bets) reaches TREE_DRAIN_TRIGGER, a recovery starts and a
+# floor is set at net x (1 - TREE_DRAIN_RECOVER). Until their net profit falls back to that floor, every pick has a
+# TREE_DRAIN_FORCE chance of a snake waiting on the branch they choose, from level TREE_DRAIN_START_LEVELS on.
+# Losses end it by themselves; any win during a recovery just pushes the finish line further out.
+# ------------------------------------------
+TREE_DRAIN_TRIGGER = 5000        # Net profit that starts the recovery
+TREE_DRAIN_RECOVER = 0.90        # Share of that profit they must lose back (0.90 of 5,000 = 4,500)
+TREE_DRAIN_FORCE = 0.70          # Chance per pick that a snake is waiting on the branch they choose
+TREE_DRAIN_START_LEVELS = 1      # Levels climbed before the recovery can bite (1 = the first level is a normal pick)
+
 # Modes. Edit the numbers here to change the odds or the bet limits.
 #   lanes   = branches (buttons) on every level - the same in every mode
-#   height  = levels to reach the golden apple at the top
+#   height  = levels to reach the apple at the top
 #   snakes  = number of snakes hiding on each level, one entry per level (so len(snakes) == height)
 #   growth  = multiplier growth per level (level 1 is TREE_LEVEL1_MULTIPLIER)
 #   min_bet / max_bet = allowed bet range (Shards) for that mode
@@ -47,14 +59,15 @@ TREE_MODES = {
 for _m in TREE_MODES.values():
     assert len(_m["snakes"]) == _m["height"], "snakes list must have one entry per level"
     assert all(1 <= n < _m["lanes"] for n in _m["snakes"]), "each level needs at least 1 safe branch"
-#   style = mode button colour: green = safer, red = riskier
+#   style = not used by the mode picker any more (its buttons go green when the bet fits the mode, blue when not)
 TREE_PICK_TIMEOUT = 120      # Seconds the player has to choose a mode after /tree
 
 BRANCH_EMOJI = "🌿"      # branch you can tap
-CLIMBED_EMOJI = "🍃"     # branch you climbed
+CLIMBED_EMOJI = "🧗"     # branch you climbed
 TRAP_EMOJI = "🐍"        # snake hiding on a branch
+SAFE_REVEAL_EMOJI = "🍃"  # safe branch revealed when the round ends
 BOOM_EMOJI = "🩸"        # the snake you stepped on
-EMPTY_TILE = "•"
+EMPTY_TILE = "🪵"
 
 TREE_LBD_IMAGE = "https://i.ibb.co/93Stcg3C/IMG-20261011-003453.jpg"   # /tree_lbd banner (caption limit: 1024 chars)
 
@@ -106,6 +119,29 @@ def generate_traps(lanes: int, snakes: list) -> list:
     return [random.sample(range(lanes), n) for n in snakes]
 
 
+def _tree_net(user_data: dict) -> int:
+    return user_data.get("tree_won", 0) - user_data.get("tree_bet", 0)
+
+
+def _tree_check_drain(user_data: dict) -> None:
+    """Starts a recovery when net profit reaches the trigger and none is running: sets the floor to fall back to."""
+    rec = user_data.setdefault("tree", {})
+    net = _tree_net(user_data)
+    if "drain_floor" not in rec and net >= TREE_DRAIN_TRIGGER:
+        rec["drain_floor"] = int(net * (1 - TREE_DRAIN_RECOVER))
+
+
+def _tree_drain_active(user_data: dict) -> bool:
+    """True while the player's net profit is still above their recovery floor (ends the recovery once it isn't)."""
+    rec = user_data.get("tree")
+    if not isinstance(rec, dict) or "drain_floor" not in rec:
+        return False
+    if _tree_net(user_data) <= rec["drain_floor"]:
+        rec.pop("drain_floor", None)
+        return False
+    return True
+
+
 def tree_apply_dda_balancing(uid: str, row: int, lane: int, game: dict) -> None:
     """
     Dynamic Difficulty Balancing (DDA) on branch picks, same rules as Mines:
@@ -115,6 +151,13 @@ def tree_apply_dda_balancing(uid: str, row: int, lane: int, game: dict) -> None:
     When it fires, one of this level's snakes is moved onto the branch the player picked.
     """
     snakes = game["traps"][row]
+
+    # Profit recovery: a snake may be waiting on the branch they pick (the round was flagged when it started)
+    if game.get("drain") and game["steps"] >= TREE_DRAIN_START_LEVELS and random.random() < TREE_DRAIN_FORCE:
+        if lane not in snakes:
+            snakes[random.randrange(len(snakes))] = lane
+        return
+
     if lane in snakes or game["steps"] < TREE_DDA_START_LEVELS:
         return
 
@@ -227,6 +270,7 @@ def tree_credit_win(uid: str, game: dict, mult: float, chat_id, chat_title: str)
         rec["biggest_win"] = payout
     if mult > rec.get("best_mult", 0):
         rec["best_mult"] = round(mult, 2)
+    _tree_check_drain(db["users"][uid])
 
     _tree_stat(db, "win", uid=uid, name=str(db["users"][uid].get("name") or "User"), mode=game["mode"],
                bet=bet, payout=payout, steps=game["steps"], mult=mult, apple=apple)
@@ -260,12 +304,13 @@ def tree_button(text: str, callback_data: str, style: str = None) -> InlineKeybo
 
 
 def tree_keyboard(uid: str, lanes: int, height: int, traps: list, picks: list, steps: int,
-                    game_over: bool = False, boom=None, can_cash_out: bool = False) -> InlineKeyboardMarkup:
+                    game_over: bool = False, boom=None, can_cash_out: bool = False,
+                    repeat=None) -> InlineKeyboardMarkup:
     """
     Draws the tree with the top level first and level 1 at the bottom.
-      blue   = the level you are on now (tap a branch)
-      green  = branches you climbed
+      green  = the level you are on now (tap a branch), and branches you climbed
       red    = snakes (only revealed when the round is over)
+      blue    = safe branches revealed when the round is over
       neutral = everything else
     """
     rows = []
@@ -279,16 +324,27 @@ def tree_keyboard(uid: str, lanes: int, height: int, traps: list, picks: list, s
                     row.append(tree_button(CLIMBED_EMOJI, "trnoop", "success"))
                 elif game_over and c in traps[r]:
                     row.append(tree_button(TRAP_EMOJI, "trnoop", "danger"))
+                elif game_over:
+                    row.append(tree_button(SAFE_REVEAL_EMOJI, "trnoop", "primary"))
                 else:
                     row.append(tree_button(EMPTY_TILE, "trnoop"))
             elif r == steps and not game_over:
                 # row index is in the callback so a stale double-tap can't hit the next level
-                row.append(tree_button(BRANCH_EMOJI, f"trstep_{uid}_{r}_{c}", "primary"))
+                row.append(tree_button(BRANCH_EMOJI, f"trstep_{uid}_{r}_{c}", "success"))
             elif game_over and c in traps[r]:
                 row.append(tree_button(TRAP_EMOJI, "trnoop", "danger"))
+            elif game_over:
+                row.append(tree_button(SAFE_REVEAL_EMOJI, "trnoop", "primary"))
             else:
                 row.append(tree_button(EMPTY_TILE, "trnoop"))
         rows.append(row)
+
+    if game_over and repeat:
+        # repeat = (mode_key, bet), shown after a win: replay the same mode and bet, or close the message
+        rows.append([
+            tree_button("↻ Repeat", f"trrep_{uid}_{repeat[0]}_{repeat[1]}", "primary"),
+            tree_button("Close", f"trclose_{uid}", "danger"),
+        ])
 
     if not game_over:
         # Always visible: red while locked, green once cash out is unlocked
@@ -305,7 +361,7 @@ def tree_status_text(game: dict) -> str:
 
     if steps < TREE_MIN_CASHOUT_STEPS:
         remaining = TREE_MIN_CASHOUT_STEPS - steps
-        unlock_note = f"\n🔒 <b>Cash Out unlocks in:</b> {remaining} more level{'s' if remaining != 1 else ''}"
+        unlock_note = f"\n<b>Cash Out unlocks in:</b> {remaining} more level{'s' if remaining != 1 else ''}"
     else:
         unlock_note = "\n🔓 <b>Cash Out unlocked!</b>"
 
@@ -315,9 +371,9 @@ def tree_status_text(game: dict) -> str:
         f"<b>Bet:</b> {bet} 💠\n"
         f"<b>Mode:</b> {game['label']}\n"
         f"<b>Level:</b> {steps}/{height}\n"
-        f"📈 <b>Current Multiplier:</b> {cur_mult:.2f}x\n"
-        f"⏭ <b>Next Level:</b> {next_mult:.2f}x\n"
-        f"✅ <b>Cash Out Value:</b> {int(bet * cur_mult)} 💠"
+        f"<b>Current Multiplier:</b> {cur_mult:.2f}x\n"
+        f"<b>Next Level:</b> {next_mult:.2f}x\n"
+        f"<b>Cash Out Value:</b> {int(bet * cur_mult)} 💠"
         f"{unlock_note}\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"🐍 <b>Snakes on this level:</b> {snakes_here} of {game['lanes']} branches\n"
@@ -326,15 +382,15 @@ def tree_status_text(game: dict) -> str:
 
 
 def tree_win_text(game: dict, final_mult: float, payout: int, reached_top: bool) -> str:
-    title = "🍎 GOLDEN APPLE!" if reached_top else "🎉 CASHED OUT!"
+    title = "🍎 APPLE!" if reached_top else "🎉 CASHED OUT!"
     return (
         f"<b>「 {title} 」</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"<b>Bet:</b> {game['bet']} 💠\n"
         f"<b>Mode:</b> {game['label']}\n"
         f"<b>Levels Climbed:</b> {game['steps']}/{game['height']}\n"
-        f"📈 <b>Final Multiplier:</b> {final_mult:.2f}x\n"
-        f"✅ <b>Payout:</b> +{payout} 💠\n"
+        f"<b>Final Multiplier:</b> {final_mult:.2f}x\n"
+        f"<b>Payout:</b> +{payout} 💠\n"
         "━━━━━━━━━━━━━━━━━"
     )
 
@@ -365,10 +421,11 @@ def _chat_info(cq: CallbackQuery):
     return chat.id, (chat.title or chat.first_name or "DM")
 
 
-def _final_keyboard(owner_id: str, game: dict, boom=None) -> InlineKeyboardMarkup:
+def _final_keyboard(owner_id: str, game: dict, boom=None, repeat: bool = False) -> InlineKeyboardMarkup:
     return tree_keyboard(
         owner_id, game["lanes"], game["height"], game["traps"], game["picks"], game["steps"],
         game_over=True, boom=boom,
+        repeat=(game["mode"], game["bet"]) if repeat else None,
     )
 
 
@@ -394,23 +451,20 @@ def tree_mode_text(bet: int) -> str:
         "<b>Choose a mode:</b>\n"
         f"{mode_lines}\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "<i>Green is safer, red is riskier. Nothing is charged until you pick.</i>"
+        "<i>Green = your bet fits that mode, blue = outside its bet range. Nothing is charged until you pick.</i>"
     )
 
 
 def tree_mode_keyboard(uid: str, bet: int) -> InlineKeyboardMarkup:
-    """Mode buttons: green (safer) / red (riskier). Modes that don't accept this bet are greyed and locked."""
-    rows = []
+    """Row 1: the modes side by side - green if the bet fits that mode, blue if it doesn't. Row 2: red Cancel."""
+    row = []
     for key, m in TREE_MODES.items():
-        if m["min_bet"] <= bet <= m["max_bet"]:
-            text = f"{m['label']} · {m['height']} levels · {tree_snake_short(m['snakes'])}"
-            style = m["style"]
-        else:
-            text = f"🔒 {m['label']} · bet {m['min_bet']:,} – {m['max_bet']:,}"
-            style = None
-        rows.append([tree_button(text, f"trmode_{uid}_{key}", style)])
-    rows.append([tree_button("Cancel", f"trcancel_{uid}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        style = "success" if m["min_bet"] <= bet <= m["max_bet"] else "primary"
+        row.append(tree_button(m["label"], f"trmode_{uid}_{key}", style))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [tree_button("Cancel", f"trcancel_{uid}", "danger")],
+    ])
 
 
 @main_router.message(Command("tree"))
@@ -471,6 +525,85 @@ async def tree_cmd(message: Message, command: CommandObject):
     pending_trees[uid] = {"bet": bet, "message_id": sent.message_id, "time": time.time()}
 
 
+# Result screens whose Repeat button is live, keyed by str(user_id) -> message_id (one use per screen).
+repeat_ok: dict = {}
+
+
+async def tree_begin_round(cq: CallbackQuery, owner_id: str, mode_key: str, bet: int,
+                           consume_pending: bool) -> bool:
+    """Validates, charges the bet and starts a round in the tapped message. Returns True if it started.
+    There are no awaits between the checks and active_trees being set, so a double tap can't start two rounds."""
+    cfg = TREE_MODES.get(mode_key)
+    if not cfg:
+        await cq.answer()
+        return False
+
+    if bet < cfg["min_bet"] or bet > cfg["max_bet"]:
+        await cq.answer(
+            f"{cfg['label']} mode bet must be between {cfg['min_bet']:,} and {cfg['max_bet']:,}.",
+            show_alert=True
+        )
+        return False
+
+    if owner_id in active_trees:
+        game = active_trees[owner_id]
+        if time.time() - game["start_time"] > TREE_GAME_TIMEOUT:
+            tree_expire(owner_id, game)
+        else:
+            await cq.answer("You already have an active tree climb.", show_alert=True)
+            return False
+
+    db = load_db()
+    user_data = db["users"][owner_id]
+    if user_data.get("nexus_shards", 0) < bet:
+        await cq.answer("You don't have enough Shards for that bet.", show_alert=True)
+        return False
+
+    if consume_pending:
+        pending_trees.pop(owner_id, None)
+
+    _tree_check_drain(user_data)   # also catches players who were already over the trigger
+    drain = _tree_drain_active(user_data)
+    user_data["nexus_shards"] -= bet
+    user_data["tree_bet"] = user_data.get("tree_bet", 0) + bet
+
+    gs = db.setdefault("tree_global", {})
+    gs["total_bet"] = gs.get("total_bet", 0) + bet
+    gs["total_games"] = gs.get("total_games", 0) + 1
+    today_str = date.today().isoformat()
+    daily = gs.setdefault("daily_games", {})
+    daily[today_str] = daily.get(today_str, 0) + 1
+    _tree_stat(db, "start", uid=owner_id, mode=mode_key, bet=bet)
+    save_db()
+
+    game = {
+        "uid": owner_id,
+        "drain": drain,
+        "bet": bet,
+        "mode": mode_key,
+        "label": cfg["label"],
+        "lanes": cfg["lanes"],
+        "height": cfg["height"],
+        "snakes": list(cfg["snakes"]),
+        "growth": cfg["growth"],
+        "traps": generate_traps(cfg["lanes"], cfg["snakes"]),
+        "picks": [],
+        "steps": 0,
+        "lock": asyncio.Lock(),
+        "chat_id": cq.message.chat.id,
+        "start_time": time.time(),
+    }
+    active_trees[owner_id] = game
+
+    await cq.answer(f"{cfg['label']} mode — good luck!")
+    await tree_edit_message(
+        cq,
+        tree_status_text(game),
+        tree_keyboard(owner_id, game["lanes"], game["height"], game["traps"], game["picks"], 0)
+    )
+    return True
+
+
 @main_router.callback_query(lambda cq: cq.data and cq.data.startswith("trmode_"))
 async def tree_mode_cb(cq: CallbackQuery):
     try:
@@ -495,72 +628,47 @@ async def tree_mode_cb(cq: CallbackQuery):
         await tree_edit_message(cq, "⌛ <b>Selection expired.</b> No Shards were taken.", InlineKeyboardMarkup(inline_keyboard=[]))
         return
 
-    cfg = TREE_MODES.get(mode_key)
-    if not cfg:
+    await tree_begin_round(cq, owner_id, mode_key, pend["bet"], consume_pending=True)
+
+
+@main_router.callback_query(lambda cq: cq.data and cq.data.startswith("trrep_"))
+async def tree_repeat_cb(cq: CallbackQuery):
+    try:
+        _, owner_id, mode_key, bet_str = cq.data.split("_")
+        bet = int(bet_str)
+    except ValueError:
         await cq.answer()
         return
-    bet = pend["bet"]
 
-    if bet < cfg["min_bet"] or bet > cfg["max_bet"]:
-        await cq.answer(
-            f"{cfg['label']} mode bet must be between {cfg['min_bet']:,} and {cfg['max_bet']:,}.",
-            show_alert=True
-        )
+    if str(cq.from_user.id) != owner_id:
+        await cq.answer("⚠️ This isn't your tree!", show_alert=True)
         return
 
-    if owner_id in active_trees:
-        game = active_trees[owner_id]
-        if time.time() - game["start_time"] > TREE_GAME_TIMEOUT:
-            tree_expire(owner_id, game)
-        else:
-            await cq.answer("You already have an active tree climb.", show_alert=True)
-            return
-
-    db = load_db()
-    user_data = db["users"][owner_id]
-    if user_data.get("nexus_shards", 0) < bet:
-        await cq.answer("You don't have enough Shards for that bet.", show_alert=True)
+    if repeat_ok.get(owner_id) != cq.message.message_id:
+        await cq.answer("This round was already repeated or closed. Send /tree to play again.", show_alert=True)
         return
 
-    pending_trees.pop(owner_id, None)
+    if await tree_begin_round(cq, owner_id, mode_key, bet, consume_pending=False):
+        if repeat_ok.get(owner_id) == cq.message.message_id:
+            repeat_ok.pop(owner_id, None)
 
-    user_data["nexus_shards"] -= bet
-    user_data["tree_bet"] = user_data.get("tree_bet", 0) + bet
 
-    gs = db.setdefault("tree_global", {})
-    gs["total_bet"] = gs.get("total_bet", 0) + bet
-    gs["total_games"] = gs.get("total_games", 0) + 1
-    today_str = date.today().isoformat()
-    daily = gs.setdefault("daily_games", {})
-    daily[today_str] = daily.get(today_str, 0) + 1
-    _tree_stat(db, "start", uid=owner_id, mode=mode_key, bet=bet)
-    save_db()
-
-    game = {
-        "uid": owner_id,
-        "bet": bet,
-        "mode": mode_key,
-        "label": cfg["label"],
-        "lanes": cfg["lanes"],
-        "height": cfg["height"],
-        "snakes": list(cfg["snakes"]),
-        "growth": cfg["growth"],
-        "traps": generate_traps(cfg["lanes"], cfg["snakes"]),
-        "picks": [],
-        "steps": 0,
-        "lock": asyncio.Lock(),
-        "chat_id": cq.message.chat.id,
-        "start_time": time.time(),
-    }
-    active_trees[owner_id] = game
-    # -------------------------------------------------------------------------------------------
-
-    await cq.answer(f"{cfg['label']} mode — good luck!")
-    await tree_edit_message(
-        cq,
-        tree_status_text(game),
-        tree_keyboard(owner_id, game["lanes"], game["height"], game["traps"], game["picks"], 0)
-    )
+@main_router.callback_query(lambda cq: cq.data and cq.data.startswith("trclose_"))
+async def tree_close_cb(cq: CallbackQuery):
+    owner_id = cq.data.split("_")[1]
+    if str(cq.from_user.id) != owner_id:
+        await cq.answer("⚠️ This isn't your tree!", show_alert=True)
+        return
+    if repeat_ok.get(owner_id) == cq.message.message_id:
+        repeat_ok.pop(owner_id, None)
+    try:
+        await cq.message.delete()
+    except Exception:   # can't delete (too old / no rights): just remove the buttons
+        try:
+            await cq.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+        except Exception:
+            pass
+    await cq.answer()
 
 
 @main_router.callback_query(lambda cq: cq.data and cq.data.startswith("trcancel_"))
@@ -626,13 +734,14 @@ async def tree_step_cb(cq: CallbackQuery):
         game["steps"] += 1
         mult = tree_multiplier(game["growth"], game["steps"])
 
-        # GOLDEN APPLE REACHED
+        # APPLE REACHED
         if game["steps"] >= game["height"]:
             chat_id, chat_title = _chat_info(cq)
             payout = tree_credit_win(owner_id, game, mult, chat_id, chat_title)
             active_trees.pop(owner_id, None)
-            await cq.answer("🍎 You reached the golden apple!", show_alert=False)
-            await tree_edit_message(cq, tree_win_text(game, mult, payout, True), _final_keyboard(owner_id, game))
+            await cq.answer("🍎 You reached the apple!", show_alert=False)
+            repeat_ok[owner_id] = cq.message.message_id
+            await tree_edit_message(cq, tree_win_text(game, mult, payout, True), _final_keyboard(owner_id, game, repeat=True))
             return
 
         await cq.answer()
@@ -679,8 +788,9 @@ async def tree_cashout_cb(cq: CallbackQuery):
         payout = tree_credit_win(owner_id, game, mult, chat_id, chat_title)
         active_trees.pop(owner_id, None)
 
-        await cq.answer(f"✅ Cashed out: +{payout} 💠")
-        await tree_edit_message(cq, tree_win_text(game, mult, payout, False), _final_keyboard(owner_id, game))
+        await cq.answer(f"Cashed out: +{payout} 💠")
+        repeat_ok[owner_id] = cq.message.message_id
+        await tree_edit_message(cq, tree_win_text(game, mult, payout, False), _final_keyboard(owner_id, game, repeat=True))
 
 
 @main_router.callback_query(lambda cq: cq.data == "trnoop")
@@ -691,8 +801,8 @@ async def tree_noop_cb(cq: CallbackQuery):
 # ==========================================
 # /tree_lbd — LEADERBOARD
 # ==========================================
-TREE_LB_TABS = {"win": "Biggest win", "mult": "Best multiplier", "total": "Total won", "apples": "Golden apples"}
-TREE_LB_TITLES = {"win": "BIGGEST WIN", "mult": "BEST MULTIPLIER", "total": "TOTAL SHARDS WON", "apples": "GOLDEN APPLES"}
+TREE_LB_TABS = {"win": "Biggest win", "mult": "Best multiplier", "total": "Total won", "apples": "Apples"}
+TREE_LB_TITLES = {"win": "BIGGEST WIN", "mult": "BEST MULTIPLIER", "total": "TOTAL SHARDS WON", "apples": "APPLES"}
 
 
 def _tree_board(db: dict, tab: str) -> list:
@@ -818,26 +928,26 @@ def _tree_section(title: str, b: dict) -> str:
     finished = wins + losses
     gen, taken = b.get("generated", 0), b.get("taken", 0)
     best = f"{b.get('best_mult', 0):.2f}x" if b.get("best_mult") else "-"
-    big = f"{b.get('biggest_win', 0):,} 💠" if b.get("biggest_win") else "-"
+    big = f"{b.get('biggest_win', 0):,}" if b.get("biggest_win") else "-"
     if b.get("biggest_win") and b.get("biggest_win_name"):
         big += f" ({_html_esc(str(b['biggest_win_name'])[:18])})"
     lines = [
         f"<b>{title}</b>",
-        f"🎮 Games started : <b>{started:,}</b>",
-        f"✅ Cash outs     : <b>{wins - b.get('apples', 0):,}</b>",
-        f"🍎 Golden apples : <b>{b.get('apples', 0):,}</b>",
-        f"🐍 Snake bites   : <b>{losses:,}</b>",
-        f"⌛ Expired       : <b>{expired:,}</b>",
-        f"📈 Win rate      : <b>{_tree_pct(wins, finished)}</b>",
-        f"💰 Wagered       : <b>{b.get('wagered', 0):,}</b> 💠",
-        f"💠 Generated     : <b>{gen:,}</b>",
-        f"💠 Taken         : <b>{taken:,}</b>",
-        f"🏦 House net     : <b>{taken - gen:+,}</b> 💠",
-        f"🏆 Biggest win   : <b>{big}</b>",
-        f"🚀 Best mult     : <b>{best}</b>",
+        f"Games started : <b>{started:,}</b>",
+        f"Cash outs     : <b>{wins - b.get('apples', 0):,}</b>",
+        f"Apples        : <b>{b.get('apples', 0):,}</b>",
+        f"Snake bites   : <b>{losses:,}</b>",
+        f"Expired       : <b>{expired:,}</b>",
+        f"Win rate      : <b>{_tree_pct(wins, finished)}</b>",
+        f"Wagered       : <b>{b.get('wagered', 0):,}</b>",
+        f"Generated     : <b>{gen:,}</b>",
+        f"Taken         : <b>{taken:,}</b>",
+        f"House net     : <b>{taken - gen:+,}</b>",
+        f"Biggest win   : <b>{big}</b>",
+        f"Best mult     : <b>{best}</b>",
     ]
     if "players" in b:
-        lines.insert(1, f"👥 Players       : <b>{len(b['players']):,}</b>")
+        lines.insert(1, f"Players       : <b>{len(b['players']):,}</b>")
     return "\n".join(lines)
 
 
@@ -847,7 +957,7 @@ def _tree_mode_block(title: str, b: dict) -> str:
         m = (b.get("modes") or {}).get(key, {})
         started, wins, losses = m.get("started", 0), m.get("wins", 0), m.get("losses", 0)
         out.append(
-            f"<b>{cfg['label']}</b>: {started:,} games | {wins:,} won ({m.get('apples', 0):,} 🍎) | "
+            f"<b>{cfg['label']}</b>: {started:,} games | {wins:,} won | {m.get('apples', 0):,} apples | "
             f"{losses:,} bitten | win {_tree_pct(wins, wins + losses)} | "
             f"wagered {m.get('wagered', 0):,} | house {m.get('taken', 0) - m.get('generated', 0):+,}"
         )
@@ -858,7 +968,7 @@ def tree_stats_text(db: dict, view: str) -> str:
     root = db.get("tree_stats") or {}
     today_key = date.today().isoformat()
     today = (root.get("days") or {}).get(today_key, {})
-    head = "<b>「 📊 TREE CLIMB STATS 」</b>\n" + _LINE + "\n"
+    head = "<b>「 TREE CLIMB STATS 」</b>\n" + _LINE + "\n"
 
     if view == "today":
         return head + _tree_section(f"TODAY ({today_key})", today)
@@ -870,14 +980,14 @@ def tree_stats_text(db: dict, view: str) -> str:
         net = gs.get("total_taken", 0) - gs.get("total_won", 0)
         return (
             head + "<b>GLOBAL (ALL TIME)</b>\n"
-            f"👥 Players            : <b>{players:,}</b>\n"
-            f"🎮 Total games        : <b>{gs.get('total_games', 0):,}</b>\n"
-            f"📅 Games today        : <b>{gs.get('daily_games', {}).get(today_key, 0):,}</b>\n"
-            f"💰 Total wagered      : <b>{wagered:,}</b> 💠\n"
-            f"💠 Shards generated   : <b>{gs.get('total_won', 0):,}</b>\n"
-            f"💠 Shards taken       : <b>{gs.get('total_taken', 0):,}</b>\n"
-            f"🏦 House net          : <b>{net:+,}</b> 💠\n"
-            f"📉 House edge         : <b>{(f'{net / wagered * 100:.1f}%' if wagered else '-')}</b>"
+            f"Players            : <b>{players:,}</b>\n"
+            f"Total games        : <b>{gs.get('total_games', 0):,}</b>\n"
+            f"Games today        : <b>{gs.get('daily_games', {}).get(today_key, 0):,}</b>\n"
+            f"Total wagered      : <b>{wagered:,}</b>\n"
+            f"Shards generated   : <b>{gs.get('total_won', 0):,}</b>\n"
+            f"Shards taken       : <b>{gs.get('total_taken', 0):,}</b>\n"
+            f"House net          : <b>{net:+,}</b>\n"
+            f"House edge         : <b>{(f'{net / wagered * 100:.1f}%' if wagered else '-')}</b>"
         )
 
     # detailed: tracked counters (they start the day this feature went live) + per-mode split + recent days
