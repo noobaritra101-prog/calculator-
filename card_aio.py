@@ -91,6 +91,7 @@ import market
 import mines
 import gcard
 import scramble  # /scramble puzzle minigame
+import tree      # /tree climb game, /tree_lbd, /tstats
 
 from handlers import trigger_drop
 from market import market_engine_loop
