@@ -169,6 +169,17 @@ def apply_dda_balancing(uid: str, idx: int, game: dict) -> None:
 # ==========================================
 # BOT TELEGRAM KEYBOARDS & MESSAGES
 # ==========================================
+def styled_button(text: str, callback_data: str, style: str = None) -> InlineKeyboardButton:
+    """Inline button with an optional Telegram colour style ('success' = green, 'danger' = red, 'primary' = blue).
+    Falls back to a plain button if the installed aiogram version doesn't support styles."""
+    if style:
+        try:
+            return InlineKeyboardButton(text=text, callback_data=callback_data, style=style)
+        except Exception:
+            pass
+    return InlineKeyboardButton(text=text, callback_data=callback_data)
+
+
 def build_keyboard(uid: str, board: list, revealed: set, boom_at=None, game_over=False, can_cash_out=False) -> InlineKeyboardMarkup:
     rows = []
     for r in range(5):
@@ -176,15 +187,27 @@ def build_keyboard(uid: str, board: list, revealed: set, boom_at=None, game_over
         for c in range(5):
             idx = r * 5 + c
             if idx == boom_at:
-                row.append(InlineKeyboardButton(text=BOOM_EMOJI, callback_data="mnoop"))
-            elif idx in revealed or game_over:
-                row.append(InlineKeyboardButton(text=BOMB_EMOJI if board[idx] else GEM_EMOJI, callback_data="mnoop"))
+                # The bomb that was clicked
+                row.append(styled_button(BOOM_EMOJI, "mnoop", "danger"))
+            elif game_over:
+                if board[idx]:
+                    # Every bomb placement is shown in red
+                    row.append(styled_button(BOMB_EMOJI, "mnoop", "danger"))
+                elif idx in revealed:
+                    # Gems the player found stay green
+                    row.append(styled_button(GEM_EMOJI, "mnoop", "success"))
+                else:
+                    # Gems the player never reached stay neutral
+                    row.append(styled_button(GEM_EMOJI, "mnoop"))
+            elif idx in revealed:
+                row.append(styled_button(BOMB_EMOJI if board[idx] else GEM_EMOJI, "mnoop", "danger" if board[idx] else "success"))
             else:
-                row.append(InlineKeyboardButton(text=HIDDEN_TILE, callback_data=f"mtile_{uid}_{idx}"))
+                row.append(styled_button(HIDDEN_TILE, f"mtile_{uid}_{idx}"))
         rows.append(row)
 
-    if not game_over and can_cash_out:
-        rows.append([InlineKeyboardButton(text="💰 Cash Out", callback_data=f"mcash_{uid}")])
+    if not game_over:
+        # Always visible: red while locked, green once cash out is unlocked
+        rows.append([styled_button("Cash Out", f"mcash_{uid}", "success" if can_cash_out else "danger")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -199,7 +222,7 @@ def build_status_text(bet: int, mines: int, gems_found: int, current_mult: float
     return (
         "<b>「 💣 MINES 」</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"💰 <b>Bet:</b> {bet} 💠\n"
+        f"<b>Bet:</b> {bet} 💠\n"
         f"💣 <b>Mines:</b> {mines}\n"
         f"💎 <b>Gems Found:</b> {gems_found}\n"
         f"📈 <b>Current Multiplier:</b> {current_mult:.2f}x\n"
@@ -214,7 +237,7 @@ def build_win_text(bet: int, mines: int, gems_found: int, final_mult: float, pay
     return (
         "<b>「 🎉 CASHED OUT! 」</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"💰 <b>Bet:</b> {bet} 💠\n"
+        f"<b>Bet:</b> {bet} 💠\n"
         f"💣 <b>Mines:</b> {mines}\n"
         f"💎 <b>Gems Found:</b> {gems_found}\n"
         f"📈 <b>Final Multiplier:</b> {final_mult:.2f}x\n"
@@ -227,7 +250,7 @@ def build_loss_text(bet: int, mines: int, gems_found: int) -> str:
     return (
         "<b>「 💥 BOOM! YOU HIT A MINE! 」</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"💸 <b>Bet Lost:</b> {bet} 💠\n"
+        f"<b>Bet Lost:</b> {bet} 💠\n"
         f"💣 <b>Mines:</b> {mines}\n"
         f"💎 <b>Gems Found:</b> {gems_found}\n"
         "━━━━━━━━━━━━━━━━━"
@@ -538,7 +561,7 @@ async def mines_cmd(message: Message, command: CommandObject):
             f"<b>Usage:</b> <code>/mines &lt;bet&gt; &lt;mines&gt;</code>\n"
             f"<b>Example:</b> <code>/mines 50 3</code>\n\n"
             f"💡 Or play the Mini App: <code>/webmine</code>\n\n"
-            f"💰 Bet: {MIN_BET} – {MAX_BET:,} 💠\n"
+            f"Bet: {MIN_BET} – {MAX_BET:,} 💠\n"
             f"💣 Mines: {MIN_MINES} – {MAX_MINES} (on a 25-tile board)",
             parse_mode=ParseMode.HTML
         )
@@ -686,7 +709,7 @@ async def mines_tile_cb(cq: CallbackQuery):
             await edit_game_message(
                 cq,
                 build_win_text(bet, mines, game["gems_found"], current_mult, payout),
-                build_keyboard(owner_id, board, game["revealed"])
+                build_keyboard(owner_id, board, game["revealed"], game_over=True)
             )
             return
 
@@ -757,7 +780,7 @@ async def mines_cashout_cb(cq: CallbackQuery):
         await edit_game_message(
             cq,
             build_win_text(bet, mines, game["gems_found"], final_mult, payout),
-            build_keyboard(owner_id, board, game["revealed"])
+            build_keyboard(owner_id, board, game["revealed"], game_over=True)
         )
 
 
@@ -787,7 +810,7 @@ async def gmstats_cmd(message: Message):
         "<b>「 📊 MINES GLOBAL STATS 」</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"💠 <b>Total Shards Generated -</b> {total_won:,}\n"
-        f"💸 <b>Total Shards Taken -</b> {total_taken:,}\n"
+        f"<b>Total Shards Taken -</b> {total_taken:,}\n"
         f"🎮 <b>Total Games Played -</b> {total_games:,}\n"
         f"📅 <b>Games Played Today -</b> {games_today:,}\n"
         "━━━━━━━━━━━━━━━━━"
