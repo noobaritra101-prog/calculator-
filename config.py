@@ -14,7 +14,7 @@ from aiogram.enums import ParseMode
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BOT_TOKEN           = "7658617809:AAFRLp0x2R4qdHrxbDrp9Ltw3DsM2DXowJ8"
+BOT_TOKEN           = "7658617809:AAFKiHT-skcWWC52UVraXrqEjEzPXNR3fRE"
 ADMIN_IDS           = [5716292610, 5822885863, 7930421561, 7964904329]
 SUPREME_OWNER_ID    = 5716292610
 DB_GROUP_ID         = -1003799799158 # Used for uploading new cards
