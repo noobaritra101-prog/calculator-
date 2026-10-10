@@ -308,10 +308,9 @@ def tree_keyboard(uid: str, lanes: int, height: int, traps: list, picks: list, s
                     repeat=None) -> InlineKeyboardMarkup:
     """
     Draws the tree with the top level first and level 1 at the bottom.
-      green  = the level you are on now (tap a branch), and branches you climbed
-      red    = snakes (only revealed when the round is over)
-      blue    = safe branches revealed when the round is over
-      neutral = everything else
+      blue    = the level you are on now (tap a branch)
+      red     = snakes (only revealed when the round is over)
+      no colour = climbed branches, revealed safe leaves and everything else
     """
     rows = []
     for r in range(height - 1, -1, -1):
@@ -321,26 +320,26 @@ def tree_keyboard(uid: str, lanes: int, height: int, traps: list, picks: list, s
                 row.append(tree_button(BOOM_EMOJI, "trnoop", "danger"))
             elif r < steps:
                 if c == picks[r]:
-                    row.append(tree_button(CLIMBED_EMOJI, "trnoop", "success"))
+                    row.append(tree_button(CLIMBED_EMOJI, "trnoop"))
                 elif game_over and c in traps[r]:
                     row.append(tree_button(TRAP_EMOJI, "trnoop", "danger"))
                 elif game_over:
-                    row.append(tree_button(SAFE_REVEAL_EMOJI, "trnoop", "primary"))
+                    row.append(tree_button(SAFE_REVEAL_EMOJI, "trnoop"))
                 else:
                     row.append(tree_button(EMPTY_TILE, "trnoop"))
             elif r == steps and not game_over:
                 # row index is in the callback so a stale double-tap can't hit the next level
-                row.append(tree_button(BRANCH_EMOJI, f"trstep_{uid}_{r}_{c}", "success"))
+                row.append(tree_button(BRANCH_EMOJI, f"trstep_{uid}_{r}_{c}", "primary"))
             elif game_over and c in traps[r]:
                 row.append(tree_button(TRAP_EMOJI, "trnoop", "danger"))
             elif game_over:
-                row.append(tree_button(SAFE_REVEAL_EMOJI, "trnoop", "primary"))
+                row.append(tree_button(SAFE_REVEAL_EMOJI, "trnoop"))
             else:
                 row.append(tree_button(EMPTY_TILE, "trnoop"))
         rows.append(row)
 
     if game_over and repeat:
-        # repeat = (mode_key, bet), shown after a win: replay the same mode and bet, or close the message
+        # repeat = (mode_key, bet), shown after a win or a snake bite: replay the same mode and bet, or close the message
         rows.append([
             tree_button("↻ Repeat", f"trrep_{uid}_{repeat[0]}_{repeat[1]}", "primary"),
             tree_button("Close", f"trclose_{uid}", "danger"),
@@ -727,7 +726,9 @@ async def tree_step_cb(cq: CallbackQuery):
             active_trees.pop(owner_id, None)
             tree_record_loss(game)
             await cq.answer("🐍 A snake was hiding there!", show_alert=False)
-            await tree_edit_message(cq, tree_loss_text(game), _final_keyboard(owner_id, game, boom=(row, lane)))
+            repeat_ok[owner_id] = cq.message.message_id
+            await tree_edit_message(cq, tree_loss_text(game),
+                                    _final_keyboard(owner_id, game, boom=(row, lane), repeat=True))
             return
 
         # SAFE BRANCH
