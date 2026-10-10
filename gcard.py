@@ -7,11 +7,12 @@ import difflib
 import io
 import re
 from datetime import datetime, timezone
+from html import escape as _html_esc
 
 from PIL import Image, ImageFilter
 from aiogram import F
 from aiogram.types import (
-    Message, BufferedInputFile, InputMediaPhoto,
+    Message, CallbackQuery, BufferedInputFile, InputMediaPhoto,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.filters import Command
@@ -167,9 +168,8 @@ async def _expire_gcard(cid_str: str, msg_id: int, chat_id: int):
         # Unblur the card while keeping the caption exactly the same
         await _reveal_gcard(chat_id, msg_id, card_data.get("file_id"))
         
-        # Clean up the revealed card and the timeout notice after 2 minutes
+        # Remove only the revealed card picture after 2 minutes; the timeout notice stays
         asyncio.create_task(_delete_message_after_delay(chat_id, msg_id, 120))
-        asyncio.create_task(_delete_message_after_delay(chat_id, timeout_msg.message_id, 120))
 
 
 @main_router.message(Command("gcard"))
@@ -359,6 +359,14 @@ async def gcard_plain_guess_listener(message: Message):
     if user_id not in daily["active_players"]:
         daily["active_players"].append(user_id)
 
+    # Personal record for /gcard_lbd (correct guesses, fastest guess, shards earned)
+    rec = user_data.setdefault("gcard", {})
+    rec["correct"] = rec.get("correct", 0) + 1
+    rec["shards"] = rec.get("shards", 0) + reward_amount
+    best = rec.get("best_time")
+    if best is None or time_taken < best:
+        rec["best_time"] = time_taken
+
     save_db()
 
     if reward_amount > 0:
@@ -382,8 +390,134 @@ async def gcard_plain_guess_listener(message: Message):
     # Unblur the original card image while maintaining the original caption
     await _reveal_gcard(chat_id, msg_id, card_data.get("file_id"))
 
-    # Clean up both the revealed card message and the victory text after 2 minutes
+    # Remove only the revealed card picture after 2 minutes; the victory text stays
     asyncio.create_task(_delete_message_after_delay(chat_id, msg_id, 120))
-    asyncio.create_task(_delete_message_after_delay(chat_id, winner_msg.message_id, 120))
+
+
+# ==========================================
+# /gcard_lbd — LEADERBOARD (same layout as /scramble_lbd, own stats)
+# ==========================================
+GCARD_LB_TABS = {"time": "Fastest guess", "correct": "Correct guesses", "shards": "Total shards collected"}
+GCARD_LB_TITLES = {"time": "FASTEST GUESS", "correct": "CORRECT GUESSES", "shards": "TOTAL SHARDS"}
+GCARD_LBD_IMAGE = "https://i.ibb.co/9kpH571g/IMG-20261010-130819.jpg"   # leaderboard banner (caption limit: 1024 chars)
+
+_GCARD_HAS_STYLE = "style" in getattr(InlineKeyboardButton, "model_fields", {})
+
+
+def _gcard_btn(text: str, data: str, style: str | None = None):
+    if style and _GCARD_HAS_STYLE:
+        return InlineKeyboardButton(text=text, callback_data=data, style=style)
+    return InlineKeyboardButton(text=f"[{text}]" if style == "success" else text, callback_data=data)
+
+
+def _gcard_board(db: dict, tab: str):
+    """[(value, uid, name)] best first. Time: lowest wins; Correct / Shards: highest wins."""
+    rows = []
+    for uid, u in (db.get("users") or {}).items():
+        rec = u.get("gcard") if isinstance(u, dict) else None
+        if not isinstance(rec, dict):
+            continue
+        if tab == "time":
+            v = rec.get("best_time")
+        elif tab == "correct":
+            v = rec.get("correct", 0)
+        else:
+            v = rec.get("shards", 0)
+        if v and v > 0:
+            name = str(u.get("name") or "User")[:24]
+            rows.append((v, str(uid), name))
+    if tab == "time":
+        rows.sort(key=lambda r: (r[0], r[1]))
+    else:
+        rows.sort(key=lambda r: (-r[0], r[1]))
+    return rows
+
+
+def _gcard_fmt_value(tab: str, v) -> str:
+    if tab == "time":
+        return f"{v:.2f}s" if v < 60 else f"{int(v // 60)}m {v % 60:04.1f}s"
+    if tab == "correct":
+        return f"{int(v):,} guess" + ("" if int(v) == 1 else "es")
+    return f"{int(v):,} shards"
+
+
+def _gcard_lb_text(db: dict, tab: str, uid) -> str:
+    rows = _gcard_board(db, tab)
+    text = f"<b>「 GCARD - {GCARD_LB_TITLES[tab]} 」</b>\n━━━━━━━━━━━━━━━━━\n"
+    if rows:
+        text += "\n".join(
+            f"<b>{i + 1}.</b> <b>{_html_esc(name[:18])}</b> - {_gcard_fmt_value(tab, v)}"
+            for i, (v, _u, name) in enumerate(rows[:10])
+        )
+    else:
+        text += "Nobody has guessed a card yet. Be the first with /gcard"
+    text += "\n━━━━━━━━━━━━━━━━━\n"
+    me = str(uid)
+    idx = next((i for i, r in enumerate(rows) if r[1] == me), None)
+    if idx is None:
+        text += "<b>Your rank:</b> Unranked"
+    else:
+        text += f"<b>Your rank:</b> #{idx + 1} with {_gcard_fmt_value(tab, rows[idx][0])}"
+    return text
+
+
+def _gcard_lb_kb(owner, active: str) -> InlineKeyboardMarkup:
+    def btn(tab):
+        return _gcard_btn(GCARD_LB_TABS[tab], f"glb:{tab}:{owner}",
+                          "success" if tab == active else "primary")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("time"), btn("correct")],
+        [btn("shards")],
+    ])
+
+
+@main_router.message(Command("gcard_lbd"))
+async def gcard_lbd_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int):
+        return
+    try:
+        ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username)
+        db = load_db()
+        text = _gcard_lb_text(db, "time", uid_int)
+        kb = _gcard_lb_kb(uid_int, "time")
+        try:   # banner image with the leaderboard as its caption
+            await message.reply_photo(photo=GCARD_LBD_IMAGE, caption=text,
+                                      reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:   # image unreachable: still show the leaderboard as text
+            await message.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[gcard_lbd_CRASH] {e}")
+        await message.reply("The leaderboard is unavailable right now. Please try again in a moment.")
+
+
+@main_router.callback_query(F.data.startswith("glb:"))
+async def gcard_lbd_cb(cq: CallbackQuery):
+    if is_ghost_banned(cq.from_user.id) or is_shadow_banned(cq.from_user.id):
+        return
+    try:
+        _, tab, owner = cq.data.split(":")
+    except ValueError:
+        await cq.answer()
+        return
+    if tab not in GCARD_LB_TABS:
+        await cq.answer()
+        return
+    if str(cq.from_user.id) != owner:
+        await cq.answer("This leaderboard belongs to someone else. Send /gcard_lbd for your own.", show_alert=True)
+        return
+    try:
+        db = load_db()
+        text = _gcard_lb_text(db, tab, cq.from_user.id)
+        kb = _gcard_lb_kb(owner, tab)
+        if cq.message.photo:   # banner image: the leaderboard lives in the caption
+            await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            print(f"[gcard_lbd_cb] failed: {e}")
+    await cq.answer()
+
 
 # --- END OF FILE gcard.py ---

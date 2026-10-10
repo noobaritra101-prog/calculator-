@@ -121,10 +121,8 @@ async def _scramble_fetch(file_id: str) -> bytes:
 
 
 def _scramble_valid_ids(db: dict) -> list:
-    """Card ids with art, skipping locked animes."""
-    locked = [a.lower().strip() for a in db.get("settings", {}).get("locked_animes", [])]
-    return [c for c, g in db.get("global_cards", {}).items()
-            if g.get("file_id") and str(g.get("anime", "")).lower().strip() not in locked]
+    """Card ids with art. Locked series are included too, same as /gcard."""
+    return [c for c, g in db.get("global_cards", {}).items() if g.get("file_id")]
 
 
 def _scramble_candidates(db: dict) -> list:
@@ -142,7 +140,7 @@ def _scramble_take(db: dict):
     while _scramble_pool:
         cid = random.choice(list(_scramble_pool))
         base = _scramble_pool.pop(cid)
-        if cid in valid:   # card may have been removed/locked since it was pooled
+        if cid in valid:   # card may have been removed since it was pooled
             return cid, base
     return None, None
 
