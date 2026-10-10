@@ -39,6 +39,9 @@ logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handle
 logger = logging.getLogger("AnimeNexus")
 
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+# One INFO line per update (console + file write) slows every single message
+logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 
 def _log_uncaught_exceptions(exc_type, exc_value, exc_traceback):
@@ -153,6 +156,11 @@ async def bot_added_to_group(event: ChatMemberUpdated):
 _cb_cooldown: dict[int, float] = {}
 CB_COOLDOWN_SEC = 1.2
 
+# check_autoleave ran on EVERY group message. A chat that passed the check is
+# not re-checked for AUTOLEAVE_RECHECK_SEC; a chat that failed is handled at once.
+_autoleave_ok_until: dict[int, float] = {}
+AUTOLEAVE_RECHECK_SEC = 30
+
 
 class GlobalGuardMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data: dict):
@@ -171,8 +179,12 @@ class GlobalGuardMiddleware(BaseMiddleware):
             if not user.is_bot:
                 config.total_messages += 1
             if event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-                if await check_autoleave(event.chat.id):
-                    return
+                _now = time.time()
+                if _autoleave_ok_until.get(event.chat.id, 0.0) <= _now:
+                    if await check_autoleave(event.chat.id):
+                        _autoleave_ok_until.pop(event.chat.id, None)
+                        return
+                    _autoleave_ok_until[event.chat.id] = _now + AUTOLEAVE_RECHECK_SEC
 
         # ADMIN IMMUNITY
         if uid not in config.ADMIN_IDS:
@@ -261,7 +273,12 @@ async def run_polling_resilient():
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("Establishing connection with Telegram API...")
-            await dp.start_polling(bot)
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),   # skip updates no handler uses
+                polling_timeout=30,                               # fewer idle requests, same latency
+                handle_as_tasks=True,                             # every update runs concurrently
+            )
             break
         except (TelegramNetworkError, TelegramRetryAfter,
                 ServerDisconnectedError, ClientConnectionError,
@@ -291,6 +308,14 @@ async def lifespan(app: FastAPI):
     logger.info("Verifying cloud database backup integrity...")
     await load_from_group()
     load_settings()
+
+    # The whole database lives in memory as millions of long-lived objects. Python's garbage
+    # collector keeps re-scanning them and freezes the bot for a moment each time. Moving
+    # them to a permanent generation and collecting less often removes those pauses.
+    import gc
+    gc.collect()
+    gc.freeze()
+    gc.set_threshold(50_000, 20, 100)
 
     # Register Aiogram Middlewares & Routers
     dp.message.outer_middleware(GlobalGuardMiddleware())

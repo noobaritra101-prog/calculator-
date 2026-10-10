@@ -14,7 +14,7 @@ from aiogram.enums import ParseMode
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BOT_TOKEN           = "7658617809:AAFKiHT-skcWWC52UVraXrqEjEzPXNR3fRE"
+BOT_TOKEN           = "7658617809:AAFRLp0x2R4qdHrxbDrp9Ltw3DsM2DXowJ8"
 ADMIN_IDS           = [5716292610, 5822885863, 7930421561, 7964904329]
 SUPREME_OWNER_ID    = 5716292610
 DB_GROUP_ID         = -1003799799158 # Used for uploading new cards
@@ -38,7 +38,7 @@ MAIN_GROUP_LINK     = "https://t.me/animex_nexus"
 # that must point back at THIS running app. Import it from config everywhere
 # instead of hardcoding it — if it drifts from the actual host, every image
 # link silently points at a dead service and every <img> in the Mini Apps breaks.
-BACKEND_PUBLIC_URL  = "https://calculator-production-740f.up.railway.app"
+BACKEND_PUBLIC_URL  = "https://worker-production-67bd.up.railway.app"
 OFFLINE_STORE_GROUP = -1003982098657  # 🏪 Peer-to-Peer Consignment Group/Channel ID
 
 # Fixed Shards Card Purchase Prices for Online Shop - Balanced Values
@@ -73,11 +73,33 @@ DECK_PER_PAGE      = 10
 CARDS_PER_PAGE     = 10
 BROWSE_PER_PAGE    = 10
 
-bot = Bot(token=BOT_TOKEN)
+try:   # bigger connection pool: many users at once no longer queue for a free connection
+    from aiogram.client.session.aiohttp import AiohttpSession
+    bot = Bot(token=BOT_TOKEN, session=AiohttpSession(limit=300))
+except Exception:
+    bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 main_router = Router()
 
 DB_FILE = "database.json"
+
+# ── Fast JSON ────────────────────────────────────────────────────────────────
+# The whole DB is serialised on the event loop every few seconds. json.dumps(indent=2)
+# is by far the slowest way to do that (indent disables the C encoder), and while it
+# runs the bot answers nobody. orjson (pip install orjson) is ~10x faster still; without
+# it we fall back to compact stdlib JSON, which is already several times faster.
+try:
+    import orjson
+
+    def _dumps(obj) -> bytes:
+        return orjson.dumps(obj, option=orjson.OPT_NON_STR_KEYS)
+
+    _loads = orjson.loads
+except ImportError:
+    def _dumps(obj) -> bytes:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    _loads = json.loads
 
 # ── In-memory DB cache ───────────────────────────────────────────────────────
 _db_cache        = None
@@ -132,10 +154,10 @@ def load_db() -> dict:
     if not os.path.exists(DB_FILE):
         _db_cache = {"users": {}, "global_cards": {}, "groups": {}, "settings": {}, "offline_store": {}, "market": {}, "promos": {}, "queries": {}}
         return _db_cache
-    with open(DB_FILE, "r", encoding="utf-8") as f:
+    with open(DB_FILE, "rb") as f:
         try:
-            _db_cache = json.load(f)
-        except json.JSONDecodeError:
+            _db_cache = _loads(f.read())
+        except ValueError:
             _db_cache = {"users": {}, "global_cards": {}, "groups": {}, "settings": {}, "offline_store": {}, "market": {}, "promos": {}, "queries": {}}
     if "settings" not in _db_cache: _db_cache["settings"] = {}
     if "offline_store" not in _db_cache: _db_cache["offline_store"] = {}
@@ -161,7 +183,7 @@ def _flush_db(force: bool = False):
     global _db_dirty
     if (not _db_dirty and not force) or _db_cache is None: return
     try:
-        payload = json.dumps(_db_cache, indent=2, ensure_ascii=False)
+        payload = _dumps(_db_cache)
         _write_db_payload(payload)
         _db_dirty = False
     except Exception as e:
@@ -171,7 +193,9 @@ def _write_db_payload(payload: str):
     """Pure disk I/O on an already-serialized string — safe to run on a
     background thread since it never touches the live _db_cache dict."""
     tmp = DB_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    with open(tmp, "wb") as f:
         f.write(payload)
     os.replace(tmp, DB_FILE)
 
@@ -187,7 +211,7 @@ async def _async_flush_db(force: bool = False):
     global _db_dirty
     if (not _db_dirty and not force) or _db_cache is None: return
     try:
-        payload = json.dumps(_db_cache, indent=2, ensure_ascii=False)
+        payload = _dumps(_db_cache)
         _db_dirty = False
         await asyncio.to_thread(_write_db_payload, payload)
     except Exception as e:

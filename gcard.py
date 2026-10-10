@@ -6,6 +6,7 @@ import asyncio
 import difflib
 import io
 import re
+from collections import deque
 from datetime import datetime, timezone
 from html import escape as _html_esc
 
@@ -31,6 +32,95 @@ from config import (
 # ==========================================
 GCARD_ROUND_TIMEOUT_SECS = 45      # time players have to guess before reveal
 GCARD_REWARD_PER_GUESS   = 50      # shards awarded per correct guess
+
+
+# ── Card pool (same idea as Scramble) ────────────────────────────────────────
+# Blurred card images are prepared in the background and kept ready, so a round starts
+# instantly with no download / blur / upload while the player waits. Each round CONSUMES
+# one ready card. When the pool drops to GCARD_POOL_LOW it is refilled up to GCARD_POOL_SIZE
+# with cards that are neither in the pool nor among the last GCARD_RECENT_MAX cards played.
+# Cards that already have a saved blurred_file_id are always instant and need no pool slot.
+GCARD_POOL_SIZE = 30
+GCARD_POOL_LOW = 15
+GCARD_RECENT_MAX = 100
+GCARD_REFILL_PARALLEL = 4
+
+_gcard_pool: dict = {}                    # card_id -> blurred JPEG bytes (ready to upload)
+_gcard_inflight: set = set()              # card_ids being prepared right now
+_gcard_recent: deque = deque(maxlen=GCARD_RECENT_MAX)
+_gcard_refilling = False
+_gcard_bg: set = set()                    # keeps background tasks alive
+
+
+def _gcard_valid_ids(db: dict) -> list:
+    return [c for c, g in db.get("global_cards", {}).items() if g.get("file_id")]
+
+
+async def _gcard_make_blur(file_id: str) -> bytes:
+    """Download a card and blur its name regions (the slow part, done off the event loop)."""
+    buf = io.BytesIO()
+    await bot.download(file_id, destination=buf)
+    return await asyncio.to_thread(_blur_card_image, buf.getvalue())
+
+
+def _gcard_take(db: dict):
+    """Pick a ready card -> (card_id, blurred_bytes or None). None means the saved
+    blurred_file_id is used. Returns (None, None) when nothing is ready."""
+    cards = db.get("global_cards", {})
+    recent = set(_gcard_recent)
+    ready = [c for c in _gcard_pool if c in cards and c not in recent]
+    ready += [c for c, g in cards.items()
+              if g.get("file_id") and g.get("blurred_file_id") and c not in recent]
+    if not ready:
+        return None, None
+    cid = random.choice(ready)
+    return cid, _gcard_pool.pop(cid, None)
+
+
+async def _gcard_refill(db: dict):
+    """Top the pool back up in the background."""
+    global _gcard_refilling
+    if _gcard_refilling:
+        return
+    _gcard_refilling = True
+    try:
+        sem = asyncio.Semaphore(GCARD_REFILL_PARALLEL)
+
+        async def load(cid):
+            async with sem:
+                data = await _gcard_make_blur(db["global_cards"][cid]["file_id"])
+            if (cid not in _gcard_pool and cid not in _gcard_recent
+                    and len(_gcard_pool) < GCARD_POOL_SIZE):
+                _gcard_pool[cid] = data
+                return True
+            return False
+
+        while len(_gcard_pool) < GCARD_POOL_SIZE:
+            taken = set(_gcard_pool) | _gcard_inflight
+            cands = [c for c in _gcard_valid_ids(db)
+                     if c not in taken and c not in _gcard_recent
+                     and not db["global_cards"][c].get("blurred_file_id")]
+            if not cands:
+                break
+            batch = random.sample(cands, min(GCARD_POOL_SIZE - len(_gcard_pool), len(cands)))
+            _gcard_inflight.update(batch)
+            try:
+                results = await asyncio.gather(*(load(c) for c in batch), return_exceptions=True)
+            finally:
+                _gcard_inflight.difference_update(batch)
+            if not any(r is True for r in results):
+                break
+    except Exception as e:
+        print(f"[gcard_refill] {e}")
+    finally:
+        _gcard_refilling = False
+
+
+def _gcard_kick_refill(db: dict):
+    if len(_gcard_pool) <= GCARD_POOL_LOW and not _gcard_refilling:
+        task = asyncio.create_task(_gcard_refill(db))
+        _gcard_bg.add(task)
+        task.add_done_callback(_gcard_bg.discard)
 
 
 def _gcard_view_kb(chat_id: int, message_id: int) -> InlineKeyboardMarkup:
@@ -210,34 +300,43 @@ async def gcard_cmd(message: Message):
         await message.reply("❌ No cards exist in the system yet.", parse_mode=ParseMode.HTML)
         return
 
-    card_id, card_data = random.choice(list(db["global_cards"].items()))
+    # Ready card first (instant). Nothing ready yet: pick any card not played recently.
+    card_id, ready_bytes = _gcard_take(db)
+    if card_id is None:
+        valid = _gcard_valid_ids(db)
+        fresh = [c for c in valid if c not in _gcard_recent] or valid
+        if not fresh:
+            active_gcard.pop(cid_str, None)
+            await message.reply("❌ No cards exist in the system yet.", parse_mode=ParseMode.HTML)
+            return
+        card_id = random.choice(fresh)
+    card_data = db["global_cards"][card_id]
     original_file_id = card_data["file_id"]
+    _gcard_recent.append(card_id)   # not offered again until it ages out of the recent list
 
     try:
+        msg = None
         cached_blur_id = card_data.get("blurred_file_id")
-        
-        # Attempt instant load via pre-compiled blurry file_id
-        if cached_blur_id:
+
+        # 1) Saved blurred file_id: instant send
+        if cached_blur_id and ready_bytes is None:
             try:
                 msg = await bot.send_photo(
                     chat_id=chat_id, photo=cached_blur_id,
                     caption=GAME_CAPTION, parse_mode=ParseMode.HTML
                 )
             except Exception:
-                cached_blur_id = None  # Fallback if cached file expired
-                
-        # Generate and save blurred template on cache miss
-        if not cached_blur_id:
-            file_info  = await bot.get_file(original_file_id)
-            file_bytes = await bot.download_file(file_info.file_path)
-            blurred_bytes = _blur_card_image(file_bytes.getvalue())
-            photo_input = BufferedInputFile(blurred_bytes, filename="gcard_blur.jpg")
-            
+                cached_blur_id = None  # cached file expired: rebuild below
+
+        # 2) Pooled (pre-blurred) bytes, or build on demand on a cache miss
+        if msg is None:
+            blurred_bytes = ready_bytes or await _gcard_make_blur(original_file_id)
             msg = await bot.send_photo(
-                chat_id=chat_id, photo=photo_input,
+                chat_id=chat_id,
+                photo=BufferedInputFile(blurred_bytes, filename="gcard_blur.jpg"),
                 caption=GAME_CAPTION, parse_mode=ParseMode.HTML
             )
-            # Save the newly uploaded blurry file_id for instant load next time
+            # Save the new blurred file_id so this card is instant from now on
             db["global_cards"][card_id]["blurred_file_id"] = msg.photo[-1].file_id
             save_db()
 
@@ -255,6 +354,8 @@ async def gcard_cmd(message: Message):
         daily = _touch_gcard_daily(db)
         daily["rounds_today"] = daily.get("rounds_today", 0) + 1
         save_db()
+
+        _gcard_kick_refill(db)
 
         # Schedule warning and expiration threads
         asyncio.create_task(_warn_gcard(cid_str, msg.message_id, chat_id))

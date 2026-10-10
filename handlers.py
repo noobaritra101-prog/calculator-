@@ -108,9 +108,25 @@ async def smart_reply_photo(message: Message, *args, **kwargs):
     return await message.reply_photo(*args, **kwargs)
 
 
+def _ratio_if(a: str, b: str, th: float) -> float:
+    """Exactly difflib's SequenceMatcher(None, a, b).ratio() when that is >= th, else 0.0.
+    Cheap length / letter-count upper bounds reject most non-matches before the slow
+    full comparison, so scanning a big card list stops costing seconds of CPU."""
+    la, lb = len(a), len(b)
+    if la + lb == 0:
+        return 1.0 if th <= 1.0 else 0.0
+    if 2.0 * min(la, lb) / (la + lb) < th:
+        return 0.0
+    sm = difflib.SequenceMatcher(None, a, b)
+    if sm.quick_ratio() < th:
+        return 0.0
+    r = sm.ratio()
+    return r if r >= th else 0.0
+
+
 async def has_bot_in_bio(user_id: int) -> bool:
     try:
-        bot_info = await bot.get_me()
+        bot_info = await bot.me()
         bot_username = f"@{bot_info.username}".lower()
         user_chat = await bot.get_chat(user_id)
         if user_chat.bio:
@@ -912,7 +928,7 @@ def _seize_name_matches(query: str, target_name: str) -> bool:
 
     if len(query) >= 3 and query in target:
         return True
-    if difflib.SequenceMatcher(None, query, target).ratio() > 0.70:
+    if _ratio_if(query, target, 0.70) > 0.70:
         return True
 
     target_words = target.split()
@@ -926,7 +942,7 @@ def _seize_name_matches(query: str, target_name: str) -> bool:
         for tw in target_words:
             if qw in tw or tw in qw:
                 return True
-            if difflib.SequenceMatcher(None, qw, tw).ratio() > 0.70:
+            if _ratio_if(qw, tw, 0.70) > 0.70:
                 return True
         return False
 
@@ -1178,7 +1194,7 @@ async def gift_cmd(message: Message, command: CommandObject):
                 best_ratio = ratio
                 best_match = (cid, cdata)
         else:
-            ratio = difflib.SequenceMatcher(None, query, name_lower).ratio()
+            ratio = _ratio_if(query, name_lower, max(0.6, best_ratio))
             if ratio > 0.6 and ratio > best_ratio:
                 best_ratio = ratio
                 best_match = (cid, cdata)
@@ -1965,13 +1981,27 @@ async def profile_back_cb(cq: CallbackQuery):
 LEADERBOARD_SYMBOLS = ["✦", "✧", "❖"] + ["◈"] * 7
 
 
+_LB_CACHE = {"at": 0.0, "n": -1, "top": []}
+LB_CACHE_SECS = 20
+
+
+def _leaderboard_ranking(db: dict) -> list:
+    """Sorting every user on each /leaderboard is slow on a big database; reuse the result briefly."""
+    now = time.time()
+    n = len(db["users"])
+    if now - _LB_CACHE["at"] > LB_CACHE_SECS or _LB_CACHE["n"] != n:
+        _LB_CACHE["top"] = sorted(db["users"].items(), key=lambda x: len(x[1].get("cards", {})), reverse=True)
+        _LB_CACHE["at"], _LB_CACHE["n"] = now, n
+    return _LB_CACHE["top"]
+
+
 @main_router.message(Command("leaderboard", "top"))
 async def leaderboard(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
 
     db      = load_db()
-    top     = sorted(db["users"].items(), key=lambda x: len(x[1].get("cards", {})), reverse=True)
+    top     = _leaderboard_ranking(db)
     user_id = str(uid_int)
 
     user_rank = 0
@@ -2342,7 +2372,7 @@ async def referral_cmd(message: Message):
 
     user_id  = str(uid_int)
     db       = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
-    bot_info = await bot.get_me()
+    bot_info = await bot.me()
 
     ref_link       = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
     referred_users = db["users"][user_id].get("referrals", [])
@@ -2667,7 +2697,7 @@ def _find_owned_card(db: dict, user_id: str, query: str):
                 best_ratio = ratio
                 best_match = cid
         else:
-            ratio = difflib.SequenceMatcher(None, query, name_lower).ratio()
+            ratio = _ratio_if(query, name_lower, max(0.6, best_ratio))
             if ratio > 0.6 and ratio > best_ratio:
                 best_ratio = ratio
                 best_match = cid
@@ -2748,7 +2778,7 @@ def _fz_token_score(qt: str, nt: str) -> float:
     if len(qt) >= 4 and qt.startswith(nt) and len(nt) >= 3:
         return 0.7                      # user typed extra letters: "gokuu" vs "goku"
     if len(qt) >= 3 and len(nt) >= 3:   # typo tolerance only for real words
-        r = difflib.SequenceMatcher(None, qt, nt).ratio()
+        r = _ratio_if(qt, nt, 0.8)
         if r >= 0.8:
             return r * 0.85
     return 0.0
@@ -2797,9 +2827,9 @@ def _fz_score(query: str, name: str) -> float:
     # --- whole-string typo tolerance (handles run-together / mangled spelling) ---
     sm = difflib.SequenceMatcher
     whole = max(
-        sm(None, q, n).ratio(),
-        sm(None, " ".join(sorted(qtoks)), " ".join(sorted(ntoks))).ratio(),   # word order ignored
-        sm(None, q.replace(" ", ""), n.replace(" ", "")).ratio(),             # spacing ignored
+        _ratio_if(q, n, 0.72),
+        _ratio_if(" ".join(sorted(qtoks)), " ".join(sorted(ntoks)), 0.72),   # word order ignored
+        _ratio_if(q.replace(" ", ""), n.replace(" ", ""), 0.72),             # spacing ignored
     )
     whole_score = whole * 0.9 if whole >= 0.72 else 0.0
 
@@ -2891,8 +2921,8 @@ def _find_search_matches(db: dict, user_id: str, query: str, limit: int = SEARCH
                 continue
             n_norm = _fz_norm(name)
             best = max(
-                difflib.SequenceMatcher(None, q_norm, n_norm).ratio(),
-                max((difflib.SequenceMatcher(None, q_norm, t).ratio() for t in n_norm.split()), default=0.0),
+                _ratio_if(q_norm, n_norm, SEARCH_LOOSE_SCORE),
+                max((_ratio_if(q_norm, t, SEARCH_LOOSE_SCORE) for t in n_norm.split()), default=0.0),
             )
             if best >= SEARCH_LOOSE_SCORE:
                 loose.append((best, owned, name.lower(), cid))
@@ -3033,7 +3063,7 @@ def _find_global_card(db: dict, query: str):
                 best_ratio = ratio
                 best_match = cid
         else:
-            ratio = difflib.SequenceMatcher(None, query, name_lower).ratio()
+            ratio = _ratio_if(query, name_lower, max(0.6, best_ratio))
             if ratio > 0.6 and ratio > best_ratio:
                 best_ratio = ratio
                 best_match = cid
@@ -3064,7 +3094,7 @@ async def data_card_cmd(message: Message, command: CommandObject):
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
 
     if message.chat.type != ChatType.PRIVATE:
-        bot_info = await bot.get_me()
+        bot_info = await bot.me()
         dm_link = f"https://t.me/{bot_info.username}"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Come here", url=dm_link)]
@@ -3579,7 +3609,7 @@ async def guide_cmd(message: Message):
     # In groups: web_app buttons aren't allowed on a normal message, so
     # instead point the user to DM the bot — clicking the button deep-links
     # straight into /start?guide, which auto-opens the guide there.
-    bot_info = await bot.get_me()
+    bot_info = await bot.me()
     deep_link = f"https://t.me/{bot_info.username}?start=guide"
 
     # If used as a reply, tag whoever was replied to — unless that's a bot
