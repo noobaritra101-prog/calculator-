@@ -18,6 +18,8 @@ import hmac
 import base64
 import json
 import hashlib
+import math
+from functools import lru_cache
 import statistics
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl
@@ -49,7 +51,7 @@ from deck import dlog, deck_api   # same FastAPI router the deck / chicken Mini 
 # buttons). Tap two numbers to swap those pieces; rebuild the picture to win.
 SCRAMBLE_COLS = 3
 SCRAMBLE_ROWS = 3
-SCRAMBLE_MAX_WIDTH = 900            # working resolution of the puzzle image
+SCRAMBLE_MAX_WIDTH = 780            # working resolution of the puzzle image (smaller = faster upload/download)
 SCRAMBLE_TTL = 15 * 60              # idle seconds before a puzzle expires
 SCRAMBLE_MAX_GAMES = 150            # hard cap on puzzles held in memory
 # Card pool: prepared card images kept ready so a board can be sent without downloading.
@@ -59,7 +61,7 @@ SCRAMBLE_MAX_GAMES = 150            # hard cap on puzzles held in memory
 SCRAMBLE_POOL_SIZE = 60
 SCRAMBLE_POOL_LOW = 30
 SCRAMBLE_RECENT_MAX = 100
-SCRAMBLE_REFILL_PARALLEL = 4        # simultaneous Telegram downloads while refilling
+SCRAMBLE_REFILL_PARALLEL = 8        # simultaneous Telegram downloads while refilling
 
 # Button flood guard: taps are applied strictly IN ORDER (never silently dropped, so a quick
 # "3 then 5" still swaps). Only taps piling up faster than the board can redraw are refused
@@ -187,14 +189,64 @@ async def _scramble_refill(db: dict):
         _scramble_refilling = False
 
 
-def _scramble_kick_refill(db: dict):
+def _scramble_kick_refill(db: dict, low: int | None = None):
     """Start a background refill when the pool is at/below the low-water mark."""
-    if len(_scramble_pool) <= SCRAMBLE_POOL_LOW and not _scramble_refilling:
+    if len(_scramble_pool) <= (SCRAMBLE_POOL_LOW if low is None else low) and not _scramble_refilling:
         task = asyncio.create_task(_scramble_refill(db))
         _scramble_bg.add(task)
         task.add_done_callback(_scramble_bg.discard)
 
 
+async def _scramble_take_wait(db: dict, wait: float = 2.5):
+    """Like _scramble_take, but if the pool is empty while a refill is running, give it a moment
+    to land a card instead of starting a second slow download."""
+    cid, base = _scramble_take(db)
+    t0 = time.time()
+    while cid is None and _scramble_refilling and time.time() - t0 < wait:
+        await asyncio.sleep(0.1)
+        cid, base = _scramble_take(db)
+    return cid, base
+
+
+def _scr_bg(coro):
+    """Run a coroutine in the background (errors swallowed) so the player never waits on it."""
+    async def _run():
+        try:
+            await coro
+        except Exception:
+            pass
+    t = asyncio.create_task(_run())
+    _scramble_bg.add(t)
+    t.add_done_callback(_scramble_bg.discard)
+
+
+_scr_save_handle = None
+
+
+def _scr_save_soon(delay: float = 1.5):
+    """save_db() a moment AFTER the request has been answered (several calls = one save).
+    Violation logging used to save synchronously inside the request, which made captcha
+    answers and swaps wait on the disk."""
+    global _scr_save_handle
+    if _scr_save_handle is not None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        save_db()
+        return
+
+    def _run():
+        global _scr_save_handle
+        _scr_save_handle = None
+        try:
+            save_db()
+        except Exception as e:
+            dlog.error(f"[scr_save_soon] {e}", exc_info=True)
+    _scr_save_handle = loop.call_later(delay, _run)
+
+
+@lru_cache(maxsize=16)
 def _scramble_font(size: int):
     for name in ("DejaVuSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf"):
         try:
@@ -212,12 +264,12 @@ def _scramble_prepare(raw: bytes) -> bytes:
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     if img.width > SCRAMBLE_MAX_WIDTH:
         ratio = SCRAMBLE_MAX_WIDTH / img.width
-        img = img.resize((SCRAMBLE_MAX_WIDTH, max(1, int(img.height * ratio))), Image.LANCZOS)
+        img = img.resize((SCRAMBLE_MAX_WIDTH, max(1, int(img.height * ratio))), Image.BICUBIC)
     w = img.width - (img.width % SCRAMBLE_COLS)
     h = img.height - (img.height % SCRAMBLE_ROWS)
     img = img.crop((0, 0, w, h))
     out = io.BytesIO()
-    img.save(out, "JPEG", quality=85)
+    img.save(out, "JPEG", quality=82)
     return out.getvalue()
 
 
@@ -253,7 +305,7 @@ def _scramble_render(base: bytes, perm: list, badges: bool = True) -> bytes:
             draw.text((cx, cy), str(pos + 1), fill=(255, 255, 255), font=font, anchor="mm")
 
     buf = io.BytesIO()
-    out.save(buf, "JPEG", quality=88)
+    out.save(buf, "JPEG", quality=80)
     return buf.getvalue()
 
 
@@ -332,11 +384,10 @@ def _scr_stat(db: dict, event: str, uid=None, name: str = "", mode: str = "chat"
 # ── /scrlog: one event log for everything Scramble does (db["scramble_log"]) ──
 SCRAMBLE_LOG_MAX = 3000          # when this many entries pile up ...
 SCRAMBLE_LOG_TRIM_TO = 2500      # ... trim down to this, dropping the oldest NORMAL events first (violations last)
-SCRAMBLE_LOG_PAGE = 10           # entries per /scrlog page
 SCRAMBLE_VIOLATIONS = {
     "too_fast", "robotic_timing", "hourly_limit", "bad_swap", "too_many_moves", "retired_finish",
     "start_spam", "banned_attempt", "flood_lock",
-    "captcha_wrong", "captcha_ignored", "ban",
+    "captcha_wrong", "captcha_ignored", "captcha_too_fast", "ban",
 }
 _scramble_log_seen: dict = {}    # (event, uid) -> last time it was logged, to keep spammy events to one line a minute
 
@@ -365,7 +416,7 @@ def _scr_log(db: dict, event: str, uid=None, name: str = "", **info):
                 keep = keep[excess:]
             lst[:] = keep
         if viol:
-            save_db()
+            _scr_save_soon()
     except Exception as e:
         dlog.error(f"[scr_log] {e}", exc_info=True)
 
@@ -544,7 +595,7 @@ async def scramble_cmd(message: Message):
         global_cards = db.get("global_cards", {})
 
         # Take a ready card from the pool (instant). Cold pool: build one on demand.
-        cid, base = _scramble_take(db)
+        cid, base = await _scramble_take_wait(db)
         if cid is None:
             cands = _scramble_candidates(db)
             if not cands:
@@ -582,10 +633,7 @@ async def scramble_cmd(message: Message):
             parse_mode=ParseMode.HTML
         )
         game["message_id"] = sent.message_id
-        try:
-            await loading.delete()
-        except Exception:
-            pass
+        _scr_bg(loading.delete())
         loading = None
         game["started"] = game["touched"] = time.time()   # clock starts once it's on screen
 
@@ -787,9 +835,11 @@ SCRAMBLE_WEB_FLAG_STDEV = 0.03          # swap gaps this even (seconds) = machin
 # ── Captcha (web mode): spawns at random when a run starts; failing it = banned from Scramble ──
 SCRAMBLE_CAPTCHA_CHANCE = 0.10          # chance a /start is answered with a captcha first
 SCRAMBLE_CAPTCHA_CHANCE_FLAGGED = 0.50  # same, for players who have been flagged (too fast / robotic)
-SCRAMBLE_CAPTCHA_TRIES = 2              # wrong answers allowed (a new code is shown after each) before the ban
+SCRAMBLE_CAPTCHA_TRIES = 3              # wrong answers allowed (a NEW, different challenge follows each) before the ban
 SCRAMBLE_CAPTCHA_TTL = 60               # seconds a challenge stays valid (an expired one is just replaced)
-SCRAMBLE_CAPTCHA_OPTIONS = 9            # codes shown to tap (1 right + decoys)
+SCRAMBLE_CAPTCHA_STAGES = 2             # challenges in a row (always different types) a normal player must pass
+SCRAMBLE_CAPTCHA_STAGES_FLAGGED = 3     # same, for flagged players
+SCRAMBLE_CAPTCHA_MIN_SOLVE = 1.0        # answering faster than this (seconds after the image was sent) = a bot -> counts as wrong
 SCRAMBLE_CAPTCHA_MAX_SKIPS = 3          # captchas ignored in a row (start again without answering) before the ban
 _SCR_CAPTCHA_CHARS = "ACDEFGHJKLMNPRTUVWXY346789"   # no look-alikes (0/O, 1/I, 5/S, 2/Z, 8/B)
 _scramble_captchas: dict = {}            # uid -> {id, code, expires, tries}
@@ -806,7 +856,8 @@ class ScrWebReq(BaseModel):
     b: int = -1      # /swap: board position of the second piece
     seq: int = 0     # /swap: 1, 2, 3 ... order of this swap within the run
     cid: str = ""    # /captcha: which challenge is being answered
-    answer: str = "" # /captcha: the code the player tapped
+    answer: str = "" # /captcha: typed text / picked number
+    taps: list[list[float]] = []   # /captcha: tap positions (0..1 of the image), in the order tapped
 
 
 def _scramble_web_user(init_data: str):
@@ -866,7 +917,7 @@ def _scramble_web_tiles(base: bytes, perm: list):
     for piece in perm:
         sx, sy = (piece % SCRAMBLE_COLS) * tw, (piece // SCRAMBLE_COLS) * th
         buf = io.BytesIO()
-        src.crop((sx, sy, sx + tw, sy + th)).save(buf, "JPEG", quality=90)
+        src.crop((sx, sy, sx + tw, sy + th)).save(buf, "JPEG", quality=80)
         out.append("data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode())
     return out, w / h
 
@@ -878,7 +929,7 @@ def _scramble_flag(db: dict, uid: str, name: str, reason: str, **info):
         rec["flags"] = rec.get("flags", 0) + 1
         log_action(db, uid, {"type": "scramble_flag", "reason": reason, "name": name, **info})
         _scr_log(db, reason, uid, name, mode="web", **info)
-        save_db()
+        _scr_save_soon()
     except Exception as e:
         dlog.error(f"[scramble_flag] {e}", exc_info=True)
 
@@ -919,11 +970,8 @@ async def _scramble_ban(db: dict, uid: str, reason: str, by="auto"):
     except Exception as e:
         dlog.error(f"[scramble_ban_log] {e}", exc_info=True)
     _scr_log(db, "ban", uid, reason=reason, by=by)
-    save_db()
-    try:
-        await bot.send_message(int(uid), "You have been banned from Scramble.")
-    except Exception:
-        pass
+    _scr_save_soon()
+    _scr_bg(bot.send_message(int(uid), "You have been banned from Scramble."))   # don't make the 403 wait on Telegram
 
 
 async def _scramble_unban(db: dict, uid: str, by=None) -> bool:
@@ -935,53 +983,271 @@ async def _scramble_unban(db: dict, uid: str, by=None) -> bool:
     rec["flags"] = 0            # clean slate: no extra captchas for them afterwards
     rec["captcha_skips"] = 0
     _scr_log(db, "unban", uid, by=by)
-    save_db()
-    try:
-        await bot.send_message(int(uid), "You have been unbanned from Scramble. Welcome back!")
-    except Exception:
-        pass
+    _scr_save_soon()
+    _scr_bg(bot.send_message(int(uid), "You have been unbanned from Scramble. Welcome back!"))
     return True
 
 
-def _scramble_captcha_image(code: str) -> bytes:
-    """Distorted code on a noisy background: each character rotated and jittered, lines over the top."""
-    W, H = 240, 90
-    img = Image.new("RGB", (W, H), (random.randint(215, 245), random.randint(215, 245), random.randint(215, 245)))
+# ── Captcha challenges: five different types, picked at random, chained ──
+#   text   distorted code, typed             math   distorted sum, typed
+#   count  "how many red stars?" (pick)      point  "tap the blue diamond" (position)
+#   order  "tap smallest to largest" digits scattered around (positions, in order)
+# Instructions live INSIDE the picture, answers never leave the server, every challenge is
+# one-use, and an answer sent faster than a human could read it counts as wrong.
+_SCR_CAP_W, _SCR_CAP_H, _SCR_CAP_BAR = 320, 250, 38
+_SCR_CAP_COLORS = {"red": (214, 48, 49), "blue": (30, 110, 230), "green": (30, 160, 80),
+                   "yellow": (232, 190, 0), "purple": (140, 60, 200)}
+_SCR_CAP_SHAPES = ("circle", "square", "triangle", "star", "diamond")
+_SCR_CAP_KINDS = ("text", "math", "count", "point", "order")
+
+
+def _scr_cap_bg(W: int, H: int):
+    c1 = tuple(random.randint(205, 245) for _ in range(3))
+    c2 = tuple(random.randint(185, 240) for _ in range(3))
+    img = Image.new("RGB", (W, H), c1)
     d = ImageDraw.Draw(img)
-    for _ in range(260):
-        x, y = random.randint(0, W - 1), random.randint(0, H - 1)
-        d.point((x, y), fill=(random.randint(120, 200),) * 3)
-    font = _scramble_font(46)
-    step = W // (len(code) + 1)
-    for i, ch in enumerate(code):
-        layer = Image.new("RGBA", (70, 80), (0, 0, 0, 0))
-        ImageDraw.Draw(layer).text((35, 40), ch, font=font, anchor="mm",
-                                   fill=(random.randint(10, 90), random.randint(10, 90), random.randint(10, 90), 255))
-        layer = layer.rotate(random.uniform(-28, 28), resample=Image.BICUBIC)
-        img.paste(layer, (step * (i + 1) - 35 + random.randint(-5, 5), H // 2 - 40 + random.randint(-7, 7)), layer)
-    for _ in range(5):
-        d.line((random.randint(0, W), random.randint(0, H), random.randint(0, W), random.randint(0, H)),
-               fill=(random.randint(40, 140), random.randint(40, 140), random.randint(40, 140)), width=random.choice((1, 2)))
+    for y in range(0, H, 2):
+        t = y / H
+        d.line((0, y, W, y), fill=tuple(int(c1[i] * (1 - t) + c2[i] * t) for i in range(3)), width=2)
+    for _ in range(W * H // 110):
+        d.point((random.randint(0, W - 1), random.randint(0, H - 1)), fill=(random.randint(120, 200),) * 3)
+    return img
+
+
+def _scr_cap_lines(img, n: int, alpha: int = 150, top: int = 0):
+    """Translucent lines and arcs across the picture (below `top` is left alone)."""
+    W, H = img.size
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(ov)
+    for _ in range(n):
+        col = (random.randint(20, 170), random.randint(20, 170), random.randint(20, 170), alpha)
+        if random.random() < 0.55:
+            d.line((random.randint(0, W), random.randint(top, H), random.randint(0, W), random.randint(top, H)),
+                   fill=col, width=random.choice((1, 2)))
+        else:
+            x, y = random.randint(-20, W - 40), random.randint(top - 20, H - 40)
+            d.arc((x, y, x + random.randint(60, 200), y + random.randint(40, 140)),
+                  random.randint(0, 180), random.randint(181, 360), fill=col, width=2)
+    return Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+
+
+def _scr_cap_jpeg(img) -> bytes:
     out = io.BytesIO()
     img.save(out, "JPEG", quality=85)
     return out.getvalue()
 
 
-def _scramble_captcha_issue(uid: str, tries_used: int = 0) -> dict:
-    """New challenge for this player (replaces any earlier one). The answer never leaves the server."""
-    code = "".join(random.choice(_SCR_CAPTCHA_CHARS) for _ in range(4))
-    opts = {code}
-    while len(opts) < SCRAMBLE_CAPTCHA_OPTIONS:      # decoys look like the real code: 1-2 characters changed
-        d = list(code)
-        for i in random.sample(range(len(code)), random.choice((1, 2))):
-            d[i] = random.choice([c for c in _SCR_CAPTCHA_CHARS if c != code[i]])
-        opts.add("".join(d))
-    options = list(opts)
-    random.shuffle(options)
-    cid = secrets.token_hex(6)
-    _scramble_captchas[uid] = {"id": cid, "code": code, "expires": time.time() + SCRAMBLE_CAPTCHA_TTL, "tries": tries_used}
-    return {"id": cid, "options": options, "tries_left": SCRAMBLE_CAPTCHA_TRIES - tries_used,
-            "image": "data:image/jpeg;base64," + base64.b64encode(_scramble_captcha_image(code)).decode()}
+def _scr_cap_wave(img, amp: float):
+    W, H = img.size
+    out = img.copy()
+    ph, per = random.uniform(0, 6.28), random.uniform(38, 70)
+    for x in range(W):
+        out.paste(img.crop((x, 0, x + 1, H)), (x, int(amp * math.sin(2 * math.pi * x / per + ph))))
+    return out
+
+
+def _scr_cap_text_image(text: str, size=(40, 50), rot: float = 30, amp=(3, 5), strikes: int = 2):
+    """Characters rotated, resized and jittered, struck through in the text's own colours, then wave-warped.
+    Characters stay dark so a person can read them; it is the combination of tricks that defeats OCR."""
+    W, H = 280, 96
+    img = _scr_cap_bg(W, H)
+    step = (W - 40) / len(text)
+    x = 20 + step / 2
+    for ch in text:
+        layer = Image.new("RGBA", (84, 92), (0, 0, 0, 0))
+        col = (random.randint(0, 80), random.randint(0, 80), random.randint(0, 80), 255)
+        ImageDraw.Draw(layer).text((42, 46), ch, font=_scramble_font(random.randint(*size)), anchor="mm", fill=col)
+        layer = layer.rotate(random.uniform(-rot, rot), resample=Image.BICUBIC)
+        img.paste(layer, (int(x - 42) + random.randint(-3, 3), H // 2 - 46 + random.randint(-6, 6)), layer)
+        x += step
+    d = ImageDraw.Draw(img)
+    for _ in range(strikes):   # strike-through lines in dark, text-like colours
+        d.line((random.randint(0, 40), random.randint(20, H - 20), random.randint(W - 40, W), random.randint(20, H - 20)),
+               fill=(random.randint(30, 110),) * 3, width=2)
+    img = _scr_cap_wave(img, random.uniform(*amp))
+    return _scr_cap_lines(img, 5, alpha=170)
+
+
+def _scr_cap_build_text() -> dict:
+    code = "".join(random.choice(_SCR_CAPTCHA_CHARS) for _ in range(5))
+    return {"image": _scr_cap_jpeg(_scr_cap_text_image(code)), "mode": "type", "input": "text",
+            "hint": "Type the code", "answer": code}
+
+
+def _scr_cap_build_math() -> dict:
+    op = random.choice(("+", "-", "x"))
+    if op == "+":
+        a, b = random.randint(3, 19), random.randint(2, 9); ans = a + b
+    elif op == "-":
+        a, b = random.randint(11, 24), random.randint(2, 9); ans = a - b
+    else:
+        a, b = random.randint(2, 9), random.randint(2, 9); ans = a * b
+    return {"image": _scr_cap_jpeg(_scr_cap_text_image(f"{a}{op}{b}=?", size=(36, 44), rot=16, amp=(2, 3.5), strikes=1)), "mode": "type",
+            "input": "numeric", "hint": "Solve it and type the answer", "answer": str(ans)}
+
+
+def _scr_cap_shape(d, kind: str, cx: float, cy: float, r: float, color, angle: float):
+    edge = tuple(max(0, c - 70) for c in color)
+    if kind == "circle":
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=color, outline=edge, width=2)
+        return
+    if kind == "square":
+        spec = [(r * 0.95, 45 + 90 * i) for i in range(4)]
+    elif kind == "triangle":
+        spec = [(r * 1.1, -90 + 120 * i) for i in range(3)]
+    elif kind == "diamond":
+        spec = [(r * (1.05 if i % 2 == 0 else 0.65), 90 * i) for i in range(4)]
+    else:   # star
+        spec = [(r * (1.1 if i % 2 == 0 else 0.48), -90 + 36 * i) for i in range(10)]
+    a0 = math.radians(angle)
+    d.polygon([(cx + rad * math.cos(math.radians(deg) + a0), cy + rad * math.sin(math.radians(deg) + a0))
+               for rad, deg in spec], fill=color, outline=edge)
+
+
+def _scr_cap_place(n: int, r: float, min_d: float) -> list:
+    """n random spots in the play area (below the instruction bar), kept apart from each other."""
+    W, H, BAR = _SCR_CAP_W, _SCR_CAP_H, _SCR_CAP_BAR
+    pts = []
+    for dist in (min_d, min_d * .85, min_d * .7, min_d * .55):
+        pts = []
+        for _ in range(700):
+            p = (random.uniform(r + 4, W - r - 4), random.uniform(BAR + r + 4, H - r - 4))
+            if all(math.hypot(p[0] - q[0], p[1] - q[1]) >= dist for q in pts):
+                pts.append(p)
+                if len(pts) == n:
+                    return pts
+    return pts
+
+
+def _scr_cap_header(img, text: str):
+    """Dark bar on top carrying the instruction, drawn character by character with a little jitter."""
+    W = img.width
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, _SCR_CAP_BAR), fill=(28, 30, 42))
+    for fs in (17, 16, 15, 14, 13):
+        font = _scramble_font(fs)
+        widths = [d.textlength(ch, font=font) for ch in text]
+        if sum(widths) <= W - 16:
+            break
+    x = (W - sum(widths)) / 2
+    for ch, w in zip(text, widths):
+        d.text((x, _SCR_CAP_BAR / 2 + random.randint(-1, 1)), ch, font=font, anchor="lm", fill=(240, 235, 220))
+        x += w
+    return img
+
+
+def _scr_cap_scene(placed: list, prompt: str):
+    W, H = _SCR_CAP_W, _SCR_CAP_H
+    img = _scr_cap_lines(_scr_cap_bg(W, H), 5, alpha=120, top=_SCR_CAP_BAR)
+    d = ImageDraw.Draw(img)
+    for it in random.sample(placed, len(placed)):   # random drawing order
+        col = tuple(max(0, min(255, c + random.randint(-14, 14))) for c in _SCR_CAP_COLORS[it["c"]])
+        _scr_cap_shape(d, it["s"], it["x"], it["y"], it["r"], col, it["a"])
+    img = _scr_cap_lines(img, 6, alpha=110, top=_SCR_CAP_BAR)   # thin lines over the shapes
+    return _scr_cap_header(img, prompt)
+
+
+def _scr_cap_items(items: list, r_range=(19, 25), min_d: float = 62) -> list:
+    pos = _scr_cap_place(len(items), 26, min_d)
+    return [{"c": c, "s": s, "x": x, "y": y, "r": random.randint(*r_range), "a": random.uniform(0, 360)}
+            for (c, s), (x, y) in zip(items, pos)]
+
+
+def _scr_cap_build_point() -> dict:
+    cols = list(_SCR_CAP_COLORS)
+    tc, ts = random.choice(cols), random.choice(_SCR_CAP_SHAPES)
+    items = [(tc, ts),   # the target comes first; one same-colour and one same-shape decoy are always present
+             (tc, random.choice([x for x in _SCR_CAP_SHAPES if x != ts])),
+             (random.choice([c for c in cols if c != tc]), ts)]
+    while len(items) < 9:
+        c, sh = random.choice(cols), random.choice(_SCR_CAP_SHAPES)
+        if (c, sh) != (tc, ts):
+            items.append((c, sh))
+    placed = _scr_cap_items(items)
+    t = placed[0]
+    img = _scr_cap_scene(placed, f"TAP THE {tc} {ts}".upper())
+    return {"image": _scr_cap_jpeg(img), "mode": "tap", "need": 1, "hint": "Follow the instruction on the image",
+            "answer": {"x": t["x"], "y": t["y"], "r": t["r"] + 9}}
+
+
+def _scr_cap_build_count() -> dict:
+    cols = list(_SCR_CAP_COLORS)
+    tc, ts = random.choice(cols), random.choice(_SCR_CAP_SHAPES)
+    n = random.randint(2, 5)
+    items = [(tc, ts)] * n
+    items += [(tc, random.choice([x for x in _SCR_CAP_SHAPES if x != ts])) for _ in range(random.randint(2, 3))]
+    items += [(random.choice([c for c in cols if c != tc]), ts) for _ in range(random.randint(2, 3))]
+    placed = _scr_cap_items(items, r_range=(18, 23), min_d=58)
+    img = _scr_cap_scene(placed, f"HOW MANY {tc} {ts}S?".upper())
+    return {"image": _scr_cap_jpeg(img), "mode": "buttons", "options": [str(i) for i in range(1, 10)],
+            "hint": "Pick the right number", "answer": str(n)}
+
+
+def _scr_cap_build_order() -> dict:
+    W, H = _SCR_CAP_W, _SCR_CAP_H
+    digits = random.sample([1, 2, 3, 4, 5, 7, 8], 5)
+    asc = random.random() < 0.5
+    pos = _scr_cap_place(5, 30, 70)
+    img = _scr_cap_lines(_scr_cap_bg(W, H), 4, alpha=120, top=_SCR_CAP_BAR)
+    d = ImageDraw.Draw(img)
+    for dg, (x, y) in zip(digits, pos):
+        r = 25
+        d.ellipse((x - r, y - r, x + r, y + r), fill=tuple(random.randint(150, 235) for _ in range(3)),
+                  outline=(random.randint(20, 90),) * 3, width=2)
+        layer = Image.new("RGBA", (70, 70), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).text((35, 35), str(dg), font=_scramble_font(random.randint(28, 34)), anchor="mm",
+                                   fill=(random.randint(0, 70), random.randint(0, 70), random.randint(0, 70), 255))
+        layer = layer.rotate(random.uniform(-35, 35), resample=Image.BICUBIC)
+        img.paste(layer, (int(x - 35), int(y - 35)), layer)
+    img = _scr_cap_lines(img, 7, alpha=120, top=_SCR_CAP_BAR)
+    img = _scr_cap_header(img, "TAP SMALLEST TO LARGEST" if asc else "TAP LARGEST TO SMALLEST")
+    order = sorted(zip(digits, pos), key=lambda t: t[0], reverse=not asc)
+    return {"image": _scr_cap_jpeg(img), "mode": "tap", "need": 5, "hint": "Follow the instruction on the image",
+            "answer": {"pts": [p for _d, p in order], "r": 30}}
+
+
+_SCR_CAP_BUILDERS = {"text": _scr_cap_build_text, "math": _scr_cap_build_math, "count": _scr_cap_build_count,
+                     "point": _scr_cap_build_point, "order": _scr_cap_build_order}
+
+
+def _scr_cap_check(ch: dict, answer: str, taps: list) -> bool:
+    """Is the answer to this challenge right? (Never raises.)"""
+    try:
+        kind, ans = ch["kind"], ch["answer"]
+        if kind == "text":
+            return hmac.compare_digest(str(answer).strip().upper().encode(), ans.encode())
+        if kind in ("math", "count"):
+            return hmac.compare_digest(str(answer).strip().encode(), str(ans).encode())
+        pts = [(float(t[0]) * _SCR_CAP_W, float(t[1]) * _SCR_CAP_H) for t in (taps or [])[:12] if len(t) >= 2]
+        if not all(math.isfinite(x) and math.isfinite(y) for x, y in pts):
+            return False
+        if kind == "point":
+            return len(pts) == 1 and math.hypot(pts[0][0] - ans["x"], pts[0][1] - ans["y"]) <= ans["r"]
+        if kind == "order":
+            return len(pts) == len(ans["pts"]) and all(
+                math.hypot(px - ax, py - ay) <= ans["r"] for (px, py), (ax, ay) in zip(pts, ans["pts"]))
+    except Exception:
+        pass
+    return False
+
+
+async def _scramble_captcha_issue(uid: str, tries_used: int = 0, stage: int = 1,
+                                  stages: int = SCRAMBLE_CAPTCHA_STAGES, last_kind: str | None = None) -> dict:
+    """New challenge for this player (replaces any earlier one). Never the same type twice in a row.
+    The answer never leaves the server."""
+    kind = random.choice([k for k in _SCR_CAP_KINDS if k != last_kind])
+    spec = await asyncio.to_thread(_SCR_CAP_BUILDERS[kind])   # PIL work must not block the bot
+    cid, now = secrets.token_hex(6), time.time()
+    _scramble_captchas[uid] = {"id": cid, "kind": kind, "answer": spec["answer"], "issued": now,
+                               "expires": now + SCRAMBLE_CAPTCHA_TTL, "tries": tries_used,
+                               "stage": stage, "stages": stages}
+    out = {"id": cid, "mode": spec["mode"], "hint": spec["hint"], "tries_left": SCRAMBLE_CAPTCHA_TRIES - tries_used,
+           "stage": stage, "stages": stages,
+           "image": "data:image/jpeg;base64," + base64.b64encode(spec["image"]).decode()}
+    for k in ("need", "options", "input"):
+        if k in spec:
+            out[k] = spec[k]
+    return out
 
 
 def _scramble_captcha_due(db: dict, uid: str) -> bool:
@@ -996,7 +1262,7 @@ async def _scramble_web_launch(uid: str, db: dict) -> dict:
     for k, v in list(_scramble_web_runs.items()):   # expire old runs + one run per player
         if now - v["started"] > SCRAMBLE_TTL or v["uid"] == uid:
             _scramble_web_runs.pop(k, None)
-    cid, base = _scramble_take(db)
+    cid, base = await _scramble_take_wait(db)
     if cid is None:                                  # cold pool: build one on demand
         cands = _scramble_candidates(db)
         if not cands:
@@ -1019,6 +1285,15 @@ async def _scramble_web_launch(uid: str, db: dict) -> dict:
         "perm0": list(perm), "perm": list(perm), "moves": 0, "stamps": [],
         "last": None, "last_resp": None, "done": False}
     return {"ok": True, "run": run, "tiles": tiles, "ar": ar}
+
+
+@deck_api.post("/scramble/warm")
+async def scramble_web_warm(req: ScrWebReq):
+    """Called by scramble.html while its intro plays: fills the card pool so the first board is instant."""
+    u = _scramble_web_auth(req)
+    db = ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username"))
+    _scramble_kick_refill(db, low=SCRAMBLE_POOL_SIZE - 1)
+    return {"ok": True, "ready": len(_scramble_pool)}
 
 
 @deck_api.post("/scramble/start")
@@ -1045,7 +1320,8 @@ async def scramble_web_start(req: ScrWebReq):
                 raise HTTPException(status_code=403, detail="You are banned from Scramble.")
         if _scramble_captcha_due(db, uid):
             _scr_log(db, "captcha_issued", uid, flagged=bool(rec.get("flags", 0) > 0))
-            return {"ok": True, "captcha": _scramble_captcha_issue(uid)}
+            stages = SCRAMBLE_CAPTCHA_STAGES_FLAGGED if rec.get("flags", 0) > 0 else SCRAMBLE_CAPTCHA_STAGES
+            return {"ok": True, "captcha": await _scramble_captcha_issue(uid, stages=stages)}
         return await _scramble_web_launch(uid, db)
     except HTTPException:
         raise
@@ -1057,7 +1333,8 @@ async def scramble_web_start(req: ScrWebReq):
 
 @deck_api.post("/scramble/captcha")
 async def scramble_web_captcha(req: ScrWebReq):
-    """Answer to the captcha. Right -> the puzzle starts. Wrong -> a fresh code, and the ban when tries run out."""
+    """Answer to a captcha challenge. Right -> the next challenge, or the puzzle after the last one.
+    Wrong -> a different challenge, and the ban when the tries run out. Each challenge can be answered once."""
     u = _scramble_web_auth(req)
     try:
         uid = str(u["id"])
@@ -1065,21 +1342,30 @@ async def scramble_web_captcha(req: ScrWebReq):
         ch = _scramble_captchas.get(uid)
         if not ch or ch["id"] != req.cid:
             raise HTTPException(status_code=400, detail="No captcha pending.")
-        if time.time() > ch["expires"]:
+        now = time.time()
+        if now > ch["expires"]:
             _scramble_captchas.pop(uid, None)            # expired is not a failure - they just get a new run
             _scr_log(db, "captcha_expired", uid)
             return {"ok": False, "error": "Captcha expired. Tap Try again."}
-        ch["tries"] += 1
-        if hmac.compare_digest(str(req.answer).strip().upper().encode(), ch["code"].encode()):
-            _scramble_captchas.pop(uid, None)
+        _scramble_captchas.pop(uid, None)                # one attempt per challenge: no probing the same one
+        too_fast = now - ch["issued"] < SCRAMBLE_CAPTCHA_MIN_SOLVE
+        if too_fast:
+            _scr_log(db, "captcha_too_fast", uid, kind=ch["kind"], secs=round(now - ch["issued"], 2))
+        if not too_fast and _scr_cap_check(ch, req.answer, req.taps):
+            if ch["stage"] < ch["stages"]:               # passed, but another (different) challenge follows
+                _scr_log(db, "captcha_stage_ok", uid, kind=ch["kind"], stage=ch["stage"], of=ch["stages"])
+                return {"ok": True, "next": True,
+                        "captcha": await _scramble_captcha_issue(uid, ch["tries"], ch["stage"] + 1, ch["stages"], ch["kind"])}
             db["users"][uid].setdefault("scramble", {})["captcha_skips"] = 0
-            _scr_log(db, "captcha_passed", uid, tries=ch["tries"])
+            _scr_log(db, "captcha_passed", uid, wrong=ch["tries"], stages=ch["stages"])
             return await _scramble_web_launch(uid, db)
-        _scr_log(db, "captcha_wrong", uid, tries=ch["tries"], of=SCRAMBLE_CAPTCHA_TRIES)
-        if ch["tries"] >= SCRAMBLE_CAPTCHA_TRIES:
+        tries = ch["tries"] + 1
+        _scr_log(db, "captcha_wrong", uid, tries=tries, of=SCRAMBLE_CAPTCHA_TRIES, kind=ch["kind"], stage=ch["stage"])
+        if tries >= SCRAMBLE_CAPTCHA_TRIES:
             await _scramble_ban(db, uid, "failed captcha")
             raise HTTPException(status_code=403, detail="Captcha failed. You are banned from Scramble.")
-        return {"ok": True, "wrong": True, "captcha": _scramble_captcha_issue(uid, ch["tries"])}
+        return {"ok": True, "wrong": True,
+                "captcha": await _scramble_captcha_issue(uid, tries, ch["stage"], ch["stages"], ch["kind"])}
     except HTTPException:
         raise
     except Exception as e:
@@ -1520,40 +1806,30 @@ async def scramble_unban_cmd(message: Message):
 
 
 # ==========================================
-# /scrlog — ADMIN ONLY, DM ONLY
+# /scrlog — ADMIN ONLY, DM ONLY  ->  sends scrlog.txt (just the file, no message)
 # ==========================================
 #   /scrlog                 everything, newest first
 #   /scrlog v               violations only (too fast, captcha fails, bans, spam ...)
 #   /scrlog <user_id>       one player      /scrlog <user_id> v   one player's violations
-def _scr_log_view(db: dict, page: int, viol_only: bool, uid: str):
+def _scr_log_text(db: dict, viol_only: bool, uid: str) -> str:
+    def clean(x) -> str:
+        return str(x).replace("\n", " ").replace("\r", " ")
+
     rows = [e for e in reversed(db.get("scramble_log") or [])
             if (not viol_only or e.get("v")) and (not uid or e.get("u") == uid)]
-    total = len(rows)
-    pages = max(1, -(-total // SCRAMBLE_LOG_PAGE))
-    page = max(0, min(page, pages - 1))
-    chunk = rows[page * SCRAMBLE_LOG_PAGE:(page + 1) * SCRAMBLE_LOG_PAGE]
-
-    scope = ("violations" if viol_only else "all events") + (f" · player {uid}" if uid else "")
-    text = f"<b>「 SCRAMBLE LOG 」</b>\n━━━━━━━━━━━━━━━━━\n<i>{_html_esc(scope)}</i> · {total:,} entries · page {page + 1}/{pages}\n\n"
-    if not chunk:
-        text += "Nothing logged yet."
-    for e in chunk:
-        when = datetime.fromtimestamp(e.get("t") or 0, timezone.utc).strftime("%m-%d %H:%M:%S")
-        mark = "⚠" if e.get("v") else "▸"
-        who = f"{_html_esc(str(e.get('n') or '-')[:18])} (<code>{_html_esc(str(e.get('u') or '-'))}</code>)"
-        info = ", ".join(f"{k}={v}" for k, v in (e.get("i") or {}).items())
-        text += (f"<code>{when}</code> {mark} <b>{_html_esc(str(e.get('e')))}</b>\n"
-                 f"    {who}" + (f" · {_html_esc(info[:110])}" if info else "") + "\n")
-    text += "\n━━━━━━━━━━━━━━━━━\n<i>/scrlog v · /scrlog &lt;user_id&gt; · /scrlog &lt;user_id&gt; v</i>"
-
-    f = f"{'v' if viol_only else 'a'}:{uid or 0}"
-    nav = []
-    if page > 0:
-        nav.append(_scr_btn("« Newer", f"slog:{page - 1}:{f}", "primary"))
-    nav.append(_scr_btn("Refresh", f"slog:{page}:{f}", "success"))
-    if page < pages - 1:
-        nav.append(_scr_btn("Older »", f"slog:{page + 1}:{f}", "primary"))
-    return text[:4000], InlineKeyboardMarkup(inline_keyboard=[nav])
+    scope = ("violations" if viol_only else "all events") + (f" | player {uid}" if uid else "")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    lines = ["SCRAMBLE LOG", f"scope: {scope}", f"entries: {len(rows):,} (newest first)",
+             f"generated: {now} UTC", "=" * 64, ""]
+    if not rows:
+        lines.append("Nothing logged yet.")
+    for e in rows:
+        when = datetime.fromtimestamp(e.get("t") or 0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        flag = "VIOLATION" if e.get("v") else "event"
+        who = f"{clean(e.get('n') or '-')} ({clean(e.get('u') or '-')})"
+        info = ", ".join(f"{k}={clean(v)}" for k, v in (e.get("i") or {}).items())
+        lines.append(f"{when} UTC | {flag:<9} | {clean(e.get('e'))} | {who}" + (f" | {info}" if info else ""))
+    return "\n".join(lines) + "\n"
 
 
 @main_router.message(Command("scrlog"))
@@ -1571,8 +1847,8 @@ async def scramble_log_cmd(message: Message):
                 viol = True
             elif tok.lstrip("-").isdigit():
                 uid = tok
-        text, kb = _scr_log_view(db, 0, viol, uid)
-        await message.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        data = (await asyncio.to_thread(_scr_log_text, db, viol, uid)).encode("utf-8")
+        await message.reply_document(BufferedInputFile(data, filename="scrlog.txt"))
     except Exception as e:
         print(f"[scrlog_CRASH] {e}")
         dlog.error(f"[scrlog_CRASH] {e}", exc_info=True)
@@ -1581,15 +1857,8 @@ async def scramble_log_cmd(message: Message):
 
 @main_router.callback_query(F.data.startswith("slog:"))
 async def scramble_log_cb(cq: CallbackQuery):
-    if cq.from_user.id not in ADMIN_IDS:
+    """Buttons on old paged /scrlog messages: the log is a .txt file now."""
+    if cq.from_user.id in ADMIN_IDS:
+        await cq.answer("Send /scrlog again - the log now comes as a .txt file.", show_alert=True)
+    else:
         await cq.answer()
-        return
-    try:
-        _, page, flt, uid = cq.data.split(":")
-        db = ensure_user(str(cq.from_user.id), cq.from_user.first_name, cq.from_user.username)
-        text, kb = _scr_log_view(db, int(page), flt == "v", "" if uid == "0" else uid)
-        await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        if "not modified" not in str(e).lower():
-            dlog.error(f"[scrlog_cb] {e}", exc_info=True)
-    await cq.answer()
