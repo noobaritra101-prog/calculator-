@@ -90,7 +90,8 @@ import store
 import market
 import mines
 import gcard
-import scramble  # /scramble puzzle minigame
+import scramble # /scramble puzzle minigame
+import tree
 
 from handlers import trigger_drop
 from market import market_engine_loop
