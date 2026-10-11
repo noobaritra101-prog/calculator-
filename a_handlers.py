@@ -1,4 +1,6 @@
 import io
+import ast
+import copy
 import os
 import sys
 import time
@@ -352,23 +354,235 @@ async def auto_register_group_mw(handler, message: Message, data: dict):
 # ==========================================
 # POWERFUL EVALUATION COMMAND (/eval)
 # ==========================================
+# ── /eval SAFETY GUARD ──────────────────────────────────────────────────────
+# Static (AST) scan run BEFORE any /eval code executes. It refuses code that
+# runs shell commands, touches files destructively, kills/restarts the
+# process, reads secrets, escapes via dunder tricks, or wipes core DB
+# sections. It is a guardrail against destructive mistakes, not a hardened
+# sandbox: /eval stays owner-only, which remains the real protection.
+EVAL_TIMEOUT_SECONDS = 30
+
+_EVAL_BLOCKED_MODULES = {
+    "subprocess", "shutil", "socket", "ctypes", "signal", "pty",
+    "multiprocessing", "importlib", "pickle", "marshal", "builtins", "pathlib",
+}
+_EVAL_BLOCKED_ATTRS = {
+    "os": {
+        "system", "popen", "remove", "unlink", "rmdir", "removedirs", "rename",
+        "renames", "replace", "kill", "killpg", "_exit", "abort", "fork",
+        "forkpty", "truncate", "chmod", "chown", "startfile", "putenv",
+        "unsetenv", "environ", "getenv",
+    },
+    "sys": {"exit", "_exit", "modules", "settrace", "setrecursionlimit"},
+    "asyncio": {"create_subprocess_exec", "create_subprocess_shell"},
+    "bot": {"log_out", "close", "delete_webhook"},
+}
+_EVAL_BLOCKED_OS_PREFIXES = ("exec", "spawn")
+_EVAL_BLOCKED_CALLS = {
+    "eval", "exec", "compile", "__import__", "getattr", "setattr", "delattr",
+    "globals", "locals", "vars", "breakpoint", "input", "exit", "quit",
+}
+_EVAL_BLOCKED_DUNDERS = {
+    "__import__", "__builtins__", "__subclasses__", "__globals__", "__class__",
+    "__bases__", "__mro__", "__code__", "__getattribute__", "__loader__",
+}
+_EVAL_DB_SECTIONS = {
+    "users", "global_cards", "groups", "settings", "offline_store",
+    "market", "promos", "queries",
+}
+
+def _eval_root_name(node):
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+def _eval_db_depth(node):
+    """0 if node is `db`, 1 if `db["<const>"]`, else None."""
+    if isinstance(node, ast.Name) and node.id == "db":
+        return 0
+    if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+            and node.value.id == "db"):
+        key = node.slice
+        if isinstance(key, ast.Constant) and key.value in _EVAL_DB_SECTIONS:
+            return 1
+    return None
+
+def _eval_is_empty_value(node):
+    if isinstance(node, ast.Constant):
+        return node.value in (None, "", 0)
+    if isinstance(node, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
+        return not (getattr(node, "keys", None) or getattr(node, "elts", None))
+    return False
+
+def _eval_safety_check(code: str) -> list:
+    """Returns a list of 'line N: reason' strings. Empty list = allowed."""
+    wrapped = "async def _eval_expr():\n" + "".join(f"    {l}\n" for l in code.split("\n"))
+    try:
+        tree = ast.parse(wrapped)
+    except SyntaxError:
+        return []   # let exec() report the syntax error normally
+
+    found = {}
+    def flag(node, reason):
+        line = max(getattr(node, "lineno", 1) - 1, 1)
+        found[(line, reason)] = True
+
+    alias = {}   # local alias -> real module name
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                base = a.name.split(".")[0]
+                alias[a.asname or base] = base
+                if base in _EVAL_BLOCKED_MODULES:
+                    flag(node, f"import of '{base}' is not allowed")
+        elif isinstance(node, ast.ImportFrom):
+            base = (node.module or "").split(".")[0]
+            if base in _EVAL_BLOCKED_MODULES:
+                flag(node, f"import from '{base}' is not allowed")
+            for a in node.names:
+                if a.name in _EVAL_BLOCKED_ATTRS.get(base, ()) or (
+                        base == "os" and a.name.startswith(_EVAL_BLOCKED_OS_PREFIXES)):
+                    flag(node, f"'{base}.{a.name}' is not allowed")
+
+    for node in ast.walk(tree):
+        # Dangerous module attributes (os.system, sys.exit, bot.log_out, ...)
+        if isinstance(node, ast.Attribute):
+            root = node.value.id if isinstance(node.value, ast.Name) else None
+            real = alias.get(root, root)
+            if real in _EVAL_BLOCKED_MODULES:
+                flag(node, f"use of '{real}' is not allowed")
+            elif real in _EVAL_BLOCKED_ATTRS and node.attr in _EVAL_BLOCKED_ATTRS[real]:
+                flag(node, f"'{real}.{node.attr}' is not allowed (process/system/secret access)")
+            elif real == "os" and node.attr.startswith(_EVAL_BLOCKED_OS_PREFIXES):
+                flag(node, f"'os.{node.attr}' is not allowed (process replacement)")
+            if node.attr in ("BOT_TOKEN", "token") or node.attr in _EVAL_BLOCKED_DUNDERS:
+                flag(node, f"access to '.{node.attr}' is not allowed")
+        if isinstance(node, ast.Name):
+            if node.id == "BOT_TOKEN" or node.id in _EVAL_BLOCKED_DUNDERS:
+                flag(node, f"access to '{node.id}' is not allowed")
+
+        # Dangerous builtin calls / file writes / DB-wiping calls
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name):
+                if fn.id in _EVAL_BLOCKED_CALLS:
+                    flag(node, f"call to '{fn.id}()' is not allowed")
+                elif fn.id == "open":
+                    mode = None
+                    if len(node.args) > 1:
+                        mode = node.args[1]
+                    for kw in node.keywords:
+                        if kw.arg == "mode":
+                            mode = kw.value
+                    if mode is not None:
+                        if not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)):
+                            flag(node, "open() with a non-literal mode is not allowed")
+                        elif any(c in mode.value for c in "wax+"):
+                            flag(node, "writing to files with open() is not allowed")
+                elif fn.id == "save_db" and (node.args or node.keywords):
+                    flag(node, "save_db(<data>) would replace the whole database")
+            elif isinstance(fn, ast.Attribute):
+                depth = _eval_db_depth(fn.value)
+                if fn.attr == "clear" and depth in (0, 1):
+                    flag(node, "clearing the database or a whole DB section is not allowed")
+                if fn.attr in ("pop", "popitem") and depth == 0:
+                    flag(node, "removing a whole DB section is not allowed")
+
+        # Reassigning/wiping the DB or a whole core section
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id in ("db", "save_db", "load_db"):
+                    flag(node, f"reassigning '{t.id}' is not allowed")
+                if (_eval_db_depth(t) == 1 and node.value is not None
+                        and _eval_is_empty_value(node.value)):
+                    flag(node, "emptying a whole DB section is not allowed")
+        if isinstance(node, ast.Delete):
+            for t in node.targets:
+                if _eval_db_depth(t) in (0, 1) or (isinstance(t, ast.Name) and t.id == "db"):
+                    flag(node, "deleting a whole DB section is not allowed")
+
+        # Loops that can never end
+        if isinstance(node, ast.While):
+            t = node.test
+            if isinstance(t, ast.Constant) and t.value:
+                if not any(isinstance(n, (ast.Break, ast.Return, ast.Raise))
+                           for n in ast.walk(node)):
+                    flag(node, "infinite loop (while True without break/return)")
+
+    return [f"line {ln}: {why}" for (ln, why) in sorted(found)]
+
+def _eval_describe_changes(before: dict, after: dict) -> str:
+    """Human-readable summary of what an /eval run changed in the DB."""
+    try:
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return "No"
+
+        b_users = before.get("users", {}) or {}
+        a_users = after.get("users", {}) or {}
+        changed_uids = [
+            uid for uid in set(b_users) | set(a_users)
+            if b_users.get(uid) != a_users.get(uid)
+        ]
+        other_sections = sorted(
+            k for k in set(before) | set(after)
+            if k != "users" and before.get(k) != after.get(k)
+        )
+
+        if not changed_uids and not other_sections:
+            return "No"
+
+        parts = []
+        if changed_uids:
+            total = len(a_users)
+            if len(changed_uids) == 1:
+                parts.append(f"Yes, for uid {changed_uids[0]}")
+            elif total and len(changed_uids) >= total:
+                parts.append(f"Yes, for all users ({len(changed_uids)})")
+            else:
+                shown = ", ".join(str(u) for u in sorted(changed_uids, key=str)[:5])
+                more = f" +{len(changed_uids) - 5} more" if len(changed_uids) > 5 else ""
+                parts.append(f"Yes, for multiple users ({len(changed_uids)}: {shown}{more})")
+        if other_sections:
+            joined = ", ".join(other_sections)
+            parts.append(("Also changed sections: " if changed_uids else "Yes, sections changed: ") + joined)
+        return _html_esc(" | ".join(parts))
+    except Exception as e:
+        return _html_esc(f"Unknown (diff failed: {e})")
+
 @main_router.message(Command("eval"))
 async def eval_cmd(message: Message, command: CommandObject):
     if message.from_user.id != SUPREME_OWNER_ID: return
     if not command.args:
-        await message.reply("⚠️ Provide code to evaluate.", parse_mode=ParseMode.HTML)
+        await message.reply("Provide code to evaluate.", parse_mode=ParseMode.HTML)
         return
 
     code = command.args
+
+    violations = _eval_safety_check(code)
+    if violations:
+        shown = violations[:8]
+        extra = f"\n... and {len(violations) - 8} more" if len(violations) > 8 else ""
+        await message.reply(
+            "<b>Blocked: harmful code detected</b>\n"
+            "The code was NOT executed.\n"
+            f"<pre>{_html_esc(chr(10).join(shown) + extra)}</pre>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     old_stdout = sys.stdout
     redirected_output = sys.stdout = io.StringIO()
+
+    eval_db = load_db()
+    db_before = copy.deepcopy(eval_db)
 
     variables = {
         'bot': bot,
         'message': message,
         'command': command,
         'config': config,
-        'db': load_db(),
+        'db': eval_db,
         'save_db': save_db,
         'asyncio': asyncio,
         'sys': sys,
@@ -378,24 +592,45 @@ async def eval_cmd(message: Message, command: CommandObject):
 
     formatted_code = f"async def _eval_expr():\n" + "".join(f"    {line}\n" for line in code.split("\n"))
 
+    started = time.perf_counter()
     try:
         exec(formatted_code, variables)
         _eval_expr = variables['_eval_expr']
-        result = await _eval_expr()
+        result = await asyncio.wait_for(_eval_expr(), timeout=EVAL_TIMEOUT_SECONDS)
         stdout_val = redirected_output.getvalue()
+    except asyncio.TimeoutError:
+        stdout_val = redirected_output.getvalue()
+        result = f"Execution timed out after {EVAL_TIMEOUT_SECONDS}s and was cancelled."
     except Exception:
         stdout_val = redirected_output.getvalue()
         result = traceback.format_exc()
     finally:
+        elapsed = time.perf_counter() - started
         sys.stdout = old_stdout
 
     output = stdout_val.strip() or str(result)
-    if len(output) > 3000:
-        output = output[:3000] + "\n... truncated due to size limit ..."
+    if len(output) > 2000:
+        output = output[:2000] + "\n... truncated due to size limit ..."
+
+    shown_code = code if len(code) <= 1200 else code[:1200] + "\n... truncated ..."
+
+    # ── Data-change detection: compare the DB snapshot taken before the run
+    # against the live DB afterwards (per-user for the "users" section).
+    after_db = load_db()
+    data_line = _eval_describe_changes(db_before, after_db)
+
+    if elapsed < 1:
+        time_taken = f"{elapsed * 1000:.1f} ms"
+    else:
+        time_taken = f"{elapsed:.2f} s"
 
     await message.reply(
-        f"<b>📝 Evaluation Output:</b>\n"
-        f"<code>{output}</code>",
+        f"<b>Code</b>\n"
+        f"<pre><code class=\"language-python\">{_html_esc(shown_code)}</code></pre>\n"
+        f"<b>Execution Outcome</b>\n"
+        f"<pre>{_html_esc(output)}</pre>\n"
+        f"<b>Data changes:</b> {data_line}\n"
+        f"<b>Time taken:</b> {time_taken}",
         parse_mode=ParseMode.HTML
     )
 

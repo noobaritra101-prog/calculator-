@@ -94,6 +94,7 @@ ADSGRAM_RARITY_WEIGHTS = {
 # instead of the normal weighted odds. Expiry is stored as a timestamp in
 # db["settings"], so it survives restarts and switches itself off after 24h.
 FAD_DURATION_SECONDS = 24 * 60 * 60
+FAD_ADS_PER_CYCLE = 6   # ads required per daily card while /fad is ON (normally ADSGRAM_ADS_PER_CYCLE)
 
 def _fad_seconds_left(db: dict) -> int:
     """Seconds of Force-Ads-Divine remaining (0 = off). Clears an expired flag."""
@@ -107,6 +108,10 @@ def _fad_seconds_left(db: dict) -> int:
         save_db()
         return 0
     return left
+
+def _ads_required(db: dict) -> int:
+    """Ads needed for today's card: FAD_ADS_PER_CYCLE while /fad is on, else the normal amount."""
+    return FAD_ADS_PER_CYCLE if _fad_seconds_left(db) > 0 else ADSGRAM_ADS_PER_CYCLE
 
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -132,15 +137,16 @@ async def get_ad_status(user_id: str):
         db = load_db()
         actual_key, user_data = get_user_from_db(db, user_id)
     if not user_data:
-        return {"watched": 0, "required": ADSGRAM_ADS_PER_CYCLE, "claimed": False, "ready": False}
+        return {"watched": 0, "required": _ads_required(db), "claimed": False, "ready": False}
 
     progress = _get_ad_progress(user_data)
+    required = _ads_required(db)
     save_db()
     return {
         "watched": progress["watched"],
-        "required": ADSGRAM_ADS_PER_CYCLE,
+        "required": required,
         "claimed": progress["claimed"],
-        "ready": progress["watched"] >= ADSGRAM_ADS_PER_CYCLE and not progress["claimed"]
+        "ready": progress["watched"] >= required and not progress["claimed"]
     }
 
 @deck_api.get("/ads/reward")
@@ -162,16 +168,17 @@ async def adsgram_reward_callback(userid: str, key: str = ""):
         raise HTTPException(status_code=404, detail="User not found")
 
     progress = _get_ad_progress(user_data)
+    required = _ads_required(db)
 
     if progress["claimed"]:
         save_db()
         return {"ok": True, "status": "already_claimed_today", "watched": progress["watched"]}
 
-    if progress["watched"] < ADSGRAM_ADS_PER_CYCLE:
+    if progress["watched"] < required:
         progress["watched"] += 1
 
     save_db()
-    if progress["watched"] >= ADSGRAM_ADS_PER_CYCLE:
+    if progress["watched"] >= required:
         return {"ok": True, "status": "ready_to_claim", "watched": progress["watched"]}
     return {"ok": True, "status": "progress", "watched": progress["watched"]}
 
@@ -187,10 +194,11 @@ async def claim_ad_reward(user_id: str):
         raise HTTPException(status_code=404, detail="User not found")
 
     progress = _get_ad_progress(user_data)
+    required = _ads_required(db)
 
     if progress["claimed"]:
         raise HTTPException(status_code=400, detail="Already claimed today")
-    if progress["watched"] < ADSGRAM_ADS_PER_CYCLE:
+    if progress["watched"] < required:
         raise HTTPException(status_code=400, detail="Watch requirement not met yet")
 
     locked_animes = db.get("settings", {}).get("locked_animes", [])
@@ -736,6 +744,7 @@ async def fad_cmd(message: Message, command: CommandObject):
             message,
             "✅ <b>Force Ads Divine: ON</b>\n"
             "Every airdrop ad reward will now be a <b>Divine ❄️</b> card.\n"
+            f"📺 Ads required per card: <b>{FAD_ADS_PER_CYCLE}</b>\n"
             f"⏳ Auto-off in <b>{format_duration_seconds(FAD_DURATION_SECONDS)}</b>.",
             parse_mode=ParseMode.HTML,
         )
