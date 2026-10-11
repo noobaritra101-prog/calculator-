@@ -18,6 +18,7 @@ import hmac
 import base64
 import json
 import hashlib
+import statistics
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl
 from collections import deque
@@ -328,6 +329,59 @@ def _scr_stat(db: dict, event: str, uid=None, name: str = "", mode: str = "chat"
         dlog.error(f"[scr_stat] {e}", exc_info=True)
 
 
+# ── /scrlog: one event log for everything Scramble does (db["scramble_log"]) ──
+SCRAMBLE_LOG_MAX = 3000          # when this many entries pile up ...
+SCRAMBLE_LOG_TRIM_TO = 2500      # ... trim down to this, dropping the oldest NORMAL events first (violations last)
+SCRAMBLE_LOG_PAGE = 10           # entries per /scrlog page
+SCRAMBLE_VIOLATIONS = {
+    "too_fast", "robotic_timing", "hourly_limit", "bad_swap", "too_many_moves", "retired_finish",
+    "start_spam", "banned_attempt", "flood_lock",
+    "captcha_wrong", "captcha_ignored", "ban",
+}
+_scramble_log_seen: dict = {}    # (event, uid) -> last time it was logged, to keep spammy events to one line a minute
+
+
+def _scr_log(db: dict, event: str, uid=None, name: str = "", **info):
+    """Append one event to the Scramble log. Never raises - logging must not break the game."""
+    try:
+        uid = "" if uid is None else str(uid)
+        if not name and uid:
+            u = (db.get("users") or {}).get(uid)
+            name = str(u.get("name") or "") if isinstance(u, dict) else ""
+        viol = event in SCRAMBLE_VIOLATIONS
+        lst = db.setdefault("scramble_log", [])
+        lst.append({"t": int(time.time()), "e": event, "u": uid, "n": str(name)[:24], "v": viol,
+                    "i": {k: (v if isinstance(v, (int, float, bool)) else str(v)[:60])
+                          for k, v in info.items() if v is not None}})
+        if len(lst) > SCRAMBLE_LOG_MAX:
+            excess = len(lst) - SCRAMBLE_LOG_TRIM_TO
+            keep = []
+            for e in lst:                       # oldest first
+                if excess > 0 and not e.get("v"):
+                    excess -= 1
+                    continue
+                keep.append(e)
+            if excess > 0:
+                keep = keep[excess:]
+            lst[:] = keep
+        if viol:
+            save_db()
+    except Exception as e:
+        dlog.error(f"[scr_log] {e}", exc_info=True)
+
+
+def _scr_log_once(db: dict, event: str, uid, every: float = 60.0, **info):
+    """Like _scr_log, but at most one line per player per `every` seconds (for events that can repeat fast)."""
+    now = time.time()
+    key = (event, str(uid))
+    if now - _scramble_log_seen.get(key, 0) < every:
+        return
+    if len(_scramble_log_seen) > 3000:
+        _scramble_log_seen.clear()
+    _scramble_log_seen[key] = now
+    _scr_log(db, event, uid, **info)
+
+
 def _scramble_settle(user_id: str, name: str, username, elapsed: float, earned: int,
                      mode: str = "chat", card: dict | None = None, moves: int | None = None,
                      chat_id="?", chat_title: str = "Unknown") -> int:
@@ -449,6 +503,9 @@ async def _scramble_busy_kb(game: dict | None, dm_button: bool):
 async def scramble_cmd(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+    if _scramble_is_banned(ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username), uid_int):
+        await message.reply("You are banned from Scramble.")
+        return
 
     is_group = message.chat.type != ChatType.PRIVATE
     chat_id = message.chat.id
@@ -516,6 +573,7 @@ async def scramble_cmd(message: Message):
         _scramble_games[gid] = game
         _scr_stat(ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username),
                   "start", uid=uid_int)
+        _scr_log(db, "start", uid_int, mode="chat", chat=("group" if is_group else "dm"))
 
         sent = await message.reply_photo(
             photo=BufferedInputFile(img, filename="scramble.jpg"),
@@ -571,6 +629,9 @@ async def _scramble_push(cq: CallbackQuery, gid: str, game: dict):
 @main_router.callback_query(F.data.startswith("scr:"))
 async def scramble_cb(cq: CallbackQuery):
     if is_ghost_banned(cq.from_user.id) or is_shadow_banned(cq.from_user.id): return
+    if _scramble_is_banned(ensure_user(str(cq.from_user.id), cq.from_user.first_name, cq.from_user.username), cq.from_user.id):
+        await cq.answer("You are banned from Scramble.", show_alert=True)
+        return
     try:
         _, gid, action = cq.data.split(":")
     except ValueError:
@@ -599,6 +660,8 @@ async def scramble_cb(cq: CallbackQuery):
         if game["strikes"] >= SCRAMBLE_FLOOD_STRIKES:
             game["strikes"] = 0
             game["locked_until"] = now + SCRAMBLE_FLOOD_LOCK
+            _scr_log_once(ensure_user(str(cq.from_user.id), cq.from_user.first_name, cq.from_user.username),
+                          "flood_lock", cq.from_user.id, mode="chat")
             await cq.answer(f"Too fast! Buttons locked for {int(SCRAMBLE_FLOOD_LOCK)}s.", show_alert=True)
         else:
             await cq.answer()   # dropped silently, instant
@@ -622,8 +685,9 @@ async def scramble_cb(cq: CallbackQuery):
 
             # ── Give up: reveal the finished picture ──
             if action == "give":
-                _scr_stat(ensure_user(str(cq.from_user.id), cq.from_user.first_name, cq.from_user.username),
-                          "giveup", uid=cq.from_user.id)
+                _gdb = ensure_user(str(cq.from_user.id), cq.from_user.first_name, cq.from_user.username)
+                _scr_stat(_gdb, "giveup", uid=cq.from_user.id)
+                _scr_log(_gdb, "giveup", cq.from_user.id, mode="chat", moves=game["moves"], card=game["name"])
                 _scramble_games.pop(gid, None)
                 _scramble_mark_done(gid)
                 img = await asyncio.to_thread(_scramble_render, game["base"], list(range(n)), False)
@@ -674,6 +738,9 @@ async def scramble_cb(cq: CallbackQuery):
                                     mode="chat", card={"name": game["name"], "rarity": game["rarity"]},
                                     moves=game["moves"], chat_id=game["chat_id"],
                                     chat_title=getattr(cq.message.chat, "title", None) or "Private chat")
+            _scr_log(ensure_user(str(cq.from_user.id), cq.from_user.first_name, cq.from_user.username), "solve",
+                     cq.from_user.id, mode="chat", time=round(game["finished"] - game["started"], 2),
+                     moves=game["moves"], paid=paid, earned=earned, card=game["name"])
             if paid > 0:
                 reward_text = f"<b>Reward :</b> +{paid} Shards\n"
             elif earned > 0:
@@ -708,14 +775,38 @@ async def scramble_cb(cq: CallbackQuery):
 # can't send fake times. Shards use the same daily minigame cap as chat mode.
 SCRAMBLE_WEB_LINK = "https://t.me/Animenx_bot/scramble"   # Mini App direct link
 SCRAMBLE_WEB_REWARD_TIERS = [(20, 50), (40, 25)]           # web mode: dragging is fast, so tighter limits
-SCRAMBLE_WEB_MIN_SECONDS = 2                               # a 9-piece board needs 5+ swaps, so faster than this is a bot
-_scramble_web_runs: dict = {}                              # run token -> {uid, started, card}
+# ── Anti-cheat knobs (web mode) ──
+SCRAMBLE_WEB_MIN_SECONDS = 4            # no human solves a 9-piece board faster than this
+SCRAMBLE_WEB_MIN_PER_SWAP = 0.3         # total time must be >= swaps * this (macros fire swaps instantly)
+SCRAMBLE_WEB_MAX_SWAPS = 150            # a run that needs more swaps than this is thrown away
+SCRAMBLE_WEB_START_GAP = 1.0            # min seconds between two /start calls from one player
+SCRAMBLE_WEB_MAX_SOLVES_PER_HOUR = 120  # solves beyond this still show the card but count for nothing
+SCRAMBLE_WEB_FLAG_STDEV = 0.03          # swap gaps this even (seconds) = machine timing -> flagged for review
+# run token -> {uid, started, card, perm0, perm, moves, stamps, last, last_resp, done}
+# The SERVER owns the shuffle and replays every swap, so "solved" is decided here, never by the browser.
+# ── Captcha (web mode): spawns at random when a run starts; failing it = banned from Scramble ──
+SCRAMBLE_CAPTCHA_CHANCE = 0.10          # chance a /start is answered with a captcha first
+SCRAMBLE_CAPTCHA_CHANCE_FLAGGED = 0.50  # same, for players who have been flagged (too fast / robotic)
+SCRAMBLE_CAPTCHA_TRIES = 2              # wrong answers allowed (a new code is shown after each) before the ban
+SCRAMBLE_CAPTCHA_TTL = 60               # seconds a challenge stays valid (an expired one is just replaced)
+SCRAMBLE_CAPTCHA_OPTIONS = 9            # codes shown to tap (1 right + decoys)
+SCRAMBLE_CAPTCHA_MAX_SKIPS = 3          # captchas ignored in a row (start again without answering) before the ban
+_SCR_CAPTCHA_CHARS = "ACDEFGHJKLMNPRTUVWXY346789"   # no look-alikes (0/O, 1/I, 5/S, 2/Z, 8/B)
+_scramble_captchas: dict = {}            # uid -> {id, code, expires, tries}
+_scramble_web_runs: dict = {}
+_scramble_web_last_start: dict = {}      # uid -> last /start time
+_scramble_web_solves: dict = {}          # uid -> deque of recent counted-solve times
 
 
 class ScrWebReq(BaseModel):
     init_data: str = ""
     run: str = ""
     tab: str = "time"
+    a: int = -1      # /swap: board position of the first piece
+    b: int = -1      # /swap: board position of the second piece
+    seq: int = 0     # /swap: 1, 2, 3 ... order of this swap within the run
+    cid: str = ""    # /captcha: which challenge is being answered
+    answer: str = "" # /captcha: the code the player tapped
 
 
 def _scramble_web_user(init_data: str):
@@ -743,6 +834,10 @@ def _scramble_web_auth(req: ScrWebReq) -> dict:
         raise HTTPException(status_code=401, detail="Invalid Telegram session.")
     if is_ghost_banned(int(u["id"])) or is_shadow_banned(int(u["id"])):
         raise HTTPException(status_code=403, detail="Not allowed.")
+    db = ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username"))
+    if _scramble_is_banned(db, u["id"]):
+        _scr_log_once(db, "banned_attempt", u["id"], mode="web")
+        raise HTTPException(status_code=403, detail="You are banned from Scramble.")
     return u
 
 
@@ -760,67 +855,333 @@ async def scramble_web_ping():
     return {"ok": True}
 
 
+def _scramble_web_tiles(base: bytes, perm: list):
+    """Cut the card into separate tile images, listed in BOARD ORDER (position 0 first).
+    The browser never receives the full picture or the piece numbers, so there is nothing to
+    read out of the page: it can only draw tiles and report which two positions were swapped."""
+    src = Image.open(io.BytesIO(base)).convert("RGB")
+    w, h = src.size
+    tw, th = w // SCRAMBLE_COLS, h // SCRAMBLE_ROWS
+    out = []
+    for piece in perm:
+        sx, sy = (piece % SCRAMBLE_COLS) * tw, (piece // SCRAMBLE_COLS) * th
+        buf = io.BytesIO()
+        src.crop((sx, sy, sx + tw, sy + th)).save(buf, "JPEG", quality=90)
+        out.append("data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode())
+    return out, w / h
+
+
+def _scramble_flag(db: dict, uid: str, name: str, reason: str, **info):
+    """Mark a suspicious run for admin review (shows in /vlog). Never blocks the request."""
+    try:
+        rec = db["users"][uid].setdefault("scramble", {})
+        rec["flags"] = rec.get("flags", 0) + 1
+        log_action(db, uid, {"type": "scramble_flag", "reason": reason, "name": name, **info})
+        _scr_log(db, reason, uid, name, mode="web", **info)
+        save_db()
+    except Exception as e:
+        dlog.error(f"[scramble_flag] {e}", exc_info=True)
+
+
+# ==========================================
+# BANS + CAPTCHA
+# ==========================================
+def _scramble_is_banned(db: dict, uid) -> bool:
+    u = (db.get("users") or {}).get(str(uid))
+    rec = u.get("scramble") if isinstance(u, dict) else None
+    return bool(isinstance(rec, dict) and rec.get("banned"))
+
+
+def _scramble_ban_list(db: dict) -> list:
+    """[(uid, name, info)] newest ban first."""
+    rows = []
+    for uid, u in (db.get("users") or {}).items():
+        rec = u.get("scramble") if isinstance(u, dict) else None
+        if isinstance(rec, dict) and rec.get("banned"):
+            rows.append((str(uid), str(u.get("name") or "User"), rec["banned"]))
+    rows.sort(key=lambda r: -(r[2].get("at") or 0))
+    return rows
+
+
+async def _scramble_ban(db: dict, uid: str, reason: str, by="auto"):
+    """Ban a player from Scramble (chat + web, hidden from the leaderboards) and end their runs."""
+    rec = db["users"][uid].setdefault("scramble", {})
+    rec["banned"] = {"at": int(time.time()), "reason": reason, "by": by}
+    for k, v in list(_scramble_web_runs.items()):
+        if v["uid"] == uid:
+            _scramble_web_runs.pop(k, None)
+    _scramble_captchas.pop(uid, None)
+    gid, _g = _scramble_active_game(int(uid))
+    if gid:
+        _scramble_games.pop(gid, None)
+    try:
+        log_action(db, uid, {"type": "scramble_ban", "reason": reason, "by": str(by)})
+    except Exception as e:
+        dlog.error(f"[scramble_ban_log] {e}", exc_info=True)
+    _scr_log(db, "ban", uid, reason=reason, by=by)
+    save_db()
+    try:
+        await bot.send_message(int(uid), "You have been banned from Scramble.")
+    except Exception:
+        pass
+
+
+async def _scramble_unban(db: dict, uid: str, by=None) -> bool:
+    u = (db.get("users") or {}).get(uid)
+    rec = u.get("scramble") if isinstance(u, dict) else None
+    if not (isinstance(rec, dict) and rec.get("banned")):
+        return False
+    rec.pop("banned", None)
+    rec["flags"] = 0            # clean slate: no extra captchas for them afterwards
+    rec["captcha_skips"] = 0
+    _scr_log(db, "unban", uid, by=by)
+    save_db()
+    try:
+        await bot.send_message(int(uid), "You have been unbanned from Scramble. Welcome back!")
+    except Exception:
+        pass
+    return True
+
+
+def _scramble_captcha_image(code: str) -> bytes:
+    """Distorted code on a noisy background: each character rotated and jittered, lines over the top."""
+    W, H = 240, 90
+    img = Image.new("RGB", (W, H), (random.randint(215, 245), random.randint(215, 245), random.randint(215, 245)))
+    d = ImageDraw.Draw(img)
+    for _ in range(260):
+        x, y = random.randint(0, W - 1), random.randint(0, H - 1)
+        d.point((x, y), fill=(random.randint(120, 200),) * 3)
+    font = _scramble_font(46)
+    step = W // (len(code) + 1)
+    for i, ch in enumerate(code):
+        layer = Image.new("RGBA", (70, 80), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).text((35, 40), ch, font=font, anchor="mm",
+                                   fill=(random.randint(10, 90), random.randint(10, 90), random.randint(10, 90), 255))
+        layer = layer.rotate(random.uniform(-28, 28), resample=Image.BICUBIC)
+        img.paste(layer, (step * (i + 1) - 35 + random.randint(-5, 5), H // 2 - 40 + random.randint(-7, 7)), layer)
+    for _ in range(5):
+        d.line((random.randint(0, W), random.randint(0, H), random.randint(0, W), random.randint(0, H)),
+               fill=(random.randint(40, 140), random.randint(40, 140), random.randint(40, 140)), width=random.choice((1, 2)))
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=85)
+    return out.getvalue()
+
+
+def _scramble_captcha_issue(uid: str, tries_used: int = 0) -> dict:
+    """New challenge for this player (replaces any earlier one). The answer never leaves the server."""
+    code = "".join(random.choice(_SCR_CAPTCHA_CHARS) for _ in range(4))
+    opts = {code}
+    while len(opts) < SCRAMBLE_CAPTCHA_OPTIONS:      # decoys look like the real code: 1-2 characters changed
+        d = list(code)
+        for i in random.sample(range(len(code)), random.choice((1, 2))):
+            d[i] = random.choice([c for c in _SCR_CAPTCHA_CHARS if c != code[i]])
+        opts.add("".join(d))
+    options = list(opts)
+    random.shuffle(options)
+    cid = secrets.token_hex(6)
+    _scramble_captchas[uid] = {"id": cid, "code": code, "expires": time.time() + SCRAMBLE_CAPTCHA_TTL, "tries": tries_used}
+    return {"id": cid, "options": options, "tries_left": SCRAMBLE_CAPTCHA_TRIES - tries_used,
+            "image": "data:image/jpeg;base64," + base64.b64encode(_scramble_captcha_image(code)).decode()}
+
+
+def _scramble_captcha_due(db: dict, uid: str) -> bool:
+    rec = db["users"][uid].get("scramble") or {}
+    chance = SCRAMBLE_CAPTCHA_CHANCE_FLAGGED if rec.get("flags", 0) > 0 else SCRAMBLE_CAPTCHA_CHANCE
+    return random.random() < chance
+
+
+async def _scramble_web_launch(uid: str, db: dict) -> dict:
+    """Pick a real card, shuffle it HERE, cut it into tiles, and start the clock as the tiles go out."""
+    now = time.time()
+    for k, v in list(_scramble_web_runs.items()):   # expire old runs + one run per player
+        if now - v["started"] > SCRAMBLE_TTL or v["uid"] == uid:
+            _scramble_web_runs.pop(k, None)
+    cid, base = _scramble_take(db)
+    if cid is None:                                  # cold pool: build one on demand
+        cands = _scramble_candidates(db)
+        if not cands:
+            _scramble_kick_refill(db)
+            return {"ok": False, "error": "no_cards"}
+        cid = random.choice(cands)
+        base = await _scramble_fetch(db["global_cards"][cid]["file_id"])
+    _scramble_recent.append(cid)
+    _scramble_kick_refill(db)
+    g = db["global_cards"][cid]
+    _scr_stat(db, "start", uid=uid)
+    _scr_log(db, "start", uid, mode="web")
+    perm = _scramble_shuffle(SCRAMBLE_COLS * SCRAMBLE_ROWS)
+    tiles, ar = await asyncio.to_thread(_scramble_web_tiles, base, perm)
+    run = secrets.token_hex(8)
+    _scramble_web_runs[run] = {
+        "uid": uid, "started": time.time(),   # the clock starts here, when the tiles are sent
+        "card": {"name": str(g.get("name", "Card")), "rarity": str(g.get("rarity", "Common")),
+                 "anime": str(g.get("anime", "Unknown"))},
+        "perm0": list(perm), "perm": list(perm), "moves": 0, "stamps": [],
+        "last": None, "last_resp": None, "done": False}
+    return {"ok": True, "run": run, "tiles": tiles, "ar": ar}
+
+
 @deck_api.post("/scramble/start")
 async def scramble_web_start(req: ScrWebReq):
-    """Pick a real card (same pool as /scramble); the client cuts it, clock starts at /begin."""
+    """Starts a run - or, now and then, a captcha first (the puzzle is only sent once it is answered)."""
     u = _scramble_web_auth(req)
     try:
         uid = str(u["id"])
-        db = ensure_user(uid, u.get("first_name", "User"), u.get("username"))
         now = time.time()
-        for k, v in list(_scramble_web_runs.items()):   # expire old runs + one run per player
-            if now - v["started"] > SCRAMBLE_TTL or v["uid"] == uid:
-                _scramble_web_runs.pop(k, None)
-        cid, base = _scramble_take(db)
-        if cid is None:                                  # cold pool: build one on demand
-            cands = _scramble_candidates(db)
-            if not cands:
-                _scramble_kick_refill(db)
-                return {"ok": False, "error": "no_cards"}
-            cid = random.choice(cands)
-            base = await _scramble_fetch(db["global_cards"][cid]["file_id"])
-        _scramble_recent.append(cid)
-        _scramble_kick_refill(db)
-        g = db["global_cards"][cid]
-        _scr_stat(db, "start", uid=uid)
-        run = secrets.token_hex(8)
-        _scramble_web_runs[run] = {"uid": uid, "started": now, "card": {
-            "name": str(g.get("name", "Card")), "rarity": str(g.get("rarity", "Common")),
-            "anime": str(g.get("anime", "Unknown"))}}
-        return {"ok": True, "run": run,
-                "image": "data:image/jpeg;base64," + base64.b64encode(base).decode()}
+        if now - _scramble_web_last_start.get(uid, 0) < SCRAMBLE_WEB_START_GAP:
+            _scr_log_once(ensure_user(uid, u.get("first_name", "User"), u.get("username")), "start_spam", uid, mode="web")
+            return {"ok": False, "error": "Slow down a little."}
+        if len(_scramble_web_last_start) > 2000:
+            _scramble_web_last_start.clear()
+        _scramble_web_last_start[uid] = now
+        db = ensure_user(uid, u.get("first_name", "User"), u.get("username"))
+        rec = db["users"][uid].setdefault("scramble", {})
+        pending = _scramble_captchas.pop(uid, None)
+        if pending and now <= pending["expires"]:        # asked for a new run without answering the captcha
+            rec["captcha_skips"] = rec.get("captcha_skips", 0) + 1
+            _scr_log(db, "captcha_ignored", uid, skips=rec["captcha_skips"])
+            if rec["captcha_skips"] >= SCRAMBLE_CAPTCHA_MAX_SKIPS:
+                await _scramble_ban(db, uid, "ignored captcha")
+                raise HTTPException(status_code=403, detail="You are banned from Scramble.")
+        if _scramble_captcha_due(db, uid):
+            _scr_log(db, "captcha_issued", uid, flagged=bool(rec.get("flags", 0) > 0))
+            return {"ok": True, "captcha": _scramble_captcha_issue(uid)}
+        return await _scramble_web_launch(uid, db)
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[scramble_web_start] {e}")
         dlog.error(f"[scramble_web_start] {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Couldn't build the puzzle.")
 
 
+@deck_api.post("/scramble/captcha")
+async def scramble_web_captcha(req: ScrWebReq):
+    """Answer to the captcha. Right -> the puzzle starts. Wrong -> a fresh code, and the ban when tries run out."""
+    u = _scramble_web_auth(req)
+    try:
+        uid = str(u["id"])
+        db = ensure_user(uid, u.get("first_name", "User"), u.get("username"))
+        ch = _scramble_captchas.get(uid)
+        if not ch or ch["id"] != req.cid:
+            raise HTTPException(status_code=400, detail="No captcha pending.")
+        if time.time() > ch["expires"]:
+            _scramble_captchas.pop(uid, None)            # expired is not a failure - they just get a new run
+            _scr_log(db, "captcha_expired", uid)
+            return {"ok": False, "error": "Captcha expired. Tap Try again."}
+        ch["tries"] += 1
+        if hmac.compare_digest(str(req.answer).strip().upper().encode(), ch["code"].encode()):
+            _scramble_captchas.pop(uid, None)
+            db["users"][uid].setdefault("scramble", {})["captcha_skips"] = 0
+            _scr_log(db, "captcha_passed", uid, tries=ch["tries"])
+            return await _scramble_web_launch(uid, db)
+        _scr_log(db, "captcha_wrong", uid, tries=ch["tries"], of=SCRAMBLE_CAPTCHA_TRIES)
+        if ch["tries"] >= SCRAMBLE_CAPTCHA_TRIES:
+            await _scramble_ban(db, uid, "failed captcha")
+            raise HTTPException(status_code=403, detail="Captcha failed. You are banned from Scramble.")
+        return {"ok": True, "wrong": True, "captcha": _scramble_captcha_issue(uid, ch["tries"])}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[scramble_web_captcha] {e}")
+        dlog.error(f"[scramble_web_captcha] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Captcha error.")
+
+
 @deck_api.post("/scramble/begin")
 async def scramble_web_begin(req: ScrWebReq):
-    """Client calls this once the card art is on screen: that is when the clock starts."""
+    """Kept so older cached copies of scramble.html don't break. It no longer touches the clock
+    (a cheater could otherwise fetch the card, solve it offline, then call this to 'start')."""
     u = _scramble_web_auth(req)
-    _scramble_web_run(req, u, pop=False)["started"] = time.time()
+    _scramble_web_run(req, u, pop=False)
     return {"ok": True}
+
+
+@deck_api.post("/scramble/swap")
+async def scramble_web_swap(req: ScrWebReq):
+    """One swap of two board positions. The server replays it on its own copy of the board and
+    answers whether the picture is now complete - and, if so, settles the reward right here."""
+    u = _scramble_web_auth(req)
+    run = _scramble_web_run(req, u, pop=False)
+    n = SCRAMBLE_COLS * SCRAMBLE_ROWS
+    a, b, seq = req.a, req.b, req.seq
+    # A retry of the swap we already applied (the reply got lost): answer again, don't re-apply.
+    if seq == run["moves"] and run["last"] == (a, b) and run["last_resp"] is not None:
+        return run["last_resp"]
+    if run["done"]:
+        raise HTTPException(status_code=400, detail="Run already finished.")
+    _db = ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username"))
+    if seq != run["moves"] + 1:
+        _scr_log_once(_db, "out_of_sync", u["id"], every=30, seq=seq, expected=run["moves"] + 1)
+        raise HTTPException(status_code=409, detail="Out of sync.")
+    if not (0 <= a < n and 0 <= b < n) or a == b:
+        _scr_log(_db, "bad_swap", u["id"], a=a, b=b)
+        raise HTTPException(status_code=400, detail="Bad swap.")
+    if run["moves"] >= SCRAMBLE_WEB_MAX_SWAPS:
+        _scramble_web_runs.pop(req.run, None)
+        _scr_log(_db, "too_many_moves", u["id"], moves=run["moves"])
+        raise HTTPException(status_code=400, detail="Too many moves.")
+
+    now = time.time()
+    perm = run["perm"]
+    perm[a], perm[b] = perm[b], perm[a]
+    run["moves"] += 1
+    run["stamps"].append(now)
+    run["last"] = (a, b)
+    if perm != list(range(n)):
+        run["last_resp"] = {"ok": True, "solved": False}
+        return run["last_resp"]
+
+    # ── Solved (as decided by the server) ──
+    try:
+        uid, name = str(u["id"]), u.get("first_name", "User")
+        db = ensure_user(uid, name, u.get("username"))
+        moves, elapsed = run["moves"], now - run["started"]
+        perm0 = run["perm0"]
+        solution = [perm0.index(p) for p in range(n)]
+        gaps = [y - x for x, y in zip(run["stamps"], run["stamps"][1:])]
+        base_resp = {"ok": True, "solved": True, "time": round(elapsed, 2), "moves": moves,
+                     "card": run["card"], "solution": solution}
+        if elapsed < max(SCRAMBLE_WEB_MIN_SECONDS, moves * SCRAMBLE_WEB_MIN_PER_SWAP):
+            _scramble_flag(db, uid, name, "too_fast", elapsed=round(elapsed, 2), moves=moves)
+            resp = {"ok": False, "error": "too_fast"}          # not recorded, not paid
+        else:
+            if len(gaps) >= 5 and statistics.pstdev(gaps) < SCRAMBLE_WEB_FLAG_STDEV:
+                _scramble_flag(db, uid, name, "robotic_timing", elapsed=round(elapsed, 2),
+                               moves=moves, stdev=round(statistics.pstdev(gaps), 4))
+            dq = _scramble_web_solves.setdefault(uid, deque())
+            while dq and now - dq[0] > 3600:
+                dq.popleft()
+            if len(dq) >= SCRAMBLE_WEB_MAX_SOLVES_PER_HOUR:    # farming: shows the card, counts for nothing
+                _scr_log(db, "hourly_limit", uid, name, solves=len(dq), time=round(elapsed, 2))
+                resp = {**base_resp, "limited": True, "earned": 0, "paid": 0}
+            else:
+                dq.append(now)
+                earned = _scramble_reward_for(elapsed, SCRAMBLE_WEB_REWARD_TIERS)
+                paid = _scramble_settle(uid, name, u.get("username"), elapsed, earned, mode="web",
+                                        card=run["card"], moves=moves, chat_id="web",
+                                        chat_title="Scramble Web App")
+                resp = {**base_resp, "earned": earned, "paid": paid}
+                _scr_log(db, "solve", uid, name, mode="web", time=round(elapsed, 2), moves=moves,
+                         paid=paid, earned=earned, card=run["card"]["name"])
+        run["done"] = True
+        run["last_resp"] = resp
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[scramble_web_swap] {e}")
+        dlog.error(f"[scramble_web_swap] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Couldn't save the result.")
 
 
 @deck_api.post("/scramble/finish")
 async def scramble_web_finish(req: ScrWebReq):
+    """Retired: the server now decides the win inside /scramble/swap. Without a verified board a
+    bare 'finish' call proves nothing, so it can no longer pay out."""
     u = _scramble_web_auth(req)
-    run = _scramble_web_run(req, u, pop=True)
-    try:
-        elapsed = time.time() - run["started"]
-        if elapsed < SCRAMBLE_WEB_MIN_SECONDS:
-            raise HTTPException(status_code=400, detail="Too fast.")
-        earned = _scramble_reward_for(elapsed, SCRAMBLE_WEB_REWARD_TIERS)
-        paid = _scramble_settle(str(u["id"]), u.get("first_name", "User"), u.get("username"), elapsed, earned,
-                                mode="web", card=run["card"], chat_id="web", chat_title="Scramble Web App")
-        return {"ok": True, "earned": earned, "paid": paid, "time": round(elapsed, 2), "card": run["card"]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[scramble_web_finish] {e}")
-        dlog.error(f"[scramble_web_finish] {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Couldn't save the result.")
+    _scr_log(ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username")), "retired_finish", u["id"], mode="web")
+    raise HTTPException(status_code=410, detail="Update scramble.html - this endpoint is retired.")
 
 
 @deck_api.post("/scramble/giveup")
@@ -828,8 +1189,14 @@ async def scramble_web_giveup(req: ScrWebReq):
     """Reveal the card (like chat mode's Give Up). No shards."""
     u = _scramble_web_auth(req)
     run = _scramble_web_run(req, u, pop=True)
-    _scr_stat(ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username")), "giveup", uid=u["id"])
-    return {"ok": True, "card": run["card"]}
+    if run["done"]:
+        raise HTTPException(status_code=400, detail="Run already finished.")
+    _gdb = ensure_user(str(u["id"]), u.get("first_name", "User"), u.get("username"))
+    _scr_stat(_gdb, "giveup", uid=u["id"])
+    _scr_log(_gdb, "giveup", u["id"], mode="web", moves=run["moves"], card=run["card"]["name"])
+    perm0 = run["perm0"]
+    return {"ok": True, "card": run["card"],
+            "solution": [perm0.index(p) for p in range(SCRAMBLE_COLS * SCRAMBLE_ROWS)]}
 
 
 @deck_api.post("/scramble/lb")
@@ -877,6 +1244,9 @@ async def scramble_web_avatar(req: ScrWebReq):
 async def scramble_web_cmd(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+    if _scramble_is_banned(ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username), uid_int):
+        await message.reply("You are banned from Scramble.")
+        return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         _scr_url_btn("Play Web Mode", SCRAMBLE_WEB_LINK, "primary")]])
     await message.reply(
@@ -905,7 +1275,7 @@ def _scramble_board(db: dict, tab: str):
     rows = []
     for uid, u in (db.get("users") or {}).items():
         rec = u.get("scramble") if isinstance(u, dict) else None
-        if not isinstance(rec, dict):
+        if not isinstance(rec, dict) or rec.get("banned"):
             continue
         if tab == "time":
             v = rec.get("best_time")
@@ -1066,6 +1436,7 @@ async def scramble_stats_cmd(message: Message):
         allt = (
             "<b>ALL TIME</b>\n"
             f"Players         : <b>{len(rounds_rows):,}</b>\n"
+            f"Banned          : <b>{len(_scramble_ban_list(db)):,}</b>\n"
             f"Rounds solved   : <b>{sum(v for v, _, _ in rounds_rows):,}</b>\n"
             f"Shards paid     : <b>{sum(v for v, _, _ in shard_rows):,}</b>\n"
             f"Fastest solve   : <b>{_scr_fmt_t(time_rows[0][0]) if time_rows else '-'}"
@@ -1084,3 +1455,141 @@ async def scramble_stats_cmd(message: Message):
         traceback.print_exc()
         dlog.error(f"[scr_stats_CRASH] {e}", exc_info=True)
         await message.reply("Stats are unavailable right now.")
+
+
+# ==========================================
+# /scrlist  /scruban — ADMIN ONLY
+# ==========================================
+@main_router.message(Command("scrlist"))
+async def scramble_banlist_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return   # not an admin: behave as if the command doesn't exist
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply("Use /scrlist in my DMs.")
+        return
+    try:
+        db = ensure_user(str(message.from_user.id), message.from_user.first_name, message.from_user.username)
+        rows = _scramble_ban_list(db)
+        text = f"<b>「 SCRAMBLE BAN LIST 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        if not rows:
+            text += "Nobody is banned."
+        else:
+            for i, (uid, name, info) in enumerate(rows[:40], 1):
+                when = datetime.fromtimestamp(info.get("at") or 0, timezone.utc).strftime("%Y-%m-%d %H:%M")
+                by = "auto" if info.get("by") == "auto" else f"admin {info.get('by')}"
+                text += (f"<b>{i}.</b> {_html_esc(name[:20])} (<code>{uid}</code>)\n"
+                         f"    {_html_esc(str(info.get('reason', '-')))} · {when} UTC · {by}\n")
+            if len(rows) > 40:
+                text += f"…and {len(rows) - 40} more.\n"
+            text += "━━━━━━━━━━━━━━━━━\n<i>/scruban &lt;user_id&gt; · reply + /scruban · /scruban all</i>"
+        await message.reply(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[scrlist_CRASH] {e}")
+        dlog.error(f"[scrlist_CRASH] {e}", exc_info=True)
+        await message.reply("Ban list unavailable right now.")
+
+
+@main_router.message(Command("scruban"))
+async def scramble_unban_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        db = ensure_user(str(message.from_user.id), message.from_user.first_name, message.from_user.username)
+        parts = (message.text or "").split()
+        arg = parts[1] if len(parts) > 1 else None
+        if arg and arg.lower() == "all":
+            ids = [uid for uid, _n, _i in _scramble_ban_list(db)]
+            for uid in ids:
+                await _scramble_unban(db, uid, by=message.from_user.id)
+            await message.reply(f"Unbanned {len(ids)} player(s) from Scramble.")
+            return
+        if arg is None and message.reply_to_message and message.reply_to_message.from_user:
+            arg = str(message.reply_to_message.from_user.id)
+        if not arg or not arg.lstrip("-").isdigit():
+            await message.reply("Usage: /scruban &lt;user_id&gt; - or reply to the player's message - or /scruban all",
+                                parse_mode=ParseMode.HTML)
+            return
+        if await _scramble_unban(db, arg, by=message.from_user.id):
+            await message.reply(f"Unbanned <code>{_html_esc(arg)}</code> from Scramble.", parse_mode=ParseMode.HTML)
+        else:
+            await message.reply("That player isn't banned from Scramble.")
+    except Exception as e:
+        print(f"[scruban_CRASH] {e}")
+        dlog.error(f"[scruban_CRASH] {e}", exc_info=True)
+        await message.reply("Couldn't unban right now.")
+
+
+# ==========================================
+# /scrlog — ADMIN ONLY, DM ONLY
+# ==========================================
+#   /scrlog                 everything, newest first
+#   /scrlog v               violations only (too fast, captcha fails, bans, spam ...)
+#   /scrlog <user_id>       one player      /scrlog <user_id> v   one player's violations
+def _scr_log_view(db: dict, page: int, viol_only: bool, uid: str):
+    rows = [e for e in reversed(db.get("scramble_log") or [])
+            if (not viol_only or e.get("v")) and (not uid or e.get("u") == uid)]
+    total = len(rows)
+    pages = max(1, -(-total // SCRAMBLE_LOG_PAGE))
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * SCRAMBLE_LOG_PAGE:(page + 1) * SCRAMBLE_LOG_PAGE]
+
+    scope = ("violations" if viol_only else "all events") + (f" · player {uid}" if uid else "")
+    text = f"<b>「 SCRAMBLE LOG 」</b>\n━━━━━━━━━━━━━━━━━\n<i>{_html_esc(scope)}</i> · {total:,} entries · page {page + 1}/{pages}\n\n"
+    if not chunk:
+        text += "Nothing logged yet."
+    for e in chunk:
+        when = datetime.fromtimestamp(e.get("t") or 0, timezone.utc).strftime("%m-%d %H:%M:%S")
+        mark = "⚠" if e.get("v") else "▸"
+        who = f"{_html_esc(str(e.get('n') or '-')[:18])} (<code>{_html_esc(str(e.get('u') or '-'))}</code>)"
+        info = ", ".join(f"{k}={v}" for k, v in (e.get("i") or {}).items())
+        text += (f"<code>{when}</code> {mark} <b>{_html_esc(str(e.get('e')))}</b>\n"
+                 f"    {who}" + (f" · {_html_esc(info[:110])}" if info else "") + "\n")
+    text += "\n━━━━━━━━━━━━━━━━━\n<i>/scrlog v · /scrlog &lt;user_id&gt; · /scrlog &lt;user_id&gt; v</i>"
+
+    f = f"{'v' if viol_only else 'a'}:{uid or 0}"
+    nav = []
+    if page > 0:
+        nav.append(_scr_btn("« Newer", f"slog:{page - 1}:{f}", "primary"))
+    nav.append(_scr_btn("Refresh", f"slog:{page}:{f}", "success"))
+    if page < pages - 1:
+        nav.append(_scr_btn("Older »", f"slog:{page + 1}:{f}", "primary"))
+    return text[:4000], InlineKeyboardMarkup(inline_keyboard=[nav])
+
+
+@main_router.message(Command("scrlog"))
+async def scramble_log_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return   # not an admin: behave as if the command doesn't exist
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply("Use /scrlog in my DMs.")
+        return
+    try:
+        db = ensure_user(str(message.from_user.id), message.from_user.first_name, message.from_user.username)
+        viol, uid = False, ""
+        for tok in (message.text or "").split()[1:]:
+            if tok.lower() in ("v", "viol", "violations"):
+                viol = True
+            elif tok.lstrip("-").isdigit():
+                uid = tok
+        text, kb = _scr_log_view(db, 0, viol, uid)
+        await message.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[scrlog_CRASH] {e}")
+        dlog.error(f"[scrlog_CRASH] {e}", exc_info=True)
+        await message.reply("The log is unavailable right now.")
+
+
+@main_router.callback_query(F.data.startswith("slog:"))
+async def scramble_log_cb(cq: CallbackQuery):
+    if cq.from_user.id not in ADMIN_IDS:
+        await cq.answer()
+        return
+    try:
+        _, page, flt, uid = cq.data.split(":")
+        db = ensure_user(str(cq.from_user.id), cq.from_user.first_name, cq.from_user.username)
+        text, kb = _scr_log_view(db, int(page), flt == "v", "" if uid == "0" else uid)
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            dlog.error(f"[scrlog_cb] {e}", exc_info=True)
+    await cq.answer()
