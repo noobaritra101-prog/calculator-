@@ -247,13 +247,18 @@ async def _expire_gcard(cid_str: str, msg_id: int, chat_id: int):
             "No one guessed it right!\n"
             f"It was <b>{name} from {anime}</b>"
         )
-        timeout_msg = await bot.send_message(
-            chat_id=chat_id,
-            text=timeout_text,
-            reply_to_message_id=msg_id,
-            parse_mode=ParseMode.HTML,
-            reply_markup=_gcard_view_kb(chat_id, msg_id)
-        )
+        try:
+            timeout_msg = await bot.send_message(
+                chat_id=chat_id,
+                text=timeout_text,
+                reply_to_message_id=msg_id,
+                allow_sending_without_reply=True,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_gcard_view_kb(chat_id, msg_id)
+            )
+        except Exception:
+            # Chat gone / bot kicked / no rights: still run cleanup below
+            timeout_msg = None
 
         # Unblur the card while keeping the caption exactly the same
         await _reveal_gcard(chat_id, msg_id, card_data.get("file_id"))

@@ -441,7 +441,22 @@ async def store_online_cb(cq: CallbackQuery):
         random.seed(seed)
         c_b = random.choice(list(basics.items()))
         c_e = random.choice(list(elites.items()))
-        c_d = random.choice(list(divines.items())) if divines else None
+        c_d = None
+        if divines:
+            special_ids = _sunday_special_ids(db)
+            owned = db["users"].get(uid, {}).get("cards", {})
+            owns_special = any(
+                str(cid) in special_ids and c.get("amount", 0) > 0
+                for cid, c in owned.items()
+            )
+            pool = divines
+            if owns_special:
+                # Already owns a Sunday Special -> only 5% chance to see another.
+                specials = {k: v for k, v in divines.items() if str(k) in special_ids}
+                regulars = {k: v for k, v in divines.items() if str(k) not in special_ids}
+                if specials and regulars:
+                    pool = specials if random.random() < 0.05 else regulars
+            c_d = random.choice(list(pool.items()))
         random.seed()
 
         # Lock in today's selection so it stays stable regardless of any
