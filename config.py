@@ -14,18 +14,19 @@ from aiogram.enums import ParseMode
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# Values are written here directly. If a variable with the same name is set in the
-# environment (e.g. Railway > Variables), it overrides the value below.
-BOT_TOKEN           = os.environ.get("BOT_TOKEN", ",7658617809:AAGAPRwyXaXDTwS_FjoSO-4msd0zkcsfV6U")
+# The bot token must come strictly from the environment, NEVER hardcoded in git.
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    sys.exit("[FATAL] BOT_TOKEN environment variable is missing!")
+
+# Other values: if a variable with the same name is set in the environment
+# (e.g. Railway > Variables), it overrides the default below.
 ADMIN_IDS           = [int(x) for x in os.environ["ADMIN_IDS"].split(",")] if os.environ.get("ADMIN_IDS") else [5716292610, 5822885863, 7930421561, 7964904329]
 SUPREME_OWNER_ID    = int(os.environ.get("SUPREME_OWNER_ID", 5716292610))
 DB_GROUP_ID         = int(os.environ.get("DB_GROUP_ID", -1003799799158))          # Used for uploading new cards
 DATABASE_BACKUP_ID  = int(os.environ.get("DATABASE_BACKUP_ID", -1002790195961))   # Used for database backups
 PUBLIC_LOG_GROUP_ID = int(os.environ.get("PUBLIC_LOG_GROUP_ID", -1004377565453))  # Used for public logs (@anexlog)
 QUERY_GROUP_ID      = int(os.environ.get("QUERY_GROUP_ID", -1003531986896))       # Used for /query submissions (support tickets)
-
-if BOT_TOKEN == "PASTE_NEW_TOKEN_HERE":
-    sys.exit("[CONFIG] Set BOT_TOKEN in config.py (or as an environment variable) before starting.")
 
 # Specific Topic/Thread IDs inside @anexlog
 LOG_THREAD_STOCKMARKET = 2  # Topic ID for Stock Market buy/sell logs
