@@ -14,13 +14,18 @@ from aiogram.enums import ParseMode
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BOT_TOKEN           = "7658617809:AAFKiHT-skcWWC52UVraXrqEjEzPXNR3fRE"
-ADMIN_IDS           = [5716292610, 5822885863, 7930421561, 7964904329]
-SUPREME_OWNER_ID    = 5716292610
-DB_GROUP_ID         = -1003799799158 # Used for uploading new cards
-DATABASE_BACKUP_ID  = -1002790195961 # Used for database backups
-PUBLIC_LOG_GROUP_ID = -1004377565453 # Used for public logs (@anexlog)
-QUERY_GROUP_ID      = -1003531986896 # Used for /query submissions (support tickets)
+# Values are written here directly. If a variable with the same name is set in the
+# environment (e.g. Railway > Variables), it overrides the value below.
+BOT_TOKEN           = os.environ.get("BOT_TOKEN", "PASTE_NEW_TOKEN_HERE")
+ADMIN_IDS           = [int(x) for x in os.environ["ADMIN_IDS"].split(",")] if os.environ.get("ADMIN_IDS") else [5716292610, 5822885863, 7930421561, 7964904329]
+SUPREME_OWNER_ID    = int(os.environ.get("SUPREME_OWNER_ID", 5716292610))
+DB_GROUP_ID         = int(os.environ.get("DB_GROUP_ID", -1003799799158))          # Used for uploading new cards
+DATABASE_BACKUP_ID  = int(os.environ.get("DATABASE_BACKUP_ID", -1002790195961))   # Used for database backups
+PUBLIC_LOG_GROUP_ID = int(os.environ.get("PUBLIC_LOG_GROUP_ID", -1004377565453))  # Used for public logs (@anexlog)
+QUERY_GROUP_ID      = int(os.environ.get("QUERY_GROUP_ID", -1003531986896))       # Used for /query submissions (support tickets)
+
+if BOT_TOKEN == "PASTE_NEW_TOKEN_HERE":
+    sys.exit("[CONFIG] Set BOT_TOKEN in config.py (or as an environment variable) before starting.")
 
 # Specific Topic/Thread IDs inside @anexlog
 LOG_THREAD_STOCKMARKET = 2  # Topic ID for Stock Market buy/sell logs
@@ -38,8 +43,8 @@ MAIN_GROUP_LINK     = "https://t.me/animex_nexus"
 # that must point back at THIS running app. Import it from config everywhere
 # instead of hardcoding it — if it drifts from the actual host, every image
 # link silently points at a dead service and every <img> in the Mini Apps breaks.
-BACKEND_PUBLIC_URL  = "https://calculator-production-740f.up.railway.app"
-OFFLINE_STORE_GROUP = -1003982098657  # 🏪 Peer-to-Peer Consignment Group/Channel ID
+BACKEND_PUBLIC_URL  = os.environ.get("BACKEND_PUBLIC_URL", "https://calculator-production-740f.up.railway.app").rstrip("/")
+OFFLINE_STORE_GROUP = int(os.environ.get("OFFLINE_STORE_GROUP", -1003982098657))  # 🏪 Peer-to-Peer Consignment Group/Channel ID
 
 # Fixed Shards Card Purchase Prices for Online Shop - Balanced Values
 SHOP_PRICES = {
