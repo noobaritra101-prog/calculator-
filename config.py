@@ -16,7 +16,7 @@ from aiogram.enums import ParseMode
 # ==========================================
 # Values are written here directly. If a variable with the same name is set in the
 # environment (e.g. Railway > Variables), it overrides the value below.
-BOT_TOKEN           = os.environ.get("BOT_TOKEN", "PASTE_NEW_TOKEN_HERE")
+BOT_TOKEN           = os.environ.get("BOT_TOKEN", "7658617809:AAE0RHNhlKwG5wrBYWmFu1khPKveqOrOmDo")
 ADMIN_IDS           = [int(x) for x in os.environ["ADMIN_IDS"].split(",")] if os.environ.get("ADMIN_IDS") else [5716292610, 5822885863, 7930421561, 7964904329]
 SUPREME_OWNER_ID    = int(os.environ.get("SUPREME_OWNER_ID", 5716292610))
 DB_GROUP_ID         = int(os.environ.get("DB_GROUP_ID", -1003799799158))          # Used for uploading new cards
