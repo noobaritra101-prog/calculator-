@@ -11,6 +11,8 @@ import logging
 import hmac
 import hashlib
 import json
+import asyncio
+from collections import OrderedDict
 from urllib.parse import parse_qsl
 from datetime import datetime, timezone
 from aiogram import F
@@ -22,7 +24,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode, ChatMemberStatus
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 from pydantic import BaseModel
 import aiohttp
 
@@ -386,65 +388,74 @@ def get_user_from_db(db: dict, user_id: str):
     return None, None
 
 
+# One shared HTTP session for Telegram downloads (a new session per image
+# was slow and made transient connection resets far more likely).
+_tg_session = None
+def _get_tg_session() -> aiohttp.ClientSession:
+    global _tg_session
+    if _tg_session is None or _tg_session.closed:
+        _tg_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+    return _tg_session
+
+# Small in-memory LRU of image bytes so repeat views never hit Telegram.
+_IMG_CACHE_MAX = 200
+_img_bytes_cache: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
+_IMG_FETCH_SEM = asyncio.Semaphore(8)   # cap concurrent Telegram downloads
+
+
 @deck_api.get("/image/{card_id}")
 async def get_card_image_proxy(card_id: str):
-    """Streams a Telegram-hosted card image through our own server.
+    """Serves a Telegram-hosted card image through our own server.
 
-    Deliberately does NOT redirect to Telegram's file URL — that URL embeds
-    our bot token (https://api.telegram.org/file/bot<TOKEN>/...), which
-    would otherwise be visible to any client in DevTools/Network tab and
-    could be used to hijack the bot. Fetching and streaming the bytes here
-    keeps the token server-side only.
+    Does NOT redirect to Telegram's file URL (it embeds the bot token).
+    Retries transient Telegram/network failures (e.g. 'Connection reset by
+    peer') so the frontend almost never sees a 404 for a valid card.
     """
-    try:
-        db = load_db()
-        global_cards = db.get("global_cards", {}) if isinstance(db, dict) else {}
-        file_id = global_cards.get(card_id, {}).get("file_id") if isinstance(global_cards, dict) else None
+    cache_hit = _img_bytes_cache.get(card_id)
+    if cache_hit:
+        _img_bytes_cache.move_to_end(card_id)
+        return Response(cache_hit[0], media_type=cache_hit[1],
+                        headers={"Cache-Control": "public, max-age=86400"})
 
-        if not file_id:
-            raise HTTPException(status_code=404, detail="Image file_id not found")
+    db = load_db()
+    global_cards = db.get("global_cards", {}) if isinstance(db, dict) else {}
+    file_id = global_cards.get(card_id, {}).get("file_id") if isinstance(global_cards, dict) else None
+    if not file_id:
+        raise HTTPException(status_code=404, detail="Image file_id not found")
 
-        cached = _file_url_cache.get(file_id)
-        if cached and (time.time() - cached[1]) < _FILE_URL_TTL_SECONDS:
-            direct_url = cached[0]
-        else:
-            telegram_file = await bot.get_file(file_id)
-            direct_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{telegram_file.file_path}"
-            _file_url_cache[file_id] = (direct_url, time.time())
-
-        session = aiohttp.ClientSession()
-        try:
-            resp = await session.get(direct_url)
-        except Exception:
-            await session.close()
-            raise
-
-        if resp.status != 200:
-            resp.release()
-            await session.close()
-            raise HTTPException(status_code=404, detail="Image unavailable")
-
-        content_type = resp.headers.get("Content-Type", "image/jpeg")
-
-        async def _stream():
+    last_err = None
+    async with _IMG_FETCH_SEM:
+        for attempt in range(3):
             try:
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    yield chunk
-            finally:
-                resp.release()
-                await session.close()
+                cached = _file_url_cache.get(file_id)
+                if cached and (time.time() - cached[1]) < _FILE_URL_TTL_SECONDS:
+                    direct_url = cached[0]
+                else:
+                    telegram_file = await bot.get_file(file_id)
+                    direct_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{telegram_file.file_path}"
+                    _file_url_cache[file_id] = (direct_url, time.time())
 
-        return StreamingResponse(
-            _stream(),
-            media_type=content_type,
-            headers={"Cache-Control": "public, max-age=86400"},  # card art doesn't change, safe to cache client-side for a day
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[image_proxy] Failed to resolve file_id {card_id}: {e}")
-        dlog.error(f"[image_proxy] Failed to resolve file_id {card_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=404, detail="Image unavailable")
+                async with _get_tg_session().get(direct_url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        ctype = resp.headers.get("Content-Type", "image/jpeg")
+                        _img_bytes_cache[card_id] = (data, ctype)
+                        while len(_img_bytes_cache) > _IMG_CACHE_MAX:
+                            _img_bytes_cache.popitem(last=False)
+                        return Response(data, media_type=ctype,
+                                        headers={"Cache-Control": "public, max-age=86400"})
+                    # Stale/invalid URL -> drop it and re-resolve on next attempt.
+                    _file_url_cache.pop(file_id, None)
+                    last_err = f"HTTP {resp.status}"
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                _file_url_cache.pop(file_id, None)
+                print(f"[image_proxy] attempt {attempt + 1}/3 failed for {card_id}: {last_err}")
+            await asyncio.sleep(0.4 * (attempt + 1))
+
+    dlog.error(f"[image_proxy] giving up on {card_id}: {last_err}")
+    # 503 = temporary; the frontend retries instead of treating it as permanent.
+    raise HTTPException(status_code=503, detail="Image temporarily unavailable")
 
 
 @deck_api.get("/state/{user_id}")
