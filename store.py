@@ -3,6 +3,7 @@ import uuid
 import random
 import asyncio
 import logging
+import html
 from aiogram import F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputRichMessage
 from aiogram.filters import Command, CommandObject
@@ -329,7 +330,7 @@ async def store_cmd(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Online Store", callback_data=f"st_on_{uid}", style=ButtonStyle.PRIMARY)],
         [InlineKeyboardButton(text="🛍️ Manage Offline Store", callback_data=f"st_off_{uid}", style=ButtonStyle.PRIMARY)],
-        [InlineKeyboardButton(text="📋 All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
+        [InlineKeyboardButton(text="All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")]
     ])
     
@@ -353,7 +354,7 @@ async def store_main_cb(cq: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Online Store", callback_data=f"st_on_{uid}", style=ButtonStyle.PRIMARY)],
         [InlineKeyboardButton(text="🛍️ Manage Offline Store", callback_data=f"st_off_{uid}", style=ButtonStyle.PRIMARY)],
-        [InlineKeyboardButton(text="📋 All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
+        [InlineKeyboardButton(text="All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")]
     ])
     
@@ -470,14 +471,14 @@ async def store_online_cb(cq: CallbackQuery):
     text = (
         "<b>「 🛒 𝗢𝗡𝗟𝗜𝗡𝗘 𝗦𝗧𝗢𝗥𝗘 」</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"<i>Your personalized daily stock. Resets in {time_until_shop_reset()}.</i>\n\n"
         f"🃏 <b>{c_b[1]['name']}</b> ➜ {SHOP_PRICES['Basic 🃏']} 💠\n"
         f"⚓ <b>{c_e[1]['name']}</b> ➜ {SHOP_PRICES['Elite ⚓']} 💠\n"
     )
     if c_d:
         divine_price = SHOP_PRICES.get('Divine ❄️', 5000)
         text += f"❄️ <b>{c_d[1]['name']}</b> ➜ {divine_price} 💠 <i>(Sunday Special!)</i>\n"
-    text += "━━━━━━━━━━━━━━━━━"
+    text += "━━━━━━━━━━━━━━━━━\n"
+    text += f"<i>Your personalized daily stock. Resets in {time_until_shop_reset()}.</i>"
 
     btn_b = InlineKeyboardButton(text=f"Buy {c_b[1]['name']}", callback_data=f"buyon_{uid}_{c_b[0]}", style=ButtonStyle.SUCCESS) if c_b[0] not in bought_list else InlineKeyboardButton(text="Sold Out (Basic)", callback_data="noop", style=ButtonStyle.DANGER)
     btn_e = InlineKeyboardButton(text=f"Buy {c_e[1]['name']}", callback_data=f"buyon_{uid}_{c_e[0]}", style=ButtonStyle.SUCCESS) if c_e[0] not in bought_list else InlineKeyboardButton(text="Sold Out (Elite)", callback_data="noop", style=ButtonStyle.DANGER)
@@ -929,7 +930,7 @@ async def offline_listings_mgr(cq: CallbackQuery, uid: str = None):
     if not my_listings:
         text = "<b>「 🛍️ 𝗠𝗬 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦  」</b>\n━━━━━━━━━━━━━━━━━\nYou currently have no active listings.\nUse <code>/sell &lt;card&gt; &lt;price&gt;</code> to list an item."
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
+            [InlineKeyboardButton(text="All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)],
             [InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")],
             [InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)]
         ])
@@ -941,7 +942,7 @@ async def offline_listings_mgr(cq: CallbackQuery, uid: str = None):
             btn_text = f"Remove {card_name} ({data['price']} 💠)"
             buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"rm_list_{uid}_{lid}", style=ButtonStyle.DANGER)])
             
-        buttons.append([InlineKeyboardButton(text="📋 All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)])
+        buttons.append([InlineKeyboardButton(text="All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)])
         buttons.append([InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")])
         buttons.append([InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1221,123 +1222,158 @@ CATEGORY_MAP = {
     "divine": ("Divine ❄️",   "Divine ❄️"),
 }
 
+async def _show_panel(cq: CallbackQuery, text: str, kb: InlineKeyboardMarkup, pic=None):
+    """Edit the current panel no matter what it currently is (photo or text),
+    and fall back to sending a fresh message if Telegram refuses the edit
+    (caption too long, text->photo switch, etc.). Previously every failure was
+    swallowed silently, which is why the panel looked like it 'did not open'."""
+    try:
+        if pic and cq.message.photo:
+            await cq.message.edit_media(InputMediaPhoto(media=pic, caption=text, parse_mode=ParseMode.HTML), reply_markup=kb)
+        elif cq.message.photo:
+            await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            return
+        dlog.error(f"[store_panel_edit_FAIL] {e}", exc_info=True)
+    # Fallback: replace the old message with a fresh one.
+    try:
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+        if pic and len(text) <= 1024:
+            await bot.send_photo(cq.message.chat.id, photo=pic, caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await bot.send_message(cq.message.chat.id, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:
+        dlog.error(f"[store_panel_send_FAIL] {e}", exc_info=True)
+
+
 @main_router.callback_query(F.data.startswith("st_glob_off_"))
 async def st_global_listings_cb(cq: CallbackQuery):
-    parts = cq.data.split("_")
-    uid = parts[3]
-    page = int(parts[4])
-    # Older buttons (from before categories existed) won't have a 6th part —
-    # fall back to "all" so they keep working instead of erroring out.
-    cat = parts[5] if len(parts) > 5 else "all"
-    if cat not in CATEGORY_MAP:
-        cat = "all"
+    try:
+        parts = cq.data.split("_")
+        uid = parts[3]
+        page = int(parts[4])
+        # Older buttons (from before categories existed) won't have a 6th part -
+        # fall back to "all" so they keep working instead of erroring out.
+        cat = parts[5] if len(parts) > 5 else "all"
+        if cat not in CATEGORY_MAP:
+            cat = "all"
+    except Exception:
+        await cq.answer("Invalid button.", show_alert=True)
+        return
     if not await verify_user(cq, uid): return
 
-    db = load_db()
-    offline_store = db.get("offline_store", {})
-
-    rarity_filter, _ = CATEGORY_MAP[cat]
-
-    # Build the category selector row. The active category is highlighted.
-    def cat_button(code: str) -> InlineKeyboardButton:
-        _, label = CATEGORY_MAP[code]
-        is_active = (code == cat)
-        return InlineKeyboardButton(
-            text=label,
-            callback_data=f"st_glob_off_{uid}_0_{code}",
-            style=ButtonStyle.SUCCESS if is_active else ButtonStyle.PRIMARY
-        )
-    selector_row = [cat_button("basic"), cat_button("elite")]
-    selector_row2 = [cat_button("divine"), cat_button("all")]
-
-    if not offline_store:
-        text = "<b>「 🌐 𝗚𝗟𝗢𝗕𝗔𝗟 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦 」</b>\n━━━━━━━━━━━━━━━━━\nNo active listings found in the Offline Store."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            selector_row,
-            selector_row2,
-            [InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)]
-        ])
-        try:
-            await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        except Exception:
-            await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        return
-
-    listings_list = list(offline_store.items())
-
-    # Filter by the selected rarity category (skip cards missing from the
-    # global card table rather than erroring, same as the render loop below).
-    if rarity_filter is not None:
-        filtered = []
-        for lid, data in listings_list:
-            card_data = db["global_cards"].get(data["card_id"])
-            if not card_data:
-                continue
-            if format_rarity(card_data["rarity"]) == rarity_filter:
-                filtered.append((lid, data))
-        listings_list = filtered
-
-    # Sorter: lowest price first
-    listings_list.sort(key=lambda x: x[1].get("price", 0))
-
-    per_page = 10
-    total = len(listings_list)
-    total_pages = max(1, (total - 1) // per_page + 1)
-    
-    if page >= total_pages: page = total_pages - 1
-    if page < 0: page = 0
-    
-    start = page * per_page
-    end = min(start + per_page, total)
-    sliced = listings_list[start:end]
-
-    _, cat_label = CATEGORY_MAP[cat]
-    text = f"<b>「 🌐 𝗚𝗟𝗢𝗕𝗔𝗟 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦 」</b>\n━━━━━━━━━━━━━━━━━\n"
-    text += f"<i>Category: {cat_label}</i>\n"
-    text += "<i>Click on a card name to view its post in the Offline GC:</i>\n\n"
-
-    if not sliced:
-        text += "<i>No active listings in this category.</i>\n"
-
-    for lid, data in sliced:
-        card_data = db["global_cards"].get(data["card_id"])
-        if not card_data: continue
-        rarity = format_rarity(card_data["rarity"])
-        seller_id = data["seller_id"]
-        seller_name = db["users"].get(seller_id, {}).get("name", "User")
-        
-        # Hyperlink configured to redirect specifically to the offline GC post
-        msg_id = data.get("msg_id")
-        gc_post_link = f"https://t.me/nexus_offstore/{msg_id}" if msg_id else "https://t.me/nexus_offstore"
-        text += f"• <a href='{gc_post_link}'>{card_data['name']}</a> [{rarity}] - <b>{data['price']} 💠</b> (by {seller_name})\n"
-        
-    text += f"\n━━━━━━━━━━━━━━━━━\nPage <b>{page+1}/{total_pages}</b>"
-    
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="❮", callback_data=f"st_glob_off_{uid}_{page-1}_{cat}"))
-    if end < total:
-        nav.append(InlineKeyboardButton(text="❯", callback_data=f"st_glob_off_{uid}_{page+1}_{cat}"))
-        
-    kb_list = [selector_row, selector_row2]
-    if nav:
-        kb_list.append(nav)
-    kb_list.append([InlineKeyboardButton(text="Back to Store", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_list)
-    
-    pic = db.get("settings", {}).get("pic_offline_store") or db.get("settings", {}).get("pic_store")
-    
+    # Answer immediately so the button never spins, whatever happens next.
     try:
-        if pic:
-            await cq.message.edit_media(InputMediaPhoto(media=pic, caption=text, parse_mode=ParseMode.HTML), reply_markup=kb)
-        else:
-            if cq.message.photo:
-                await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
-            else:
-                await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await cq.answer()
     except Exception:
         pass
-    await cq.answer()
+
+    try:
+        db = load_db()
+        offline_store = db.get("offline_store", {})
+        rarity_filter, cat_label = CATEGORY_MAP[cat]
+
+        def cat_button(code: str) -> InlineKeyboardButton:
+            _, label = CATEGORY_MAP[code]
+            return InlineKeyboardButton(
+                text=label,
+                callback_data=f"st_glob_off_{uid}_0_{code}",
+                style=ButtonStyle.SUCCESS if code == cat else ButtonStyle.PRIMARY
+            )
+        selector_row = [cat_button("basic"), cat_button("elite")]
+        selector_row2 = [cat_button("divine"), cat_button("all")]
+
+        pic = db.get("settings", {}).get("pic_offline_store") or db.get("settings", {}).get("pic_store")
+
+        if not offline_store:
+            text = "<b>「 🌐 𝗚𝗟𝗢𝗕𝗔𝗟 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦 」</b>\n━━━━━━━━━━━━━━━━━\nNo active listings found in the Offline Store."
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                selector_row, selector_row2,
+                [InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)]
+            ])
+            await _show_panel(cq, text, kb, pic)
+            return
+
+        listings_list = list(offline_store.items())
+
+        if rarity_filter is not None:
+            filtered = []
+            for lid, data in listings_list:
+                card_data = db["global_cards"].get(data["card_id"])
+                if not card_data:
+                    continue
+                if format_rarity(card_data["rarity"]) == rarity_filter:
+                    filtered.append((lid, data))
+            listings_list = filtered
+
+        # Sorter: lowest price first
+        listings_list.sort(key=lambda x: x[1].get("price", 0))
+
+        per_page = 10
+        total = len(listings_list)
+        total_pages = max(1, (total - 1) // per_page + 1)
+        if page >= total_pages: page = total_pages - 1
+        if page < 0: page = 0
+
+        start = page * per_page
+        end = min(start + per_page, total)
+        sliced = listings_list[start:end]
+
+        text = "<b>「 🌐 𝗚𝗟𝗢𝗕𝗔𝗟 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        text += f"Category: {html.escape(cat_label)}\n\n"
+
+        number_buttons = []
+        n = 0
+        idx = start
+        for lid, data in sliced:
+            card_data = db["global_cards"].get(data["card_id"])
+            if not card_data: continue
+            n += 1
+            idx += 1
+            rarity = format_rarity(card_data["rarity"])
+            msg_id = data.get("msg_id")
+            gc_post_link = f"https://t.me/nexus_offstore/{msg_id}" if msg_id else "https://t.me/nexus_offstore"
+            text += f"{idx}. <a href=\"{gc_post_link}\">{html.escape(str(card_data['name']))}</a> - {html.escape(rarity)}\n"
+            number_buttons.append(InlineKeyboardButton(text=str(idx), callback_data=f"buyoff_{uid}_{lid}", style=ButtonStyle.SUCCESS))
+
+        if n == 0:
+            text += "No active listings in this category.\n"
+
+        text += (
+            "\n<blockquote>Click on a card name to view its post in the "
+            "<a href=\"https://t.me/nexus_offstore\">Offline GC</a></blockquote>\n"
+        )
+        text += f"━━━━━━━━━━━━━━━━━\nPage <b>{page+1}/{total_pages}</b>"
+
+        kb_list = []
+        # Numbered buttons, four per row (1 2 3 4 / 5 6 7 8 / 9 10)
+        for i in range(0, len(number_buttons), 4):
+            kb_list.append(number_buttons[i:i+4])
+        kb_list.append(selector_row)
+        kb_list.append(selector_row2)
+
+        if total_pages > 1:
+            prev_btn = InlineKeyboardButton(text="❮ Prev", callback_data=f"st_glob_off_{uid}_{page-1}_{cat}") if page > 0 else InlineKeyboardButton(text="•", callback_data="noop")
+            page_btn = InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop")
+            next_btn = InlineKeyboardButton(text="Next ❯", callback_data=f"st_glob_off_{uid}_{page+1}_{cat}") if page < total_pages - 1 else InlineKeyboardButton(text="•", callback_data="noop")
+            kb_list.append([prev_btn, page_btn, next_btn])
+        kb_list.append([InlineKeyboardButton(text="Back to Store", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_list)
+
+        await _show_panel(cq, text, kb, pic)
+    except Exception as e:
+        dlog.error(f"[store_global_listings_CRASH] uid={uid}: {e}", exc_info=True)
+        try:
+            await cq.message.answer("Something went wrong opening the listings. Please try again.")
+        except Exception:
+            pass
 
 # ==========================================
 # REST API — used by the /webdeck Mini App's Store tab.
