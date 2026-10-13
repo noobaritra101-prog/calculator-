@@ -3170,11 +3170,11 @@ async def who_owns_cb(cq: CallbackQuery):
     # and (since shards were deducted first) the user was charged for a
     # list that never rendered. Text messages allow up to 4096 chars, so
     # paginate defensively at a much higher owner count instead.
-    OWNERS_PER_MSG = 80
-    # Names and amounts only — user IDs are never shown, to anyone.
+    OWNERS_PER_MSG = 50   # lower than before: each line now also carries a user ID
+    # Name, user ID (tap to copy) and amount.
     from html import escape as _esc
     owner_lines_all = [
-        f"{_esc(str(name))} - {amount}"
+        f"{_esc(str(name))} (<code>{_esc(str(uid))}</code>) - {amount}"
         for uid, name, amount in owners
     ]
 
