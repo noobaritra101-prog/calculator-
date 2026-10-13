@@ -919,14 +919,20 @@ async def confirm_sell_cb(cq: CallbackQuery):
         await cq.answer(f"Failed to list in group: {e}", show_alert=True)
 
 @main_router.callback_query(F.data.startswith("st_off_"))
-async def offline_listings_mgr(cq: CallbackQuery, uid: str = None):
+async def offline_listings_mgr(cq: CallbackQuery, uid: str = None, page: int = 0):
     if uid is None:
-        uid = cq.data.split("_")[2]
+        parts = cq.data.split("_")
+        uid = parts[2]
+        try:
+            page = int(parts[3]) if len(parts) > 3 else 0
+        except ValueError:
+            page = 0
     if not await verify_user(cq, uid): return
 
     db = load_db()
     my_listings = {lid: data for lid, data in db.get("offline_store", {}).items() if data["seller_id"] == uid}
-    
+    pic = db.get("settings", {}).get("pic_offline_store")
+
     if not my_listings:
         text = "<b>「 🛍️ 𝗠𝗬 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦  」</b>\n━━━━━━━━━━━━━━━━━\nYou currently have no active listings.\nUse <code>/sell &lt;card&gt; &lt;price&gt;</code> to list an item."
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -935,31 +941,46 @@ async def offline_listings_mgr(cq: CallbackQuery, uid: str = None):
             [InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)]
         ])
     else:
-        text = "<b>「 🛍️ 𝗠𝗬 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦  」</b>\n━━━━━━━━━━━━━━━━━\nSelect a listing to remove it and retrieve your card:\n\n"
+        items = list(my_listings.items())
+        per_page = 10
+        total = len(items)
+        total_pages = max(1, (total - 1) // per_page + 1)
+        page = max(0, min(page, total_pages - 1))
+        start = page * per_page
+        sliced = items[start:start + per_page]
+
+        text = "<b>「 🛍️ 𝗠𝗬 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦  」</b>\n━━━━━━━━━━━━━━━━━\nTap a number to remove that listing and get your card back:\n\n"
+        num_buttons = []
+        idx = start
+        for lid, data in sliced:
+            card_data = db["global_cards"].get(data["card_id"], {})
+            card_name = html.escape(str(card_data.get("name", "Unknown")))
+            rarity = html.escape(format_rarity(card_data["rarity"])) if card_data.get("rarity") else "Unknown"
+            msg_id = data.get("msg_id")
+            link = f"https://t.me/nexus_offstore/{msg_id}" if msg_id else "https://t.me/nexus_offstore"
+            idx += 1
+            text += f"{idx}. <a href=\"{link}\">{card_name}</a> - {rarity}\n"
+            num_buttons.append(InlineKeyboardButton(text=str(idx), callback_data=f"rm_list_{uid}_{lid}", style=ButtonStyle.DANGER))
+        text += f"\n━━━━━━━━━━━━━━━━━\nPage <b>{page+1}/{total_pages}</b>"
+
         buttons = []
-        for lid, data in my_listings.items():
-            card_name = db["global_cards"].get(data["card_id"], {}).get("name", "Unknown")
-            btn_text = f"Remove {card_name} ({data['price']} 💠)"
-            buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"rm_list_{uid}_{lid}", style=ButtonStyle.DANGER)])
-            
+        for i in range(0, len(num_buttons), 4):
+            buttons.append(num_buttons[i:i+4])
+        if total_pages > 1:
+            prev_btn = InlineKeyboardButton(text="❮ Prev", callback_data=f"st_off_{uid}_{page-1}") if page > 0 else InlineKeyboardButton(text="•", callback_data="noop")
+            page_btn = InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop")
+            next_btn = InlineKeyboardButton(text="Next ❯", callback_data=f"st_off_{uid}_{page+1}") if page < total_pages - 1 else InlineKeyboardButton(text="•", callback_data="noop")
+            buttons.append([prev_btn, page_btn, next_btn])
         buttons.append([InlineKeyboardButton(text="All Active Listings", callback_data=f"st_glob_off_{uid}_0_all", style=ButtonStyle.SUCCESS)])
         buttons.append([InlineKeyboardButton(text="🛍️ Oϝϝʅιɳҽ Sƚσɾҽ (GC)", url="https://t.me/nexus_offstore")])
         buttons.append([InlineKeyboardButton(text="Back", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    pic = db.get("settings", {}).get("pic_offline_store")
-    
+
+    await _show_panel(cq, text, kb, pic)
     try:
-        if pic:
-            await cq.message.edit_media(InputMediaPhoto(media=pic, caption=text, parse_mode=ParseMode.HTML), reply_markup=kb)
-        else:
-            if cq.message.photo:
-                await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
-            else:
-                await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await cq.answer()
     except Exception:
         pass
-    await cq.answer()
 
 @main_router.callback_query(F.data.startswith("rm_list_"))
 async def remove_listing_cb(cq: CallbackQuery):
@@ -1329,19 +1350,19 @@ async def st_global_listings_cb(cq: CallbackQuery):
         text = "<b>「 🌐 𝗚𝗟𝗢𝗕𝗔𝗟 𝗟𝗜𝗦𝗧𝗜𝗡𝗚𝗦 」</b>\n━━━━━━━━━━━━━━━━━\n"
         text += f"Category: {html.escape(cat_label)}\n\n"
 
-        number_buttons = []
         n = 0
-        idx = start
         for lid, data in sliced:
             card_data = db["global_cards"].get(data["card_id"])
             if not card_data: continue
             n += 1
-            idx += 1
             rarity = format_rarity(card_data["rarity"])
+            seller_id = data["seller_id"]
+            seller_name = html.escape(str(db["users"].get(seller_id, {}).get("name", "User")))
+
+            # Hyperlink configured to redirect specifically to the offline GC post
             msg_id = data.get("msg_id")
             gc_post_link = f"https://t.me/nexus_offstore/{msg_id}" if msg_id else "https://t.me/nexus_offstore"
-            text += f"{idx}. <a href=\"{gc_post_link}\">{html.escape(str(card_data['name']))}</a> - {html.escape(rarity)}\n"
-            number_buttons.append(InlineKeyboardButton(text=str(idx), callback_data=f"buyoff_{uid}_{lid}", style=ButtonStyle.SUCCESS))
+            text += f"• <a href=\"{gc_post_link}\">{html.escape(str(card_data['name']))}</a> [{html.escape(rarity)}] - <b>{data['price']} 💠</b> (by {seller_name})\n"
 
         if n == 0:
             text += "No active listings in this category.\n"
@@ -1352,18 +1373,15 @@ async def st_global_listings_cb(cq: CallbackQuery):
         )
         text += f"━━━━━━━━━━━━━━━━━\nPage <b>{page+1}/{total_pages}</b>"
 
-        kb_list = []
-        # Numbered buttons, four per row (1 2 3 4 / 5 6 7 8 / 9 10)
-        for i in range(0, len(number_buttons), 4):
-            kb_list.append(number_buttons[i:i+4])
-        kb_list.append(selector_row)
-        kb_list.append(selector_row2)
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="❮", callback_data=f"st_glob_off_{uid}_{page-1}_{cat}"))
+        if end < total:
+            nav.append(InlineKeyboardButton(text="❯", callback_data=f"st_glob_off_{uid}_{page+1}_{cat}"))
 
-        if total_pages > 1:
-            prev_btn = InlineKeyboardButton(text="❮ Prev", callback_data=f"st_glob_off_{uid}_{page-1}_{cat}") if page > 0 else InlineKeyboardButton(text="•", callback_data="noop")
-            page_btn = InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop")
-            next_btn = InlineKeyboardButton(text="Next ❯", callback_data=f"st_glob_off_{uid}_{page+1}_{cat}") if page < total_pages - 1 else InlineKeyboardButton(text="•", callback_data="noop")
-            kb_list.append([prev_btn, page_btn, next_btn])
+        kb_list = [selector_row, selector_row2]
+        if nav:
+            kb_list.append(nav)
         kb_list.append([InlineKeyboardButton(text="Back to Store", callback_data=f"st_main_{uid}", style=ButtonStyle.DANGER)])
         kb = InlineKeyboardMarkup(inline_keyboard=kb_list)
 
