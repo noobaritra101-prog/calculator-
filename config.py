@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
 
-# ==========================================
+# =========================================
 # CONFIGURATION
 # ==========================================
 # The bot token must come strictly from the environment, NEVER hardcoded in git.
