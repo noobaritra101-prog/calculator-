@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
 
-# =========================================
+# ==========================================
 # CONFIGURATION
 # ==========================================
 # The bot token must come strictly from the environment, NEVER hardcoded in git.
@@ -254,7 +254,20 @@ async def flush_db_now():
 
 
 
+_backup_lock = None
+
+
 async def perform_backup():
+    """Serialised: two overlapping backups would both write database.zip at once
+    and could leave a corrupt archive."""
+    global _backup_lock
+    if _backup_lock is None:
+        _backup_lock = asyncio.Lock()
+    async with _backup_lock:
+        await _perform_backup()
+
+
+async def _perform_backup():
     # Force flush both cached databases directly to disk before archiving
     await _async_flush_db(force=True)
     try:
@@ -265,11 +278,7 @@ async def perform_backup():
         
     try:
         chat = await bot.get_chat(DATABASE_BACKUP_ID)
-        if chat.pinned_message:
-            try:
-                await bot.delete_message(DATABASE_BACKUP_ID, chat.pinned_message.message_id)
-            except Exception:
-                pass
+        old_pinned_id = chat.pinned_message.message_id if chat.pinned_message else None
         
         # Package database.json, vlog.json, and the banners/ image folder into database.zip.
         # Banner template images live on disk (not inside database.json itself — see
@@ -298,6 +307,12 @@ async def perform_backup():
             caption=f"📦 Automated ZIP Backup\n📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
         await bot.pin_chat_message(DATABASE_BACKUP_ID, msg.message_id, disable_notification=True)
+        # Only now is the new backup safe, so the previous one can go.
+        if old_pinned_id and old_pinned_id != msg.message_id:
+            try:
+                await bot.delete_message(DATABASE_BACKUP_ID, old_pinned_id)
+            except Exception:
+                pass
         print("[BACKUP] Successfully backed up database.zip and pinned to backup group.")
     except Exception as e:
         print(f"[BACKUP] Task failed: {e}")

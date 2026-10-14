@@ -854,11 +854,13 @@ async def add_card(message: Message, command: CommandObject):
     )
 
     msg_id = None
+    log_warn = ""
     try: 
         msg = await bot.send_photo(DB_GROUP_ID, photo=file_id, caption=log_text, parse_mode=ParseMode.HTML)
         msg_id = msg.message_id
     except Exception as e: 
         print(f"[LOG_GROUP] Send failed: {e}")
+        log_warn = f"\n\n⚠️ <b>Saved, but NOT posted to the DB group:</b> <code>{_html_esc(str(e))}</code>"
 
     db["global_cards"][card_id] = {
         "name": char_name, "anime": anime_name, "rarity": formatted_rar,
@@ -871,7 +873,7 @@ async def add_card(message: Message, command: CommandObject):
         "ADD CARD", f"{char_name} [{anime_name}] ({formatted_rar}) — ID: {card_id}"
     )
 
-    await message.reply(log_text + "\n\n✅ Saved!", parse_mode=ParseMode.HTML)
+    await message.reply(log_text + "\n\n✅ Saved!" + log_warn, parse_mode=ParseMode.HTML)
 
 @main_router.message(Command("remove_card"))
 async def remove_card(message: Message, command: CommandObject):
@@ -1013,6 +1015,7 @@ async def edit_card(message: Message, command: CommandObject):
         "━━━━━━━━━━━━━━━━━━━"
     )
     
+    log_warn = ""
     msg_id = card_data.get("msg_id")
     if msg_id:
         try:
@@ -1031,8 +1034,10 @@ async def edit_card(message: Message, command: CommandObject):
                 )
         except Exception as e:
             print(f"[EDIT_CARD] Failed to update group message: {e}")
+            if "not modified" not in str(e).lower():
+                log_warn = f"\n\n⚠️ <b>DB group post not updated:</b> <code>{_html_esc(str(e))}</code>"
             
-    await message.reply(f"✅ Card <code>{card_id}</code> updated successfully!\n\n" + log_text, parse_mode=ParseMode.HTML)
+    await message.reply(f"✅ Card <code>{card_id}</code> updated successfully!\n\n" + log_text + log_warn, parse_mode=ParseMode.HTML)
 
 # ==========================================
 # /forcedrop IMPLEMENTATION

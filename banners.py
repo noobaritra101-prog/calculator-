@@ -21,6 +21,7 @@ they come alive as soon as this module is imported.
 Requires Pillow, numpy, and scipy (`pip install Pillow numpy scipy`).
 """
 import os
+import html
 import time
 import math
 import random
@@ -373,11 +374,13 @@ async def add_banner_cmd(message: Message, command: CommandObject):
     )
 
     msg_id = None
+    log_warn = ""
     try:
         msg = await bot.send_photo(DB_GROUP_ID, photo=file_id, caption=log_text, parse_mode=ParseMode.HTML)
         msg_id = msg.message_id
     except Exception as e:
         print(f"[LOG_GROUP] Banner send failed: {e}")
+        log_warn = f"\n\n<b>Not posted to the DB group:</b> <code>{html.escape(str(e))}</code>"
 
     banners_db[banner_id] = {
         "name": name,
@@ -395,7 +398,8 @@ async def add_banner_cmd(message: Message, command: CommandObject):
         f"ID: <code>{banner_id}</code>\n"
         f"Name: {name}\n"
         f"Detected circle: ~{int(circle['radius'] * 2)}px diameter\n\n"
-        f"Use <code>/set_default {banner_id}</code> to make it active for everyone's /profile.",
+        f"Use <code>/set_default {banner_id}</code> to make it active for everyone's /profile."
+        + log_warn,
         parse_mode=ParseMode.HTML
     )
 
@@ -537,6 +541,7 @@ async def edit_banner_cmd(message: Message, command: CommandObject):
         "━━━━━━━━━━━━━━━━━━━"
     )
 
+    log_warn = ""
     msg_id = meta.get("msg_id")
     if msg_id:
         try:
@@ -555,10 +560,13 @@ async def edit_banner_cmd(message: Message, command: CommandObject):
                 )
         except Exception as e:
             print(f"[EDIT_BANNER] Failed to update group log message: {e}")
+            if "not modified" not in str(e).lower():
+                log_warn = f"\n\n<b>DB group log not updated:</b> <code>{html.escape(str(e))}</code>"
 
     await message.reply(
         f"✅ Banner <code>{banner_id}</code> updated successfully!"
-        + (f"\n\n<b>Changes:</b> " + "; ".join(changes) if changes else "\n\n<i>No fields changed.</i>"),
+        + (f"\n\n<b>Changes:</b> " + "; ".join(changes) if changes else "\n\n<i>No fields changed.</i>")
+        + log_warn,
         parse_mode=ParseMode.HTML
     )
 

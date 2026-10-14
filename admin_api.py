@@ -38,19 +38,21 @@ from aiogram.types import (
 )
 from aiogram.filters import Command
 from aiogram.enums import ParseMode, ChatType
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramRetryAfter, TelegramAPIError, TelegramMigrateToChat, TelegramNetworkError,
+)
 
 import config
 from config import (
     bot, main_router, ADMIN_IDS, SUPREME_OWNER_ID, DB_GROUP_ID,
-    RARITIES, format_rarity, load_db, save_db, get_mention,
+    RARITIES, format_rarity, load_db, save_db, get_mention, perform_backup,
 )
 from deck import _chicken_verify_init_data      # Telegram initData HMAC check
 import a_handlers                                # eval safety check + admin log
 import vlog                                      # vault activity log storage
 
 # Where admin.html is hosted (same place as index.html / chicken.html).
-ADMIN_WEB_URL = "https://nexusanimemonarch.netlify.app/admin.html"
+ADMIN_WEB_URL = "https://animenexuss.netlify.app/admin.html"
 
 admin_api = APIRouter(prefix="/api/admin", tags=["Admin"])
 
@@ -97,6 +99,94 @@ def _sniff_image(b: bytes):
     return None
 
 
+# ------------------------------------------------------------------ telegram helpers
+_db_chat_id = DB_GROUP_ID       # follows a group -> supergroup migration at runtime
+_db_send_lock = None            # created lazily inside the running loop
+_db_last_send = 0.0
+DB_SEND_GAP = 3.2               # seconds between posts into the DB group (< 20/min)
+
+
+def _tg_hint(msg: str) -> str:
+    """Turns Telegram's terse error text into something an admin can act on."""
+    m = (msg or "").lower()
+    if "chat not found" in m:
+        return "chat not found. Check DB_GROUP_ID and make sure the bot was added to that chat."
+    if "not enough rights" in m or "have no rights" in m or "administrator rights" in m:
+        return "the bot has no permission to post there. Make it an admin with 'Post messages'."
+    if "kicked" in m or "not a member" in m or "forbidden" in m:
+        return "the bot was removed from that chat. Add it back as an admin."
+    if "thread" in m or "topic" in m:
+        return "topic problem. The chat is a forum and its topic is missing or closed."
+    return msg or "unknown error"
+
+
+def _tg_msg(e: Exception) -> str:
+    return getattr(e, "message", None) or str(e)
+
+
+async def _post_to_db_group(photo: bytes, filename: str, caption: str):
+    """send_photo to the DB group. Retries network blips and follows a group
+    that was upgraded to a supergroup (its chat id changes when that happens)."""
+    global _db_chat_id, _db_send_lock, _db_last_send
+    if _db_send_lock is None:
+        _db_send_lock = asyncio.Lock()
+    last = None
+    # One send at a time, spaced out: Telegram caps a group at ~20 messages/min,
+    # and a burst (or two admins uploading together) otherwise hits 429 errors.
+    async with _db_send_lock:
+        wait = DB_SEND_GAP - (time.monotonic() - _db_last_send)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            for attempt in range(3):
+                try:
+                    return await bot.send_photo(
+                        _db_chat_id,
+                        photo=BufferedInputFile(photo, filename=filename),
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramMigrateToChat as e:
+                    print(f"[ADMIN_API] DB group migrated: {_db_chat_id} -> {e.migrate_to_chat_id}. Update DB_GROUP_ID.")
+                    _db_chat_id = e.migrate_to_chat_id
+                    last = e
+                except TelegramNetworkError as e:
+                    last = e
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        finally:
+            _db_last_send = time.monotonic()
+    raise last
+
+
+# One backup per burst of uploads instead of one per card.
+_backup_deadline = 0.0
+_backup_task = None
+
+
+async def _backup_worker():
+    global _backup_task
+    try:
+        while True:
+            while time.time() < _backup_deadline:
+                await asyncio.sleep(max(0.5, _backup_deadline - time.time()))
+            started = time.time()
+            try:
+                await perform_backup()
+            except Exception as e:
+                print(f"[ADMIN_API] backup failed: {type(e).__name__}: {e}")
+            if _backup_deadline <= started:
+                break
+    finally:
+        _backup_task = None
+
+
+def _schedule_backup(delay: float = 20.0):
+    global _backup_deadline, _backup_task
+    _backup_deadline = time.time() + delay
+    if _backup_task is None or _backup_task.done():
+        _backup_task = asyncio.create_task(_backup_worker())
+
+
 # ------------------------------------------------------------------ meta
 @admin_api.get("/meta")
 async def meta(x_init_data: str = Header("")):
@@ -114,6 +204,44 @@ async def meta(x_init_data: str = Header("")):
         "rarities": list(RARITIES),
         "animes": [{"name": n, "count": c} for n, c in animes],
     }
+
+
+@admin_api.get("/diagnose")
+async def diagnose(x_init_data: str = Header("")):
+    """Checks that the bot can really post to the DB group and the backup chat."""
+    _require_admin(x_init_data)
+    me = await bot.get_me()
+    targets = [("DB group", _db_chat_id)]
+    backup_id = getattr(config, "DATABASE_BACKUP_ID", None)
+    if backup_id and backup_id != _db_chat_id:
+        targets.append(("Backup chat", backup_id))
+
+    out = []
+    for label, cid in targets:
+        row = {"label": label, "id": str(cid), "ok": False, "detail": ""}
+        try:
+            chat = await bot.get_chat(cid)
+            member = await bot.get_chat_member(cid, me.id)
+            st = member.status
+            row["title"] = chat.title or ""
+            if st in ("left", "kicked"):
+                row["detail"] = "The bot is not in this chat. Add it as an admin."
+            elif chat.type == "channel" and not (
+                st == "creator" or (st == "administrator" and getattr(member, "can_post_messages", False))
+            ):
+                row["detail"] = "The bot is in the channel but cannot post. Give it 'Post messages'."
+            elif st == "restricted" and not getattr(member, "can_send_photos", getattr(member, "can_send_messages", False)):
+                row["detail"] = "The bot is restricted from sending photos in this chat."
+            else:
+                row["ok"] = True
+        except TelegramMigrateToChat as e:
+            row["detail"] = f"This group was upgraded to a supergroup. Set its id to {e.migrate_to_chat_id}."
+        except TelegramAPIError as e:
+            row["detail"] = _tg_hint(_tg_msg(e))
+        except Exception as e:
+            row["detail"] = f"{type(e).__name__}"
+        out.append(row)
+    return {"chats": out}
 
 
 @admin_api.get("/cards/anime")
@@ -145,6 +273,16 @@ async def upload_card(
     x_upload_key: str = Header(""),
 ):
     """Adds ONE card. Body = raw image bytes (jpeg/png/webp). Same result as /add_card."""
+    try:
+        return await _upload_card(request, name, anime, rarity, force, x_init_data, x_upload_key)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({"detail": f"Server error ({type(e).__name__}): {e}"}, status_code=500)
+
+
+async def _upload_card(request, name, anime, rarity, force, x_init_data, x_upload_key):
     user = _require_admin(x_init_data)
 
     # Idempotency: a retry after a timeout must not create a second card.
@@ -188,7 +326,7 @@ async def upload_card(
         card_id = f"DB-{str(uuid.uuid4())[:6].upper()}"
 
     added_by = int(user["id"])
-    added_by_mention = get_mention(added_by, user.get("first_name", "Admin"))
+    added_by_mention = get_mention(added_by, html.escape(str(user.get("first_name", "Admin")), quote=False))
     log_text = (
         "<b>「 📥 DATABASE LOG : NEW CARD 」</b>\n"
         "━━━━━━━━━━━━━━━━━━━\n\n"
@@ -203,17 +341,17 @@ async def upload_card(
 
     # Uploading to the DB group is how we obtain a Telegram file_id.
     try:
-        msg = await bot.send_photo(
-            DB_GROUP_ID,
-            photo=BufferedInputFile(body, filename=f"{card_id}.{ext}"),
-            caption=log_text,
-            parse_mode=ParseMode.HTML,
-        )
+        msg = await _post_to_db_group(body, f"{card_id}.{ext}", log_text)
     except TelegramRetryAfter as e:
         return JSONResponse({"detail": "Telegram rate limit", "retry_after": int(e.retry_after)}, status_code=429)
+    except TelegramMigrateToChat as e:
+        raise HTTPException(502, f"The DB group was upgraded to a supergroup. Set DB_GROUP_ID to {e.migrate_to_chat_id}.")
+    except TelegramAPIError as e:
+        print(f"[ADMIN_API] send_photo failed: {type(e).__name__}: {_tg_msg(e)}")
+        raise HTTPException(502, f"Telegram refused the upload: {_tg_hint(_tg_msg(e))}")
     except Exception as e:
         print(f"[ADMIN_API] send_photo failed: {type(e).__name__}: {e}")
-        raise HTTPException(502, f"Telegram upload failed: {type(e).__name__}")
+        raise HTTPException(502, f"Upload to the DB group failed ({type(e).__name__}).")
 
     file_id = msg.photo[-1].file_id
     db = load_db()
@@ -226,7 +364,8 @@ async def upload_card(
     if x_upload_key:
         _recent_uploads[x_upload_key] = (time.time(), card_id)
     _log(user, "ADD CARD", f"{name} [{anime}] ({rar}) — ID: {card_id}")
-    return {"ok": True, "card_id": card_id}
+    _schedule_backup()      # pushes database.json to the backup chat once the burst ends
+    return {"ok": True, "card_id": card_id, "group": True, "backup": "queued"}
 
 
 # ------------------------------------------------------------------ eval (owner only)
