@@ -5,6 +5,9 @@ Routes (all under /api/admin, all require Telegram initData of an admin):
     GET  /meta                    rarities, anime list, is_owner flag
     GET  /cards/anime?name=       existing cards of an anime (duplicate check)
     POST /cards/upload            add ONE card (image bytes in body)
+    GET  /promos                  list promo (redeem) codes
+    POST /promos                  create a promo code
+    DELETE /promos/{code}         delete a promo code
     POST /eval                    run /eval code (SUPREME OWNER only)
     GET  /info/summary            totals + rarity breakdown
     GET  /info/users|groups       paginated / searchable lists
@@ -203,6 +206,7 @@ async def meta(x_init_data: str = Header("")):
         "is_owner": int(user["id"]) == SUPREME_OWNER_ID,
         "rarities": list(RARITIES),
         "animes": [{"name": n, "count": c} for n, c in animes],
+        "banners": _promo_banner_options(db),
     }
 
 
@@ -499,6 +503,134 @@ async def _upload_banner(request, name, make_default, x_init_data, x_upload_key)
     _schedule_backup()
     return {"ok": True, "banner_id": banner_id, "name": name,
             "diameter": int(circle["radius"] * 2), "default": bool(make_default)}
+
+
+# ------------------------------------------------------------------ promo / redeem codes
+def _promo_banner_options(db: dict) -> list:
+    """Banners that can be used as a promo reward (same rules as /add_promo)."""
+    default_id = db.get("settings", {}).get("default_banner_id")
+    out = []
+    for bid, b in db.get("banners", {}).items():
+        out.append({
+            "id": str(bid), "name": b.get("name", str(bid)),
+            "usable": bid != default_id and not b.get("drop_locked"),
+            "default": bid == default_id, "locked": bool(b.get("drop_locked")),
+        })
+    return out
+
+
+def _promo_view(code: str, p: dict) -> dict:
+    # Old-style promos stored a single reward at the top level instead of "rewards".
+    rewards = p.get("rewards")
+    if rewards is None:
+        if p.get("type") == "shards":
+            rewards = [{"type": "shards", "shards": p.get("shards", 0)}]
+        else:
+            rewards = [{"type": "card", "rarity": p.get("rarity"), "amount": p.get("amount", 1)}]
+    return {
+        "code": code,
+        "rewards": rewards,
+        "max_claims": _int(p.get("max_claims", 0)),
+        "claimed": len(p.get("claimed_by", [])),
+    }
+
+
+@admin_api.get("/promos")
+async def promos_list(x_init_data: str = Header("")):
+    _require_admin(x_init_data)
+    db = load_db()
+    items = [_promo_view(c, p) for c, p in db.get("promos", {}).items()]
+    return {"items": items, "total": len(items)}
+
+
+class PromoReward(BaseModel):
+    type: str
+    shards: int = 0
+    rarity: str = ""
+    amount: int = 1
+    banner_id: str = ""
+
+
+class PromoReq(BaseModel):
+    code: str
+    max_claims: int
+    rewards: list[PromoReward]
+
+
+@admin_api.post("/promos")
+async def promos_create(req: PromoReq, x_init_data: str = Header("")):
+    user = _require_admin(x_init_data)
+    code = req.code.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_\-]{2,32}", code):
+        raise HTTPException(400, "Code must be 2-32 characters: letters, numbers, - or _ (no spaces).")
+    if req.max_claims < 1 or req.max_claims > 1_000_000:
+        raise HTTPException(400, "Max claims must be between 1 and 1,000,000.")
+    if not req.rewards:
+        raise HTTPException(400, "Add at least one reward.")
+    if len(req.rewards) > 15:
+        raise HTTPException(400, "Too many rewards (max 15).")
+
+    db = load_db()
+    banners_pool = db.get("banners", {})
+    default_id = db.get("settings", {}).get("default_banner_id")
+    rewards = []
+    for r in req.rewards:
+        t = r.type.strip().lower()
+        if t == "shards":
+            if r.shards < 1:
+                raise HTTPException(400, "Shard amount must be at least 1.")
+            rewards.append({"type": "shards", "shards": int(r.shards)})
+        elif t == "card":
+            rar = _norm_rarity(r.rarity)
+            if not rar:
+                raise HTTPException(400, f"Invalid rarity: {r.rarity or '(empty)'}")
+            if r.amount < 1:
+                raise HTTPException(400, "Card quantity must be at least 1.")
+            rewards.append({"type": "card", "rarity": rar, "amount": int(r.amount)})
+        elif t == "banner":
+            if r.amount < 1:
+                raise HTTPException(400, "Banner quantity must be at least 1.")
+            target = (r.banner_id or "").strip().lower()
+            if target != "r":
+                if target not in banners_pool:
+                    raise HTTPException(400, f"No banner with ID {target or '(empty)'}.")
+                if target == default_id:
+                    raise HTTPException(400, "The default banner is free for everyone and can't be a promo reward.")
+                if banners_pool[target].get("drop_locked"):
+                    raise HTTPException(400, f"Banner {target} is locked from drops. Unlock it first or pick another.")
+            elif not [b for b, m in banners_pool.items() if b != default_id and not m.get("drop_locked")]:
+                raise HTTPException(400, "No non-default, unlocked banners exist to award randomly.")
+            rewards.append({"type": "banner", "amount": int(r.amount), "banner_id": target})
+        else:
+            raise HTTPException(400, f"Unknown reward type: {r.type}")
+
+    promos = db.setdefault("promos", {})
+    if code in promos:
+        raise HTTPException(409, f"Code {code} already exists. Delete it first to recreate it.")
+    promos[code] = {"rewards": rewards, "max_claims": int(req.max_claims), "claimed_by": []}
+    save_db()
+
+    _log(user, "ADD PROMO", f"{code} — max {req.max_claims} — " + ", ".join(
+        f"{x['shards']} shards" if x["type"] == "shards"
+        else f"{x['amount']}x {x['rarity']}" if x["type"] == "card"
+        else f"{x['amount']}x banner {x['banner_id']}" for x in rewards))
+    _schedule_backup()
+    return {"ok": True, "promo": _promo_view(code, promos[code])}
+
+
+@admin_api.delete("/promos/{code}")
+async def promos_delete(code: str, x_init_data: str = Header("")):
+    user = _require_admin(x_init_data)
+    code = code.strip().upper()
+    db = load_db()
+    promos = db.setdefault("promos", {})
+    if code not in promos:
+        raise HTTPException(404, f"Promo code {code} does not exist.")
+    del promos[code]
+    save_db()
+    _log(user, "DEL PROMO", code)
+    _schedule_backup()
+    return {"ok": True, "code": code}
 
 
 # ------------------------------------------------------------------ eval (owner only)
