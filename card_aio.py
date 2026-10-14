@@ -85,13 +85,14 @@ from config import (
 import handlers
 import deck
 import a_handlers
+import admin_api  # /admin command + admin Mini App API
 import vlog
 import store
 import market
 import mines
 import gcard
-import scramble # /scramble puzzle minigame
-import tree
+import scramble  # /scramble puzzle minigame
+import tree 
 
 from handlers import trigger_drop
 from market import market_engine_loop
@@ -99,6 +100,7 @@ from versus import active_versus, versus_router
 from vlog import vlog_cleanup_loop
 from mines import mines_router
 from deck import deck_api  # <--- IMPORT DECK API ROUTER
+from admin_api import admin_api  # <--- IMPORT ADMIN API ROUTER
 from store import store_api  # <--- IMPORT STORE API ROUTER
 
 
@@ -377,6 +379,7 @@ app.add_middleware(
 # Mount REST Routers
 app.include_router(mines_router)
 app.include_router(deck_api)  # <--- MOUNT DECK API ROUTER
+app.include_router(admin_api)  # <--- MOUNT ADMIN API ROUTER
 app.include_router(store_api)  # <--- MOUNT STORE API ROUTER
 app.include_router(versus_router)  # <--- MOUNT VERSUS WEB APP ROUTER
 
