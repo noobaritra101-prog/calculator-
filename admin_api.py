@@ -795,8 +795,89 @@ def _vlog_logs_for(user_id: str):
     return vlog.load_vlogs().get(user_id, [])
 
 
+# ---- vlog search ---------------------------------------------------------
+# Query language (all terms are ANDed; a leading "-" excludes):
+#   naruto               free text, matches title / card / people / chat / code / values
+#   "uzumaki naruto"     exact phrase
+#   card:naruto          card name           rarity:divine     rarity
+#   with:1234 / with:sam counterparty, buyer or seller (name or id)
+#   chat:anime           chat title or id    code:WELCOME      promo code
+#   symbol:xyz           stock symbol        type:burn         type, title or category
+#   amount>1000  >=500  <50k  =250   shard amount (k / m suffixes ok; bare ">500" works too)
+#   -gift                hide anything matching "gift"
+_Q_TOKEN = re.compile(r'(-?)(?:([A-Za-z]+)(:|>=|<=|>|<|=))?(?:"([^"]*)"|(\S+))')
+_Q_FIELDS = {
+    "card": ("Card", "Card earned"), "rarity": ("Rarity",),
+    "with": ("Counterparty", "Seller", "Buyer"), "chat": ("Chat",),
+    "code": ("Promo code",), "symbol": ("Symbol",),
+}
+
+
+def _qnum(txt):
+    t = str(txt or "").strip().lower().replace(",", "").replace("_", "")
+    mult = 1
+    if t.endswith("k"):
+        mult, t = 1_000, t[:-1]
+    elif t.endswith("m"):
+        mult, t = 1_000_000, t[:-1]
+    try:
+        return float(t) * mult
+    except ValueError:
+        return None
+
+
+def _parse_vlog_query(q: str):
+    terms = []
+    for m in _Q_TOKEN.finditer((q or "")[:200]):
+        neg, key, op, quoted, bare = m.groups()
+        val = (quoted if quoted is not None else (bare or "")).strip()
+        if not val:
+            continue
+        key = key.lower() if key else None
+        if key is None:
+            mm = re.fullmatch(r"(>=|<=|>|<|=)(.+)", val)
+            if mm and _qnum(mm.group(2)) is not None:
+                key, op, val = "amount", mm.group(1), mm.group(2)
+        elif key not in _Q_FIELDS and key not in ("amount", "type"):
+            # unknown "word:thing" -> just plain text
+            val, key, op = f"{key}{op}{val}", None, None
+        terms.append((bool(neg), key, op, val.lower()))
+    return terms
+
+
+def _vlog_match(v: dict, terms) -> bool:
+    hay = " ".join([v["title"], v["sub"], str(v["type"] or ""), v["cat"]]
+                   + [f"{k} {val}" for k, val in v["fields"]]).lower()
+    amt = abs(v["delta"])
+    for neg, key, op, val in terms:
+        if key == "amount":
+            n = _qnum(val)
+            if n is None:
+                ok = False
+            elif op in (">",):
+                ok = amt > n
+            elif op == ">=":
+                ok = amt >= n
+            elif op == "<":
+                ok = 0 < amt < n
+            elif op == "<=":
+                ok = 0 < amt <= n
+            else:
+                ok = amt == n
+        elif key in _Q_FIELDS:
+            ok = any(val in str(fv).lower() for fk, fv in v["fields"] if fk in _Q_FIELDS[key])
+        elif key == "type":
+            ok = val in str(v["type"] or "").lower() or val in v["title"].lower() or val in v["cat"]
+        else:
+            ok = val in hay
+        if ok == neg:
+            return False
+    return True
+
+
 @admin_api.get("/vlog/user/{user_id}")
-async def vlog_user(user_id: str, cat: str = "all", page: int = 0, x_init_data: str = Header("")):
+async def vlog_user(user_id: str, cat: str = "all", page: int = 0, q: str = "", dir: str = "all",
+                    days: int = 0, sort: str = "new", x_init_data: str = Header("")):
     user = _require_admin(x_init_data)
     logs = _vlog_logs_for(user_id)
     db = load_db()
@@ -813,8 +894,24 @@ async def vlog_user(user_id: str, cat: str = "all", page: int = 0, x_init_data: 
             outflow += -v["delta"]
 
     shown = views if cat in ("", "all") else [v for v in views if v["cat"] == cat]
+    if dir == "in":
+        shown = [v for v in shown if v["delta"] > 0]
+    elif dir == "out":
+        shown = [v for v in shown if v["delta"] < 0]
+    days = max(0, min(int(days or 0), 3650))
+    if days:
+        cutoff = time.time() - days * 86400
+        shown = [v for v in shown if v["ts"] >= cutoff]
+    terms = _parse_vlog_query(q)
+    if terms:
+        shown = [v for v in shown if _vlog_match(v, terms)]
+    if sort == "old":
+        shown = sorted(shown, key=lambda v: v["ts"])
+    elif sort == "big":
+        shown = sorted(shown, key=lambda v: (abs(v["delta"]), v["ts"]), reverse=True)
+
     items, page, pages, total = _page(shown, page, VLOG_PER_PAGE)
-    if page == 0:
+    if page == 0 and not terms and dir == "all" and not days:
         _log(user, "VLOG VIEW", f"user {user_id}")
     return {
         "user": {"id": user_id, "name": u.get("name") or "Unknown", "username": u.get("username"),
