@@ -368,6 +368,139 @@ async def _upload_card(request, name, anime, rarity, force, x_init_data, x_uploa
     return {"ok": True, "card_id": card_id, "group": True, "backup": "queued"}
 
 
+# ------------------------------------------------------------------ banner upload
+def _circle_of(src):
+    """Runs banners.detect_circle on a path or file-like object (blocking; call via to_thread)."""
+    from PIL import Image
+    import banners
+    img = Image.open(src)
+    img.load()
+    return banners.detect_circle(img)
+
+
+@admin_api.post("/banners/upload")
+async def upload_banner(
+    request: Request,
+    name: str,
+    make_default: int = 0,
+    x_init_data: str = Header(""),
+    x_upload_key: str = Header(""),
+):
+    """Adds ONE profile banner (same result as /ab). Body = raw image bytes."""
+    try:
+        return await _upload_banner(request, name, make_default, x_init_data, x_upload_key)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse({"detail": f"Server error ({type(e).__name__}): {e}"}, status_code=500)
+
+
+async def _upload_banner(request, name, make_default, x_init_data, x_upload_key):
+    import banners
+    user = _require_admin(x_init_data)
+
+    key = ("banner:" + x_upload_key) if x_upload_key else ""
+    if key and key in _recent_uploads:
+        return {"ok": True, "banner_id": _recent_uploads[key][1], "repeat": True}
+
+    name = name.strip()
+    if not name or len(name) > 60:
+        raise HTTPException(400, "Banner name is required (max 60 characters).")
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "Empty image.")
+    if len(body) > MAX_IMAGE_BYTES:
+        raise HTTPException(413, "Image over 10 MB.")
+    ext = _sniff_image(body)
+    if not ext:
+        raise HTTPException(415, "Only JPEG, PNG or WEBP images are supported.")
+
+    no_circle = ("Couldn't find a white circle placeholder in that image. It needs one solid, "
+                 "roughly-circular pure-white area for the profile picture to go into.")
+
+    # Cheap early check on the original, so a bad template never gets posted to the DB group.
+    try:
+        pre = await asyncio.to_thread(_circle_of, io.BytesIO(body))
+    except Exception:
+        raise HTTPException(415, "Couldn't read that image.")
+    if not pre:
+        raise HTTPException(422, no_circle)
+
+    added_by = int(user["id"])
+    added_by_mention = get_mention(added_by, html.escape(str(user.get("first_name", "Admin")), quote=False))
+    log_text = (
+        "<b>「 📥 DATABASE LOG : NEW BANNER 」</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "<blockquote><i>A new profile banner template has been registered globally.</i></blockquote>\n\n"
+        f"• 🏷️ <b>Name:</b> <b>{html.escape(name)}</b>\n"
+        f"• ⭕ <b>Circle:</b> ~{int(pre['radius'] * 2)}px diameter\n"
+        f"• — <b>Added By:</b> {added_by_mention}\n"
+        "━━━━━━━━━━━━━━━━━━━"
+    )
+
+    try:
+        msg = await _post_to_db_group(body, f"banner.{ext}", log_text)
+    except TelegramRetryAfter as e:
+        return JSONResponse({"detail": "Telegram rate limit", "retry_after": int(e.retry_after)}, status_code=429)
+    except TelegramMigrateToChat as e:
+        raise HTTPException(502, f"The DB group was upgraded to a supergroup. Set DB_GROUP_ID to {e.migrate_to_chat_id}.")
+    except TelegramAPIError as e:
+        print(f"[ADMIN_API] banner send_photo failed: {type(e).__name__}: {_tg_msg(e)}")
+        raise HTTPException(502, f"Telegram refused the upload: {_tg_hint(_tg_msg(e))}")
+    except Exception as e:
+        print(f"[ADMIN_API] banner send_photo failed: {type(e).__name__}: {e}")
+        raise HTTPException(502, f"Upload to the DB group failed ({type(e).__name__}).")
+
+    # Telegram re-encodes/downsizes photos. Save THAT copy (what /ab does and what
+    # ensure_banner_file() restores later) and measure the circle on it.
+    file_id = msg.photo[-1].file_id
+    os.makedirs(banners.BANNERS_DIR, exist_ok=True)
+    tmp_path = os.path.join(banners.BANNERS_DIR, f"tmp_{uuid.uuid4().hex[:8]}.png")
+    circle = None
+    try:
+        await bot.download(file_id, destination=tmp_path)
+        circle = await asyncio.to_thread(_circle_of, tmp_path)
+    except Exception as e:
+        print(f"[ADMIN_API] banner download/detect failed: {type(e).__name__}: {e}")
+    if not circle:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        try:
+            await bot.delete_message(_db_chat_id, msg.message_id)
+        except Exception:
+            pass
+        raise HTTPException(422, no_circle)
+
+    # No awaits from here to save_db(): the new id can't be taken by a parallel upload.
+    db = load_db()
+    banner_id = banners.next_banner_id(db)
+    file_path = os.path.join(banners.BANNERS_DIR, f"{banner_id}.png")
+    os.replace(tmp_path, file_path)
+    db.setdefault("banners", {})[banner_id] = {
+        "name": name,
+        "file_path": file_path,
+        "file_id": file_id,
+        "circle": circle,
+        "msg_id": msg.message_id,
+        "added_by": str(added_by),
+        "added_at": int(time.time()),
+    }
+    if make_default:
+        db.setdefault("settings", {})["default_banner_id"] = banner_id
+    save_db()
+
+    if key:
+        _recent_uploads[key] = (time.time(), banner_id)
+    _log(user, "ADD BANNER", f"{name} — ID: {banner_id}" + (" (set as default)" if make_default else ""))
+    _schedule_backup()
+    return {"ok": True, "banner_id": banner_id, "name": name,
+            "diameter": int(circle["radius"] * 2), "default": bool(make_default)}
+
+
 # ------------------------------------------------------------------ eval (owner only)
 class EvalReq(BaseModel):
     code: str
