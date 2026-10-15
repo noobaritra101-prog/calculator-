@@ -1,3 +1,4 @@
+import re
 import math
 import time
 import uuid
@@ -41,11 +42,12 @@ user_mine_cooldowns = {}
 _action_cooldowns: dict[str, float] = {}
 ACTION_COOLDOWN_SECS = 8
 
+# /throw result delay in seconds (0 = instant). /roll keeps the full dice animation.
+THROW_RESULT_DELAY = 0
+
 # # Gifting limit configuration
-GIFT_COOLDOWN = 300           # 5-minute cooldown between gifts for regular users
 DAILY_GIFT_SEND_LIMIT = 4     # Maximum cards a user can send per day
 DAILY_GIFT_RECEIVE_LIMIT = 4  # Maximum cards a user can receive per day
-_gift_cooldowns: dict[str, float] = {}
 
 # Shards transfer cooldown tracking
 _sgive_cooldowns: dict[str, float] = {}
@@ -124,16 +126,32 @@ def _ratio_if(a: str, b: str, th: float) -> float:
     return r if r >= th else 0.0
 
 
+DAILY_BASE_REWARD  = 150
+DAILY_BIO_BONUS    = 150
+WEEKLY_BASE_REWARD = 500
+WEEKLY_BIO_BONUS   = 300
+
+_bot_username_cache: str = ""
+
+async def _bot_tag() -> str:
+    """'@username' of this bot (cached)."""
+    global _bot_username_cache
+    if not _bot_username_cache:
+        _bot_username_cache = (await bot.me()).username or ""
+    return f"@{_bot_username_cache}"
+
+
 async def has_bot_in_bio(user_id: int) -> bool:
+    """True if the bot's @username appears in the user's Telegram bio.
+    Matches whole usernames only (so @MyBot doesn't match @MyBot_2) and logs failures."""
     try:
-        bot_info = await bot.me()
-        bot_username = f"@{bot_info.username}".lower()
-        user_chat = await bot.get_chat(user_id)
-        if user_chat.bio:
-            return bot_username in user_chat.bio.lower()
-    except Exception:
-        pass
-    return False
+        tag  = (await _bot_tag()).lower()
+        chat = await bot.get_chat(user_id)
+        bio  = (getattr(chat, "bio", None) or "").lower()
+        return re.search(rf"(?<![a-z0-9_]){re.escape(tag)}(?![a-z0-9_])", bio) is not None
+    except Exception as e:
+        print(f"[has_bot_in_bio] failed for {user_id}: {e!r}")
+        return False
 
 # ==========================================
 # ANTI-CHEAT REFERRAL CONVERSION ENGINE
@@ -242,19 +260,17 @@ async def daily_reward_cmd(message: Message):
 
     user_id = str(uid_int)
 
-    # Serialize per-user so rapid-fire /daily spam can't slip multiple
-    # claims through before last_daily is saved — has_bot_in_bio() below
-    # awaits a Telegram call, which yields control long enough for a second
-    # /daily to sneak past the "already claimed today?" check otherwise.
+    # Serialize per-user so rapid-fire /daily spam can't slip multiple claims through.
     lock = _daily_locks.setdefault(user_id, asyncio.Lock())
     if lock.locked():
         return
     async with lock:
         db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
+        user = db["users"][user_id]
 
         now_dt     = datetime.now(timezone.utc)
         today_date = now_dt.date()
-        last_claim = db["users"][user_id].get("last_daily", 0)
+        last_claim = user.get("last_daily", 0)
         last_date  = datetime.fromtimestamp(last_claim, tz=timezone.utc).date() if last_claim else None
 
         if last_date == today_date:
@@ -265,38 +281,68 @@ async def daily_reward_cmd(message: Message):
             await message.reply(f"⏳ <b>Daily already claimed!</b>\nResets at midnight UTC — return in <b>{h}h {m}m</b>.", parse_mode=ParseMode.HTML)
             return
 
-        # Mark claimed and save BEFORE the bio-bonus check below, which awaits
-        # a Telegram API call — closing the race at its source, not just
-        # relying on the lock (a restart mid-await would otherwise still let
-        # a second process claim before this save happened).
-        db["users"][user_id]["last_daily"] = int(now_dt.timestamp())
+        # Base reward is paid and saved BEFORE the bio check (it awaits Telegram),
+        # so a restart / spam mid-await can never double-claim.
+        claim_ts = int(now_dt.timestamp())
+        user["last_daily"]    = claim_ts
+        user["nexus_shards"]  = user.get("nexus_shards", 0) + DAILY_BASE_REWARD
+        user["daily_bio_for"] = 0
         save_db()
 
-        bio_bonus    = await has_bot_in_bio(uid_int)
-        base_reward  = 150
-        bonus_reward = 150 if bio_bonus else 0
-        total_reward = base_reward + bonus_reward
-
-        db["users"][user_id]["nexus_shards"] = db["users"][user_id].get("nexus_shards", 0) + total_reward
-        save_db()
-
-        msg = (
-            "<b>「 💠 DAILY SHARDS CLAIMED ぁ 」</b>\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"٠࣪⭑ Daily Reward  <b>+{base_reward} Shards</b>\n"
-        )
+        # Bio bonus is paid at most once per claim.
+        bio_bonus = await has_bot_in_bio(uid_int)
         if bio_bonus:
-            msg += f"⟡ ݁₊ . Bio Bonus  <b>+{bonus_reward} Shards</b> (Bot username verified!)\n"
-        else:
-            msg += "💡 <i>Tip: Put our bot username in your profile Bio for an extra +100 Shards daily!</i>\n"
-        msg += f"━━━━━━━━━━━━━━━━━\n── Total Claimed <b>+{total_reward} Shards 💠</b>"
-        await message.reply(msg, parse_mode=ParseMode.HTML)
+            user["nexus_shards"] += DAILY_BIO_BONUS
+            user["daily_bio_for"] = claim_ts
+            save_db()
+
+        await message.reply(
+            await _daily_text(bio_bonus),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_bio_kb("daily", user_id, bio_bonus),
+        )
+
+
+async def _daily_text(bio_bonus: bool) -> str:
+    bonus = DAILY_BIO_BONUS if bio_bonus else 0
+    msg = (
+        "<b>「 💠 DAILY SHARDS CLAIMED ぁ 」</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"٠࣪⭑ Daily Reward  <b>+{DAILY_BASE_REWARD} Shards</b>\n"
+    )
+    if bio_bonus:
+        msg += f"⟡ ݁₊ . Bio Bonus  <b>+{bonus} Shards</b> (Bot username verified!)\n"
+    else:
+        tag = await _bot_tag()
+        msg += (f"💡 <i>Add <code>{tag}</code> to your Bio, then tap "
+                f"<b>Check Again</b> for +{DAILY_BIO_BONUS} Shards!</i>\n")
+    msg += f"━━━━━━━━━━━━━━━━━\n── Total Claimed <b>+{DAILY_BASE_REWARD + bonus} Shards 💠</b>"
+    return msg
 
 
 # ==========================================
 # WEEKLY REWARDS CLAIM SYSTEM (/weekly)
 # ==========================================
 _weekly_locks: dict[str, asyncio.Lock] = {}
+
+def _weekly_caption(card_data: dict, bio_bonus: bool, balance: int, tag: str) -> str:
+    display_rarity = format_rarity(card_data["rarity"])
+    bonus_line = f" +{WEEKLY_BIO_BONUS} Shards" if bio_bonus else " "
+    msg = (
+        "<b>「 💠 WEEKLY CLAIM REWARDS ぁ 」</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"<b>Card :</b> {card_data['name']}<b>〔{display_rarity}〕</b>\n"
+        f"<b>Anime : </b> {card_data.get('anime', 'Unknown')}\n"
+        f"<b>Base Shards : </b> +{WEEKLY_BASE_REWARD} Shards 💠[<b>Bio Bonus:</b>{bonus_line}]\n"
+    )
+    if not bio_bonus:
+        msg += f"<b>Note : </b> Add <code>{tag}</code> to your Bio, then tap <b>Check Again</b> for +{WEEKLY_BIO_BONUS} Shards.\n"
+    msg += (
+        "━━━━━━━━━━━━━━━━━\n"
+        f"<blockquote><b>Total Balance </b>: {balance} Shards 💠</blockquote>"
+    )
+    return msg
+
 
 @main_router.message(Command("weekly"))
 async def weekly_reward_cmd(message: Message):
@@ -305,17 +351,15 @@ async def weekly_reward_cmd(message: Message):
 
     user_id = str(uid_int)
 
-    # Serialize per-user so rapid-fire /weekly spam can't slip multiple
-    # claims through before the cooldown timestamp is saved.
     lock = _weekly_locks.setdefault(user_id, asyncio.Lock())
     if lock.locked():
         return
     async with lock:
         db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
 
-        now       = int(time.time())
+        now        = int(time.time())
         last_claim = db["users"][user_id].get("last_weekly", 0)
-        cooldown  = 7 * 24 * 3600
+        cooldown   = 7 * 24 * 3600
 
         if now - last_claim < cooldown:
             rem  = cooldown - (now - last_claim)
@@ -340,18 +384,20 @@ async def weekly_reward_cmd(message: Message):
         card_id, card_data = random.choice(list(tier_pool.items()))
 
         bio_bonus    = await has_bot_in_bio(uid_int)
-        base_reward  = 500
-        bonus_reward = 300 if bio_bonus else 0
-        total_reward = base_reward + bonus_reward
+        bonus_reward = WEEKLY_BIO_BONUS if bio_bonus else 0
+        total_reward = WEEKLY_BASE_REWARD + bonus_reward
 
-        db["users"][user_id]["nexus_shards"] = db["users"][user_id].get("nexus_shards", 0) + total_reward
-        db["users"][user_id]["last_weekly"]  = now
+        user = db["users"][user_id]
+        user["nexus_shards"]    = user.get("nexus_shards", 0) + total_reward
+        user["last_weekly"]     = now
+        user["weekly_card_id"]  = card_id
+        user["weekly_bio_for"]  = now if bio_bonus else 0
 
-        user_cards = db["users"][user_id].setdefault("cards", {})
+        user_cards = user.setdefault("cards", {})
         if card_id not in user_cards:
             user_cards[card_id] = {"name": card_data["name"], "rarity": card_data["rarity"], "amount": 0}
         user_cards[card_id]["amount"] += 1
-        db["users"][user_id]["total_claimed"] = db["users"][user_id].get("total_claimed", 0) + 1
+        user["total_claimed"] = user.get("total_claimed", 0) + 1
         save_db()
 
         log_action(db, user_id, {
@@ -362,25 +408,113 @@ async def weekly_reward_cmd(message: Message):
             "chat_title": message.chat.title or message.chat.first_name or "DM"
         })
 
-        display_rarity = format_rarity(card_data["rarity"])
-        bonus_line = f" +{bonus_reward} Shards" if bio_bonus else " "
-        msg = (
-            "<b>「 💠 WEEKLY CLAIM REWARDS ぁ 」</b>\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"<b>Card :</b> {card_data['name']}<b>〔{display_rarity}〕</b>\n"
-            f"<b>Anime : </b> {card_data.get('anime', 'Unknown')}\n"
-            f"<b>Base Shards : </b> +{base_reward} Shards 💠[<b>Bio Bonus:</b>{bonus_line}]\n"
-        )
-        if not bio_bonus:
-            msg += f"<b>Note : </b> Add bot Usernames (@Animenx_bot) to your Bio To get Bonus .\n"
-        msg += (
-            "━━━━━━━━━━━━━━━━━\n"
-            f"<blockquote><b>Total Balance </b>: {db['users'][user_id]['nexus_shards']} Shards 💠</blockquote>"
-        )
+        msg = _weekly_caption(card_data, bio_bonus, user["nexus_shards"], await _bot_tag())
+        kb  = _bio_kb("weekly", user_id, bio_bonus)
         try:
-            await message.reply_photo(photo=card_data["file_id"], caption=msg, parse_mode=ParseMode.HTML, has_spoiler=True)
+            await message.reply_photo(photo=card_data["file_id"], caption=msg, parse_mode=ParseMode.HTML,
+                                      has_spoiler=True, reply_markup=kb)
         except Exception:
-            await message.reply(msg, parse_mode=ParseMode.HTML)
+            await message.reply(msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ==========================================
+# BIO BONUS — [Check Again] / [Verified] BUTTONS (daily + weekly)
+# ==========================================
+_bio_locks: dict[str, asyncio.Lock] = {}
+
+def _styled_btn(text: str, callback_data: str, style: str) -> InlineKeyboardButton:
+    """Coloured inline button (Bot API 9.4+: style = danger / success / primary).
+    Falls back to a plain button if the installed aiogram doesn't know `style`."""
+    try:
+        return InlineKeyboardButton(text=text, callback_data=callback_data, style=style)
+    except Exception:
+        return InlineKeyboardButton(text=text, callback_data=callback_data)
+
+def _bio_kb(kind: str, user_id: str, verified: bool) -> InlineKeyboardMarkup:
+    if verified:
+        btn = _styled_btn("Verified", f"bio_ok|{kind}|{user_id}", "success")
+    else:
+        btn = _styled_btn("Check Again", f"bio_chk|{kind}|{user_id}", "danger")
+    return InlineKeyboardMarkup(inline_keyboard=[[btn]])
+
+
+@main_router.callback_query(F.data.startswith("bio_ok|"))
+async def bio_verified_cb(cq: CallbackQuery):
+    parts = cq.data.split("|")
+    if len(parts) != 3 or str(cq.from_user.id) != parts[2]:
+        await cq.answer("This button is not for you!", show_alert=True)
+        return
+    await cq.answer("✅ Bio bonus already verified!")
+
+
+@main_router.callback_query(F.data.startswith("bio_chk|"))
+async def bio_check_again_cb(cq: CallbackQuery):
+    parts = cq.data.split("|")
+    if len(parts) != 3:
+        await cq.answer()
+        return
+    _, kind, owner = parts
+    if str(cq.from_user.id) != owner:
+        await cq.answer("This button is not for you!", show_alert=True)
+        return
+
+    lock = _bio_locks.setdefault(owner, asyncio.Lock())
+    if lock.locked():
+        await cq.answer()
+        return
+    async with lock:
+        db   = ensure_user(owner, cq.from_user.first_name, cq.from_user.username)
+        user = db["users"][owner]
+        now  = int(time.time())
+
+        if kind == "daily":
+            claim_ts = user.get("last_daily", 0)
+            today    = datetime.now(timezone.utc).date()
+            valid    = bool(claim_ts) and datetime.fromtimestamp(claim_ts, tz=timezone.utc).date() == today
+            done_key, bonus = "daily_bio_for", DAILY_BIO_BONUS
+        else:
+            claim_ts = user.get("last_weekly", 0)
+            valid    = bool(claim_ts) and (now - claim_ts) < 7 * 24 * 3600
+            done_key, bonus = "weekly_bio_for", WEEKLY_BIO_BONUS
+
+        if not valid:
+            await cq.answer("⌛ This claim has expired. Claim again to get a new bonus check.", show_alert=True)
+            return
+
+        already = user.get(done_key, 0) == claim_ts
+        if not already:
+            if not await has_bot_in_bio(cq.from_user.id):
+                tag = await _bot_tag()
+                await cq.answer(f"❌ {tag} not found in your Bio!\nAdd it, save, then tap Check Again.", show_alert=True)
+                return
+            user["nexus_shards"] = user.get("nexus_shards", 0) + bonus
+            user[done_key] = claim_ts
+            save_db()
+            log_action(db, owner, {
+                "type": f"{kind}_bio_bonus",
+                "amount": bonus,
+                "chat_id": cq.message.chat.id if cq.message else 0,
+                "chat_title": (cq.message.chat.title or cq.message.chat.first_name or "DM") if cq.message else "DM",
+            })
+
+        # Rebuild the claim message with the bonus + a green [Verified] button.
+        kb = _bio_kb(kind, owner, True)
+        try:
+            if kind == "daily":
+                await cq.message.edit_text(await _daily_text(True), parse_mode=ParseMode.HTML, reply_markup=kb)
+            else:
+                card = db.get("global_cards", {}).get(user.get("weekly_card_id", ""))
+                if card:
+                    cap = _weekly_caption(card, True, user["nexus_shards"], await _bot_tag())
+                    if cq.message.photo:
+                        await cq.message.edit_caption(caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                    else:
+                        await cq.message.edit_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                else:
+                    await cq.message.edit_reply_markup(reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+        await cq.answer(f"✅ Verified! +{bonus} Shards added." if not already else "✅ Already verified!", show_alert=not already)
 
 
 # ==========================================
@@ -424,7 +558,7 @@ async def bowling_roll_cmd(message: Message):
     save_db()
 
     try:
-        dice_msg = await message.answer_dice(emoji="🎳")
+        dice_msg = await message.reply_dice(emoji="🎳")
     except (TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest):
         return
     await asyncio.sleep(4)
@@ -503,10 +637,11 @@ async def basketball_throw_cmd(message: Message):
     save_db()
 
     try:
-        dice_msg = await message.answer_dice(emoji="🏀")
+        dice_msg = await message.reply_dice(emoji="🏀")
     except (TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest):
         return
-    await asyncio.sleep(4)
+    if THROW_RESULT_DELAY:
+        await asyncio.sleep(THROW_RESULT_DELAY)
 
     shards_won = 0
     if dice_msg.dice.value >= 4:
@@ -1113,19 +1248,6 @@ async def gift_cmd(message: Message, command: CommandObject):
     user_id   = str(message.from_user.id)
     target_id = str(target_user.id)
 
-    # Cooldown check (non-admins)
-    now = time.time()
-    if uid_int not in ADMIN_IDS:
-        last_gift = _gift_cooldowns.get(user_id, 0)
-        if now - last_gift < GIFT_COOLDOWN:
-            rem  = int(GIFT_COOLDOWN - (now - last_gift))
-            m, s = divmod(rem, 60)
-            await message.reply(
-                f"⏳ <b>Gift cooldown active!</b>\nYou can gift another card in <b>{m}m {s}s</b>.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
     db = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
     db = ensure_user(target_id, target_user.first_name, target_user.username)
 
@@ -1244,15 +1366,7 @@ async def confirm_gift_cb(cq: CallbackQuery):
         await cq.answer("This menu is not for you!", show_alert=True)
         return
 
-    # Double check cooldown before processing gift (non-admins)
     now = time.time()
-    if uid_int not in ADMIN_IDS:
-        last_gift = _gift_cooldowns.get(user_id, 0)
-        if now - last_gift < GIFT_COOLDOWN:
-            rem  = int(GIFT_COOLDOWN - (now - last_gift))
-            m, s = divmod(rem, 60)
-            await cq.answer(f"⏳ Cooldown active! Wait {m}m {s}s.", show_alert=True)
-            return
 
     db = load_db()
 
@@ -1321,10 +1435,6 @@ async def confirm_gift_cb(cq: CallbackQuery):
         target_cards[card_id] = {"name": card_data["name"], "rarity": card_data["rarity"], "amount": 0}
     target_cards[card_id]["amount"] += 1
 
-    # Record limit parameters on successful execution (Cooldown is only for regular users)
-    if uid_int not in ADMIN_IDS:
-        _gift_cooldowns[user_id] = now
-        
     # We now increment parameters for both admins and regular users to show accurate visual tracking
     sender_gift_data["sent"] += 1
     receiver_gift_data["received"] += 1
