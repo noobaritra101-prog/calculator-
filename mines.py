@@ -9,6 +9,8 @@ from urllib.parse import parse_qsl
 from datetime import date
 from typing import Dict, Any
 
+from html import escape as _html_esc
+from aiogram import F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode
@@ -16,7 +18,7 @@ from aiogram.enums import ParseMode
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from config import main_router, load_db, save_db, ensure_user, ADMIN_IDS
+from config import main_router, load_db, save_db, ensure_user, ADMIN_IDS, is_ghost_banned, is_shadow_banned
 from vlog import log_action
 
 # ==========================================
@@ -51,6 +53,16 @@ active_games: dict = {}
 # Telegram Mini App auth. Set BOT_TOKEN in your environment to enforce it.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 INITDATA_MAX_AGE = 86400
+
+
+def _record_win(user: dict, bet: int, payout: int, mult: float) -> None:
+    """Per-user Mines stats used by /mines_lbd (biggest win, best multiplier, win count)."""
+    user["mines_wins"] = user.get("mines_wins", 0) + 1
+    profit = payout - bet
+    if profit > user.get("mines_best_win", 0):
+        user["mines_best_win"] = profit
+    if mult > user.get("mines_best_mult", 0):
+        user["mines_best_mult"] = round(float(mult), 2)
 
 
 def verify_init_data(init_data: str, uid: str) -> None:
@@ -336,6 +348,7 @@ async def api_start_game(req: StartGameReq):
 
     user_data["nexus_shards"] -= req.bet
     user_data["mines_bet"] = user_data.get("mines_bet", 0) + req.bet
+    user_data["mines_games"] = user_data.get("mines_games", 0) + 1
 
     global_stats = db.setdefault("mines_global", {})
     global_stats["total_bet"] = global_stats.get("total_bet", 0) + req.bet
@@ -416,6 +429,7 @@ async def api_reveal_tile(req: RevealTileReq):
 
             db["users"][uid]["nexus_shards"] = db["users"][uid].get("nexus_shards", 0) + payout
             db["users"][uid]["mines_won"] = db["users"][uid].get("mines_won", 0) + payout
+            _record_win(db["users"][uid], game["bet"], payout, current_mult)
 
             global_stats = db.setdefault("mines_global", {})
             global_stats["total_won"] = global_stats.get("total_won", 0) + net_profit_round
@@ -478,6 +492,7 @@ async def api_cashout(req: CashoutReq):
         db = load_db()
         db["users"][uid]["nexus_shards"] = db["users"][uid].get("nexus_shards", 0) + payout
         db["users"][uid]["mines_won"] = db["users"][uid].get("mines_won", 0) + payout
+        _record_win(db["users"][uid], game["bet"], payout, current_mult)
 
         global_stats = db.setdefault("mines_global", {})
         global_stats["total_won"] = global_stats.get("total_won", 0) + net_profit_round
@@ -513,16 +528,18 @@ async def webmine_cmd(message: Message):
     db = load_db()
     ensure_user(uid, message.from_user.first_name, message.from_user.username)
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💣 Open Mines Mini App",
-                    url="http://t.me/Animenx_bot/webmine"
-                )
-            ]
-        ]
-    )
+    try:   # primary (blue) style needs a recent aiogram; fall back to a plain button
+        web_btn = InlineKeyboardButton(
+            text="Open Mines Mini App",
+            url="http://t.me/Animenx_bot/webmine",
+            style="primary"
+        )
+    except Exception:
+        web_btn = InlineKeyboardButton(
+            text="Open Mines Mini App",
+            url="http://t.me/Animenx_bot/webmine"
+        )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[web_btn]])
 
     await message.reply(
         "<b>「 💣 MINES WEB MINI APP 」</b>\n"
@@ -588,6 +605,7 @@ async def mines_cmd(message: Message, command: CommandObject):
 
     user_data["nexus_shards"] -= bet
     user_data["mines_bet"] = user_data.get("mines_bet", 0) + bet
+    user_data["mines_games"] = user_data.get("mines_games", 0) + 1
 
     global_stats = db.setdefault("mines_global", {})
     global_stats["total_bet"] = global_stats.get("total_bet", 0) + bet
@@ -687,6 +705,7 @@ async def mines_tile_cb(cq: CallbackQuery):
             db = load_db()
             db["users"][owner_id]["nexus_shards"] = db["users"][owner_id].get("nexus_shards", 0) + payout
             db["users"][owner_id]["mines_won"] = db["users"][owner_id].get("mines_won", 0) + payout
+            _record_win(db["users"][owner_id], bet, payout, current_mult)
 
             global_stats = db.setdefault("mines_global", {})
             global_stats["total_won"] = global_stats.get("total_won", 0) + net_profit_round
@@ -757,6 +776,7 @@ async def mines_cashout_cb(cq: CallbackQuery):
         db = load_db()
         db["users"][owner_id]["nexus_shards"] = db["users"][owner_id].get("nexus_shards", 0) + payout
         db["users"][owner_id]["mines_won"] = db["users"][owner_id].get("mines_won", 0) + payout
+        _record_win(db["users"][owner_id], bet, payout, final_mult)
 
         global_stats = db.setdefault("mines_global", {})
         global_stats["total_won"] = global_stats.get("total_won", 0) + net_profit_round
@@ -818,23 +838,6 @@ async def gmstats_cmd(message: Message):
     await message.reply(text, parse_mode=ParseMode.HTML)
 
 
-@main_router.message(Command("setweb"))
-async def setweb_cmd(message: Message, command: CommandObject):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    if not command.args:
-        await message.reply("⚠️ Usage: <code>/setweb https://your-netlify-url.netlify.app</code>", parse_mode=ParseMode.HTML)
-        return
-
-    url = command.args.strip()
-    db = load_db()
-    db.setdefault("settings", {})["mines_webapp_url"] = url
-    save_db()
-
-    await message.reply(f"✅ Mines Web App URL updated to:\n<code>{url}</code>", parse_mode=ParseMode.HTML)
-
-
 @main_router.message(Command("imm"))
 async def imm_cmd(message: Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -850,3 +853,143 @@ async def imm_cmd(message: Message):
     save_db()
 
     await message.reply("✅ Mines background image saved.", parse_mode=ParseMode.HTML)
+
+
+# ==========================================
+# /mines_lbd LEADERBOARD
+# ==========================================
+MINES_LBD_IMAGE = "https://i.ibb.co/jvHgKybF/IMG-20261016-043955.jpg"   # banner (caption limit: 1024 chars)
+MINES_LB_TABS = {
+    "profit":  "Net profit",
+    "wagered": "Total wagered",
+    "biggest": "Biggest win",
+    "games":   "Games played",
+    "wins":    "Most wins",
+}
+MINES_LB_TITLES = {
+    "profit":  "NET PROFIT",
+    "wagered": "TOTAL WAGERED",
+    "biggest": "BIGGEST WIN",
+    "games":   "GAMES PLAYED",
+    "wins":    "MOST WINS",
+}
+
+_MINES_HAS_STYLE = "style" in getattr(InlineKeyboardButton, "model_fields", {})
+
+
+def _mines_btn(text: str, data: str, style: str = None):
+    if style and _MINES_HAS_STYLE:
+        return InlineKeyboardButton(text=text, callback_data=data, style=style)
+    return InlineKeyboardButton(text=f"[{text}]" if style == "success" else text, callback_data=data)
+
+
+def _mines_board(db: dict, tab: str):
+    """[(value, uid, name)] best first. Only players who have played at least one round."""
+    rows = []
+    for uid, u in (db.get("users") or {}).items():
+        if not isinstance(u, dict) or not u.get("mines_bet"):
+            continue
+        if tab == "profit":
+            v = u.get("mines_won", 0) - u.get("mines_bet", 0)
+        elif tab == "wagered":
+            v = u.get("mines_bet", 0)
+        elif tab == "biggest":
+            v = u.get("mines_best_win", 0)
+        elif tab == "wins":
+            v = u.get("mines_wins", 0)
+        else:
+            v = u.get("mines_games", 0)
+        if tab == "profit" or v > 0:
+            rows.append((v, str(uid), str(u.get("name") or "User")[:24]))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    return rows
+
+
+def _mines_fmt_value(tab: str, v) -> str:
+    if tab == "profit":
+        return f"{int(v):+,} \U0001F4A0"
+    if tab == "games":
+        return f"{int(v):,} game" + ("" if int(v) == 1 else "s")
+    if tab == "wins":
+        return f"{int(v):,} win" + ("" if int(v) == 1 else "s")
+    return f"{int(v):,} \U0001F4A0"
+
+
+def _mines_lb_text(db: dict, tab: str, uid) -> str:
+    rows = _mines_board(db, tab)
+    text = f"<b>\u300c MINES - {MINES_LB_TITLES[tab]} \u300d</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+    if rows:
+        text += "\n".join(
+            f"<b>{i + 1}.</b> <b>{_html_esc(name[:18])}</b> - {_mines_fmt_value(tab, v)}"
+            for i, (v, _u, name) in enumerate(rows[:10])
+        )
+    else:
+        text += "Nobody has played Mines yet. Be the first with /mines"
+    text += "\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+    me = str(uid)
+    idx = next((i for i, r in enumerate(rows) if r[1] == me), None)
+    if idx is None:
+        text += "<b>Your rank:</b> Unranked"
+    else:
+        text += f"<b>Your rank:</b> #{idx + 1} with {_mines_fmt_value(tab, rows[idx][0])}"
+    return text
+
+
+def _mines_lb_kb(owner, active: str) -> InlineKeyboardMarkup:
+    def btn(tab):
+        return _mines_btn(MINES_LB_TABS[tab], f"mlb:{tab}:{owner}",
+                          "success" if tab == active else "primary")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("profit"), btn("wagered")],
+        [btn("biggest"), btn("games")],
+        [btn("wins")],
+    ])
+
+
+@main_router.message(Command("mines_lbd"))
+async def mines_lbd_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int):
+        return
+    try:
+        ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username)
+        db = load_db()
+        text = _mines_lb_text(db, "profit", uid_int)
+        kb = _mines_lb_kb(uid_int, "profit")
+        try:   # banner image with the leaderboard as its caption
+            await message.reply_photo(photo=MINES_LBD_IMAGE, caption=text,
+                                      reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:   # image unreachable: still show the leaderboard as text
+            await message.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[mines_lbd_CRASH] {e}")
+        await message.reply("The leaderboard is unavailable right now. Please try again in a moment.")
+
+
+@main_router.callback_query(F.data.startswith("mlb:"))
+async def mines_lbd_cb(cq: CallbackQuery):
+    if is_ghost_banned(cq.from_user.id) or is_shadow_banned(cq.from_user.id):
+        return
+    try:
+        _, tab, owner = cq.data.split(":")
+    except ValueError:
+        await cq.answer()
+        return
+    if tab not in MINES_LB_TABS:
+        await cq.answer()
+        return
+    if str(cq.from_user.id) != owner:
+        await cq.answer("This leaderboard belongs to someone else. Send /mines_lbd for your own.", show_alert=True)
+        return
+    try:
+        db = load_db()
+        text = _mines_lb_text(db, tab, cq.from_user.id)
+        kb = _mines_lb_kb(owner, tab)
+        if cq.message.photo:   # banner image: the leaderboard lives in the caption
+            await cq.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            print(f"[mines_lbd_cb] failed: {e}")
+    await cq.answer()
