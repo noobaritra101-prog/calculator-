@@ -9,7 +9,10 @@ import time
 import random
 import logging
 import json
+import hmac
+import hashlib
 import asyncio
+from urllib.parse import parse_qsl
 from collections import OrderedDict
 from datetime import datetime, timezone
 from aiogram import F
@@ -52,6 +55,30 @@ if not dlog.handlers:
 # FASTAPI WEB APP API ROUTER (/api/deck)
 # ==========================================
 deck_api = APIRouter(prefix="/api/deck", tags=["Deck"])
+
+
+def verify_init_data(init_data: str, max_age: int = 86400):
+    """Returns the Telegram user dict if Mini App initData is genuine and fresh, else None."""
+    try:
+        pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
+        recv_hash = pairs.pop("hash", None)
+        if not recv_hash:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", bot.token.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, recv_hash):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > max_age:
+            return None
+        return json.loads(pairs.get("user", "{}"))
+    except Exception:
+        return None
+
+
+# Temporary alias: admin_api.py still imports the old name. Once admin_api.py
+# line 53 is changed to `from deck import verify_init_data`, delete this line.
+_chicken_verify_init_data = verify_init_data
 
 # ==========================================
 # ADSGRAM REWARDED-AD DAILY CARD
