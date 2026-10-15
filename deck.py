@@ -8,12 +8,9 @@ import os
 import time
 import random
 import logging
-import hmac
-import hashlib
 import json
 import asyncio
 from collections import OrderedDict
-from urllib.parse import parse_qsl
 from datetime import datetime, timezone
 from aiogram import F
 from aiogram.types import (
@@ -24,7 +21,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode, ChatMemberStatus
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse, Response
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import aiohttp
 
@@ -646,12 +643,12 @@ async def open_web_deck_cmd(message: Message):
     # fine inside groups too, and Telegram still populates initDataUnsafe.user
     # correctly on open, so no group/DM split is needed anymore.
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎴 Open Card Deck Web", url=WEBDECK_APP_LINK)]
+        [InlineKeyboardButton(text="Open Card Deck Web", url=WEBDECK_APP_LINK, style="success")]
     ])
 
     await smart_reply(
         message,
-        "<b>「 🎴 CARDS COLLECTION WEB 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "<b>「 CARDS COLLECTION WEB 」</b>\n━━━━━━━━━━━━━━━━━\n"
         "Explore your anime card deck in 3D, inspect stats, filter by anime/rarity, and recycle duplicate cards for <b>Nexus Shards 💠</b>!",
         reply_markup=kb,
         parse_mode=ParseMode.HTML
@@ -666,7 +663,6 @@ WEBAPP_LINKS = {
     "airdrop":  f"https://t.me/{BOT_USERNAME}/airdrop",
     "mine":     f"https://t.me/{BOT_USERNAME}/webmine",
     "scramble": f"https://t.me/{BOT_USERNAME}/scramble",
-    "chicken":  f"https://t.me/{BOT_USERNAME}/chicken",
 }
 
 
@@ -679,7 +675,6 @@ async def all_webapps_cmd(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎮 Deck", url=L["deck"]),
          InlineKeyboardButton(text="🪂 Airdrop", url=L["airdrop"])],
-        [InlineKeyboardButton(text="🐔 Chicken Cross", url=L["chicken"])],
         [InlineKeyboardButton(text="💣 Mine", url=L["mine"]),
          InlineKeyboardButton(text="🕵️ Scramble", url=L["scramble"])],
     ])
@@ -703,11 +698,11 @@ async def airdrop_cmd(message: Message):
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📺 Open Airdrop", url=AIRDROP_APP_LINK)]
+        [InlineKeyboardButton(text="Open Airdrop", url=AIRDROP_APP_LINK, style="primary")]
     ])
     await smart_reply(
         message,
-        "<b>「 📺 DAILY AIRDROP ぁ 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "<b>「 DAILY AIRDROP ぁ 」</b>\n━━━━━━━━━━━━━━━━━\n"
         "Watch a couple of quick ads for a free card drop!",
         reply_markup=kb,
         parse_mode=ParseMode.HTML
@@ -720,11 +715,11 @@ async def adrop_cmd(message: Message):
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📺 Open Airdrop", url="https://t.me/Animenx_bot/airdrop")]
+        [InlineKeyboardButton(text="Open Airdrop", url="https://t.me/Animenx_bot/airdrop", style="primary")]
     ])
     await smart_reply(
         message,
-        "<b>「 📺 DAILY AIRDROP ぁ 」</b>\n━━━━━━━━━━━━━━━━━\n"
+        "<b>「 DAILY AIRDROP ぁ 」</b>\n━━━━━━━━━━━━━━━━━\n"
         "Watch a couple of quick ads for a free card drop!",
         reply_markup=kb,
         parse_mode=ParseMode.HTML
@@ -978,7 +973,7 @@ async def send_deck_page(message, db: dict, user_id: str, page=0, edit=False, mu
             InlineKeyboardButton(text="Collection 🫧", switch_inline_query_current_chat=f"card_user.{user_id}"),
             InlineKeyboardButton(text="🌐 Web", url=WEBDECK_APP_LINK)
         ],
-        [InlineKeyboardButton(text="🗑️", callback_data=f"deckdel_{user_id}")]
+        [InlineKeyboardButton(text="🗑️", callback_data=f"deckdel_{user_id}", style="danger")]
     ])
 
     caption_too_long = caption_visible_length(text) > CAPTION_SAFE_LIMIT
@@ -1521,367 +1516,3 @@ async def confirm_burn_cb(cq: CallbackQuery):
     )
     await cq.message.edit_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=None)
     await cq.answer("🔥 Card burned successfully!")
-
-
-# ==========================================
-# 🐔 CHICKEN CROSS (Mini App game)
-#   /chicken_cross  /c_top [level]
-# Game page is served by this backend at /api/deck/chicken/game (chicken.html
-# must sit next to deck.py). Scores are posted by the game with Telegram
-# initData, which is verified with the bot token before anything is saved.
-# Data lives in users[uid]["chicken"] = {coins, coins_by:{level:n}, best:{level:rows}, rows, games, save, last_ts}
-# Leaderboard ranks lifetime coins earned (after the level multiplier).
-# ==========================================
-CHICKEN_LEVELS = {"peasy": "Peasy", "easy": "Easy", "medium": "Medium", "hard": "Hard", "vhard": "Very hard"}
-CHICKEN_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chicken.html")
-# Direct Mini App link (used in groups). Create it in BotFather: /newapp -> short name "chicken"
-# -> Web App URL = <BACKEND_PUBLIC_URL>/api/deck/chicken/game
-CHICKEN_APP_LINK = f"https://t.me/{BOT_USERNAME}/chicken"
-CHICKEN_MULT = {"peasy": 1, "easy": 1.25, "medium": 1.5, "hard": 2, "vhard": 3}   # same as the game
-
-
-CHICKEN_WEB_URL = "https://nexusanimemonarch.netlify.app/chicken.html"   # where chicken.html is hosted
-
-
-def _chicken_game_url() -> str:
-    return CHICKEN_WEB_URL
-
-
-def _chicken_verify_init_data(init_data: str, max_age: int = 86400):
-    """Returns the Telegram user dict if initData is genuine and fresh, else None."""
-    try:
-        pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
-        recv_hash = pairs.pop("hash", None)
-        if not recv_hash:
-            return None
-        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
-        secret = hmac.new(b"WebAppData", bot.token.encode(), hashlib.sha256).digest()
-        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(calc, recv_hash):
-            return None
-        if time.time() - int(pairs.get("auth_date", "0")) > max_age:
-            return None
-        return json.loads(pairs.get("user", "{}"))
-    except Exception:
-        return None
-
-
-class ChickenScoreReq(BaseModel):
-    init_data: str
-    score: int
-    coins: int = 0
-    level: str = "medium"
-    secs: float = 0
-
-
-@deck_api.get("/chicken/game")
-async def chicken_game_page():
-    if not os.path.exists(CHICKEN_HTML_PATH):
-        raise HTTPException(status_code=404, detail="Game file missing.")
-    return FileResponse(CHICKEN_HTML_PATH, media_type="text/html", headers={"Cache-Control": "no-cache"})
-
-
-@deck_api.post("/chicken/score")
-async def chicken_submit_score(req: ChickenScoreReq):
-    try:
-        tg_user = _chicken_verify_init_data(req.init_data)
-        if not tg_user or "id" not in tg_user:
-            raise HTTPException(status_code=401, detail="Invalid Telegram session.")
-        uid = str(tg_user["id"])
-        if is_ghost_banned(int(uid)) or is_shadow_banned(int(uid)):
-            return {"success": True, "new_best": False}
-        if req.level not in CHICKEN_LEVELS:
-            raise HTTPException(status_code=400, detail="Bad level.")
-
-        score = max(0, min(int(req.score), 5000))
-        coins = max(0, min(int(req.coins), score + 5))
-        if score > max(0.0, float(req.secs)) * 9 + 3:   # faster than the chicken can physically hop
-            raise HTTPException(status_code=400, detail="Score rejected.")
-
-        db = load_db()
-        _, user_data = get_user_from_db(db, uid)
-        if not user_data:
-            ensure_user(uid, tg_user.get("first_name", "User"), tg_user.get("username"))
-            db = load_db()
-            _, user_data = get_user_from_db(db, uid)
-        if not isinstance(user_data, dict):
-            raise HTTPException(status_code=500, detail="Profile error.")
-
-        _chicken_fix_name(user_data, tg_user)
-        rec = user_data.setdefault("chicken", {})
-        now = time.time()
-        if now - rec.get("last_ts", 0) < 2:
-            raise HTTPException(status_code=429, detail="Too fast.")
-        earned = int(round(coins * CHICKEN_MULT[req.level]))
-        best = rec.setdefault("best", {})
-        new_best = score > best.get(req.level, 0)
-        if new_best:
-            best[req.level] = score
-        by = rec.setdefault("coins_by", {})
-        by[req.level] = by.get(req.level, 0) + earned
-        rec["coins"] = rec.get("coins", 0) + earned
-        rec["rows"] = rec.get("rows", 0) + score
-        rec["games"] = rec.get("games", 0) + 1
-        rec["last_ts"] = now
-        save_db()
-        return {"success": True, "earned": earned, "new_best": new_best, "best": best.get(req.level, 0)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[chicken_score_CRASH] {e}")
-        traceback.print_exc()
-        dlog.error(f"[chicken_score_CRASH] {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Score save error.")
-
-
-class ChickenProfileReq(BaseModel):
-    init_data: str
-
-
-class ChickenSyncReq(BaseModel):
-    init_data: str
-    save: dict
-
-
-def _chicken_get_user(tg_user: dict):
-    uid = str(tg_user["id"])
-    db = load_db()
-    _, user_data = get_user_from_db(db, uid)
-    if not user_data:
-        ensure_user(uid, tg_user.get("first_name", "User"), tg_user.get("username"))
-        db = load_db()
-        _, user_data = get_user_from_db(db, uid)
-    return db, user_data
-
-
-def _chicken_fix_name(user_data: dict, tg_user: dict) -> bool:
-    fn = sanitize_display_name(str(tg_user.get("first_name") or ""))
-    if fn != "User" and str(user_data.get("name") or "User").strip() in ("", "User"):
-        user_data["name"] = fn
-        return True
-    return False
-
-
-def _chicken_clean_save(sv: dict) -> dict:
-    owned = [x[:20] for x in (sv.get("owned") or []) if isinstance(x, str)][:60]
-    if "classic" not in owned:
-        owned.insert(0, "classic")
-    skin = sv.get("skin") if sv.get("skin") in owned else "classic"
-    last = str(sv.get("last", ""))[:10]
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", last):
-        last = ""
-    return {
-        "bank": max(0, min(int(sv.get("bank", 0) or 0), 10_000_000)),
-        "owned": owned,
-        "skin": skin,
-        "streak": max(0, min(int(sv.get("streak", 0) or 0), 100000)),
-        "last": last,
-        "ts": max(0, min(int(sv.get("ts", 0) or 0), 4_102_444_800_000)),
-    }
-
-
-@deck_api.post("/chicken/profile")
-async def chicken_profile(req: ChickenProfileReq):
-    try:
-        tg_user = _chicken_verify_init_data(req.init_data)
-        if not tg_user or "id" not in tg_user:
-            raise HTTPException(status_code=401, detail="Invalid Telegram session.")
-        uid = str(tg_user["id"])
-        db, user_data = _chicken_get_user(tg_user)
-        if not isinstance(user_data, dict):
-            raise HTTPException(status_code=500, detail="Profile error.")
-        if _chicken_fix_name(user_data, tg_user):
-            save_db()
-        rec = user_data.get("chicken") if isinstance(user_data.get("chicken"), dict) else {}
-        ranks = {}
-        for key in [None] + list(CHICKEN_LEVELS):
-            rows = _chicken_board(db, key)
-            idx = next((i for i, r in enumerate(rows) if r[1] == uid), None)
-            ranks[key or "overall"] = (idx + 1) if idx is not None else None
-        return {
-            "name": sanitize_display_name(user_data.get("name") or tg_user.get("first_name", "Player")),
-            "best": rec.get("best", {}),
-            "coins": rec.get("coins", 0),
-            "games": rec.get("games", 0),
-            "ranks": ranks,
-            "save": rec.get("save"),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[chicken_profile_CRASH] {e}")
-        traceback.print_exc()
-        dlog.error(f"[chicken_profile_CRASH] {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Profile load error.")
-
-
-@deck_api.post("/chicken/sync")
-async def chicken_sync(req: ChickenSyncReq):
-    try:
-        tg_user = _chicken_verify_init_data(req.init_data)
-        if not tg_user or "id" not in tg_user:
-            raise HTTPException(status_code=401, detail="Invalid Telegram session.")
-        try:
-            clean = _chicken_clean_save(req.save)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Bad save data.")
-        _, user_data = _chicken_get_user(tg_user)
-        if not isinstance(user_data, dict):
-            raise HTTPException(status_code=500, detail="Profile error.")
-        rec = user_data.setdefault("chicken", {})
-        rec["save"] = clean
-        save_db()
-        return {"success": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[chicken_sync_CRASH] {e}")
-        traceback.print_exc()
-        dlog.error(f"[chicken_sync_CRASH] {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Sync error.")
-
-
-def _chicken_board(db: dict, level=None):
-    """[(coins, uid, name)] sorted high -> low. level=None means lifetime total across all levels."""
-    rows = []
-    users = db.get("users", {}) if isinstance(db, dict) else {}
-    for uid, u in (users or {}).items():
-        rec = u.get("chicken") if isinstance(u, dict) else None
-        if not isinstance(rec, dict):
-            continue
-        c = (rec.get("coins_by") or {}).get(level, 0) if level else rec.get("coins", 0)
-        if c and c > 0:
-            rows.append((int(c), str(uid), sanitize_display_name(str(u.get("name") or "User"))))
-    rows.sort(key=lambda r: (-r[0], r[1]))
-    return rows
-
-
-def _chicken_level_arg(arg):
-    """None = no argument, '?' = unknown level."""
-    if not arg:
-        return None
-    a = re.sub(r"[^a-z]", "", arg.lower())
-    if a == "all":
-        return None
-    return {"peasy": "peasy", "easy": "easy", "medium": "medium", "med": "medium",
-            "hard": "hard", "veryhard": "vhard", "vhard": "vhard"}.get(a, "?")
-
-
-@main_router.message(Command("chicken_cross"))
-async def chicken_cross_cmd(message: Message):
-    uid_int = message.from_user.id
-    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
-
-    # Same Mini App direct link in DMs and groups
-    btn = InlineKeyboardButton(text="Play Chicken Cross", url=CHICKEN_APP_LINK)
-
-    await smart_reply(
-        message,
-        "<b>「 CHICKEN CROSS 」</b>\n━━━━━━━━━━━━━━━━━\n"
-        "Hop across roads and rivers in 3D, collect coins and climb the coin leaderboard.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
-        parse_mode=ParseMode.HTML
-    )
-
-
-CHICKEN_LEVEL_ROWS = [["peasy", "easy"], ["medium", "hard"], ["vhard"]]
-CHICKEN_BTN_LABELS = {"peasy": "Peasy", "easy": "Easy", "medium": "Medium", "hard": "Hard", "vhard": "Very Hard"}
-
-
-def _chicken_top_kb(owner_uid, active=None):
-    rows = [[
-        InlineKeyboardButton(
-            text=("[All]" if active is None else "All"),
-            callback_data=f"ctop:all:{owner_uid}"
-        )
-    ]]
-    for row in CHICKEN_LEVEL_ROWS:
-        rows.append([
-            InlineKeyboardButton(
-                text=(f"[{CHICKEN_BTN_LABELS[lv]}]" if lv == active else CHICKEN_BTN_LABELS[lv]),
-                callback_data=f"ctop:{lv}:{owner_uid}"
-            ) for lv in row
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _chicken_top_text(db: dict, lvl, uid) -> str:
-    rows = _chicken_board(db, lvl)
-    title = f"TOP 10 COINS - {CHICKEN_LEVELS[lvl].upper()}" if lvl else "TOP 10 COINS - ALL LEVELS"
-    text = f"<b>「 CHICKEN CROSS - {title} 」</b>\n━━━━━━━━━━━━━━━━━\n"
-
-    if rows:
-        text += "\n".join(
-            f"<b>{i + 1}.</b> <b>{_html_esc(name)}</b> - {coins:,} coins"
-            for i, (coins, _uid, name) in enumerate(rows[:10])
-        )
-    else:
-        text += "No coins collected yet. Be the first with /chicken_cross"
-
-    me = str(uid)
-    idx = next((i for i, r in enumerate(rows) if r[1] == me), None)
-    text += "\n━━━━━━━━━━━━━━━━━\n"
-    if idx is None:
-        text += "<b>Your rank:</b> Unranked"
-    else:
-        text += f"<b>Your rank:</b> #{idx + 1} with {rows[idx][0]:,} coins"
-
-    _, user_data = get_user_from_db(db, me)
-    rec = user_data.get("chicken") if isinstance(user_data, dict) else None
-    if isinstance(rec, dict) and rec.get("games"):
-        best_run = max((rec.get("best") or {"x": 0}).values())
-        text += f"\n<b>Games played:</b> {rec.get('games', 0)}   <b>Best run:</b> {best_run} rows"
-    return text
-
-
-@main_router.message(Command("c_top"))
-async def chicken_top_cmd(message: Message, command: CommandObject):
-    uid_int = message.from_user.id
-    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
-
-    lvl = _chicken_level_arg(command.args)
-    if lvl == "?":
-        await smart_reply(message, "Usage: <code>/c_top [all | peasy | easy | medium | hard | veryhard]</code>",
-                          parse_mode=ParseMode.HTML)
-        return
-
-    try:
-        text = _chicken_top_text(load_db(), lvl, uid_int)
-        kb = _chicken_top_kb(uid_int, lvl)
-    except Exception as e:
-        print(f"[c_top_CRASH] {e}")
-        traceback.print_exc()
-        dlog.error(f"[c_top_CRASH] {e}", exc_info=True)
-        await smart_reply(message, "The leaderboard is unavailable right now. Please try again in a moment.")
-        return
-
-    await smart_reply(message, text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-
-@main_router.callback_query(F.data.startswith("ctop:"))
-async def chicken_top_cb(cq: CallbackQuery):
-    if is_ghost_banned(cq.from_user.id) or is_shadow_banned(cq.from_user.id): return
-    try:
-        _, lvl, owner = cq.data.split(":")
-    except ValueError:
-        await cq.answer()
-        return
-    if lvl == "all":
-        lvl = None
-    elif lvl not in CHICKEN_LEVELS:
-        await cq.answer()
-        return
-    if str(cq.from_user.id) != owner:
-        await cq.answer("This leaderboard belongs to someone else. Send /c_top for your own.", show_alert=True)
-        return
-    try:
-        await cq.message.edit_text(
-            _chicken_top_text(load_db(), lvl, cq.from_user.id),
-            reply_markup=_chicken_top_kb(cq.from_user.id, lvl),
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        if "not modified" not in str(e).lower():
-            print(f"[c_top_cb] edit failed: {e}")
-            dlog.error(f"[c_top_cb] edit failed: {e}", exc_info=True)
-    await cq.answer()
