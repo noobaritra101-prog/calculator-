@@ -42,8 +42,9 @@ user_mine_cooldowns = {}
 _action_cooldowns: dict[str, float] = {}
 ACTION_COOLDOWN_SECS = 8
 
-# /throw result delay in seconds (0 = instant). /roll keeps the full dice animation.
+# /roll and /throw result delay in seconds (0 = instant).
 THROW_RESULT_DELAY = 0
+ROLL_RESULT_DELAY  = 0
 
 # # Gifting limit configuration
 DAILY_GIFT_SEND_LIMIT = 4     # Maximum cards a user can send per day
@@ -141,17 +142,23 @@ async def _bot_tag() -> str:
     return f"@{_bot_username_cache}"
 
 
-async def has_bot_in_bio(user_id: int) -> bool:
-    """True if the bot's @username appears in the user's Telegram bio.
-    Matches whole usernames only (so @MyBot doesn't match @MyBot_2) and logs failures."""
+async def check_bio(user_id: int):
+    """Returns (found, error). `error` is None when the bio was read fine,
+    otherwise a short reason string (found is then False)."""
     try:
-        tag  = (await _bot_tag()).lower()
+        name = (await _bot_tag()).lstrip("@").lower()
         chat = await bot.get_chat(user_id)
         bio  = (getattr(chat, "bio", None) or "").lower()
-        return re.search(rf"(?<![a-z0-9_]){re.escape(tag)}(?![a-z0-9_])", bio) is not None
+        # Accepts "@Name", "t.me/Name", or plain "Name" — but not "@Name_2" / "@MyName".
+        found = re.search(rf"(?<![a-z0-9_]){re.escape(name)}(?![a-z0-9_])", bio) is not None
+        return found, None
     except Exception as e:
-        print(f"[has_bot_in_bio] failed for {user_id}: {e!r}")
-        return False
+        print(f"[check_bio] failed for {user_id}: {e!r}")
+        return False, type(e).__name__
+
+
+async def has_bot_in_bio(user_id: int) -> bool:
+    return (await check_bio(user_id))[0]
 
 # ==========================================
 # ANTI-CHEAT REFERRAL CONVERSION ENGINE
@@ -444,7 +451,7 @@ async def bio_verified_cb(cq: CallbackQuery):
     if len(parts) != 3 or str(cq.from_user.id) != parts[2]:
         await cq.answer("This button is not for you!", show_alert=True)
         return
-    await cq.answer("✅ Bio bonus already verified!")
+    await cq.answer("Bio bonus already verified!")
 
 
 @main_router.callback_query(F.data.startswith("bio_chk|"))
@@ -483,19 +490,26 @@ async def bio_check_again_cb(cq: CallbackQuery):
 
         already = user.get(done_key, 0) == claim_ts
         if not already:
-            if not await has_bot_in_bio(cq.from_user.id):
+            found, err = await check_bio(cq.from_user.id)
+            if err:
+                await cq.answer("Couldn't read your Bio right now. Make sure you've started the bot in DM, then try again.", show_alert=True)
+                return
+            if not found:
                 tag = await _bot_tag()
-                await cq.answer(f"❌ {tag} not found in your Bio!\nAdd it, save, then tap Check Again.", show_alert=True)
+                await cq.answer(f"{tag} not found in your Bio!\nAdd it, save, then tap Check Again.", show_alert=True)
                 return
             user["nexus_shards"] = user.get("nexus_shards", 0) + bonus
             user[done_key] = claim_ts
             save_db()
-            log_action(db, owner, {
-                "type": f"{kind}_bio_bonus",
-                "amount": bonus,
-                "chat_id": cq.message.chat.id if cq.message else 0,
-                "chat_title": (cq.message.chat.title or cq.message.chat.first_name or "DM") if cq.message else "DM",
-            })
+            try:
+                log_action(db, owner, {
+                    "type": f"{kind}_bio_bonus",
+                    "amount": bonus,
+                    "chat_id": cq.message.chat.id if cq.message else 0,
+                    "chat_title": (cq.message.chat.title or cq.message.chat.first_name or "DM") if cq.message else "DM",
+                })
+            except Exception as e:
+                print(f"[bio_check_again] log_action failed: {e!r}")
 
         # Rebuild the claim message with the bonus + a green [Verified] button.
         kb = _bio_kb(kind, owner, True)
@@ -512,9 +526,9 @@ async def bio_check_again_cb(cq: CallbackQuery):
                         await cq.message.edit_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
                 else:
                     await cq.message.edit_reply_markup(reply_markup=kb)
-        except TelegramBadRequest:
-            pass
-        await cq.answer(f"✅ Verified! +{bonus} Shards added." if not already else "✅ Already verified!", show_alert=not already)
+        except Exception as e:
+            print(f"[bio_check_again] edit failed: {e!r}")
+        await cq.answer(f"Verified! +{bonus} Shards added." if not already else "Already verified!", show_alert=not already)
 
 
 # ==========================================
@@ -561,7 +575,8 @@ async def bowling_roll_cmd(message: Message):
         dice_msg = await message.reply_dice(emoji="🎳")
     except (TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest):
         return
-    await asyncio.sleep(4)
+    if ROLL_RESULT_DELAY:
+        await asyncio.sleep(ROLL_RESULT_DELAY)
 
     shards_won = 0
     if dice_msg.dice.value == 6:
