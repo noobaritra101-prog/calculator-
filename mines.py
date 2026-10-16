@@ -860,15 +860,13 @@ async def imm_cmd(message: Message):
 # ==========================================
 MINES_LBD_IMAGE = "https://i.ibb.co/jvHgKybF/IMG-20261016-043955.jpg"   # banner (caption limit: 1024 chars)
 MINES_LB_TABS = {
-    "profit":  "Net profit",
-    "wagered": "Total wagered",
+    "profit":  "Total profit",
     "biggest": "Biggest win",
     "games":   "Games played",
     "wins":    "Most wins",
 }
 MINES_LB_TITLES = {
-    "profit":  "NET PROFIT",
-    "wagered": "TOTAL WAGERED",
+    "profit":  "TOTAL PROFIT",
     "biggest": "BIGGEST WIN",
     "games":   "GAMES PLAYED",
     "wins":    "MOST WINS",
@@ -891,15 +889,13 @@ def _mines_board(db: dict, tab: str):
             continue
         if tab == "profit":
             v = u.get("mines_won", 0) - u.get("mines_bet", 0)
-        elif tab == "wagered":
-            v = u.get("mines_bet", 0)
         elif tab == "biggest":
             v = u.get("mines_best_win", 0)
         elif tab == "wins":
             v = u.get("mines_wins", 0)
         else:
             v = u.get("mines_games", 0)
-        if tab == "profit" or v > 0:
+        if v > 0:
             rows.append((v, str(uid), str(u.get("name") or "User")[:24]))
     rows.sort(key=lambda r: (-r[0], r[1]))
     return rows
@@ -907,7 +903,7 @@ def _mines_board(db: dict, tab: str):
 
 def _mines_fmt_value(tab: str, v) -> str:
     if tab == "profit":
-        return f"{int(v):+,} \U0001F4A0"
+        return f"{int(v):,} \U0001F4A0"
     if tab == "games":
         return f"{int(v):,} game" + ("" if int(v) == 1 else "s")
     if tab == "wins":
@@ -940,9 +936,8 @@ def _mines_lb_kb(owner, active: str) -> InlineKeyboardMarkup:
         return _mines_btn(MINES_LB_TABS[tab], f"mlb:{tab}:{owner}",
                           "success" if tab == active else "primary")
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("profit"), btn("wagered")],
-        [btn("biggest"), btn("games")],
-        [btn("wins")],
+        [btn("profit"), btn("biggest")],
+        [btn("games"), btn("wins")],
     ])
 
 
