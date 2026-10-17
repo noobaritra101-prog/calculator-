@@ -323,8 +323,11 @@ async def fsunday_cmd(message: Message, command: CommandObject):
     now_day = _stats_today_key()
     if args[0].lower() == "list":
         # Drop entries from past Sundays while we're here.
-        for k in [k for k, v in forced.items() if v.get("date", "") < now_day]:
+        stale = [k for k, v in forced.items() if v.get("date", "") < now_day]
+        for k in stale:
             del forced[k]
+        if stale:
+            save_db()
         if not forced:
             await message.reply("No forced Sunday cards.")
             return
