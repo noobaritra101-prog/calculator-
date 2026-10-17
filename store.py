@@ -45,14 +45,24 @@ def _sunday_special_ids(db: dict) -> set:
     """Card IDs the admin added to the Sunday Special pool (can be from locked series)."""
     return {str(x) for x in db.get("settings", {}).get("sunday_special_cards", [])}
 
-def _forced_sunday_card(db: dict, uid):
+def _forced_sunday_card(db: dict, uid, include_used: bool = False):
     """Card the admin forced into this user's Sunday Divine slot with /fsunday.
-    Only valid on Sunday, and only on the exact Sunday it was set for."""
+    Only valid on Sunday, and only on the exact Sunday it was set for.
+    It is used up by the FIRST roll that shows it, so a refresh gives a normal
+    Divine (include_used=True is only for the locked-series purchase check)."""
     if not is_divine_day():
         return None
     entry = db.get("settings", {}).get("sunday_forced", {}).get(str(uid))
     if not entry or entry.get("date") != _stats_today_key():
         return None
+    if not include_used:
+        if entry.get("used"):
+            return None
+        # Entries made before "used" existed: if that card is already the
+        # user's rolled Divine, they have seen it, so treat it as used.
+        dp = db.get("users", {}).get(str(uid), {}).get("daily_purchases", {})
+        if str(dp.get("rolled_divine")) == str(entry.get("card")):
+            return None
     cid = str(entry.get("card"))
     return cid if cid in db.get("global_cards", {}) else None
 
@@ -63,7 +73,7 @@ def _is_sunday_special(db: dict, card_id, uid=None) -> bool:
         return False
     if str(card_id) in _sunday_special_ids(db):
         return True
-    return uid is not None and _forced_sunday_card(db, uid) == str(card_id)
+    return uid is not None and _forced_sunday_card(db, uid, include_used=True) == str(card_id)
 
 def _pick_sunday_divine(db: dict, uid: str, divines: dict):
     """Pick the Divine slot card. MUST be called right after random.seed(...)
@@ -294,7 +304,7 @@ async def fsunday_cmd(message: Message, command: CommandObject):
     """Admin: /fsunday <user_id> <card_id> | /fsunday <user_id> clear | /fsunday list
     Forces a specific Divine card into one user's Sunday Divine slot (even from a
     locked series). Applies to this Sunday if today is Sunday, otherwise the next
-    one, and survives that user's refreshes. Expires after that Sunday."""
+    one, and shows only once: their next refresh gives a normal Divine. Expires after that Sunday."""
     if message.chat.type != "private":
         return
     if not message.from_user or message.from_user.id not in config.ADMIN_IDS:
@@ -322,7 +332,7 @@ async def fsunday_cmd(message: Message, command: CommandObject):
         for u, e in forced.items():
             c = db["global_cards"].get(str(e.get("card")))
             uname = db["users"].get(u, {}).get("name", "?")
-            lines.append(f"• <code>{u}</code> ({html.escape(str(uname))}) → <code>{e.get('card')}</code> {html.escape(c['name']) if c else '⚠️ missing'} — {e.get('date')}")
+            lines.append(f"• <code>{u}</code> ({html.escape(str(uname))}) → <code>{e.get('card')}</code> {html.escape(c['name']) if c else '⚠️ missing'} — {e.get('date')}{' (shown)' if e.get('used') else ''}")
         await message.reply("<b>📌 Forced Sunday cards</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
         return
 
@@ -361,6 +371,7 @@ async def fsunday_cmd(message: Message, command: CommandObject):
         dp = db["users"][uid].get("daily_purchases", {})
         if dp.get("date") == config.get_shop_rotation_seed() and dp.get("rolled_basic") and dp.get("rolled_elite"):
             dp["rolled_divine"] = cid
+            forced[uid]["used"] = True
             dp["bought"] = [b for b in dp.get("bought", []) if b != cid]
             applied_now = True
     save_db()
@@ -555,6 +566,7 @@ async def store_online_cb(cq: CallbackQuery):
         forced_id = _forced_sunday_card(db, uid)
         if forced_id:
             c_d = (forced_id, db["global_cards"][forced_id])
+            db["settings"]["sunday_forced"][str(uid)]["used"] = True  # saved below with the roll
         else:
             c_d = _pick_sunday_divine(db, uid, divines) if divines else None
         random.seed()
@@ -1591,6 +1603,7 @@ async def api_get_online_store(user_id: str):
             forced_id = _forced_sunday_card(db, user_id)
             if forced_id:
                 c_d = (forced_id, db["global_cards"][forced_id])
+                db["settings"]["sunday_forced"][str(user_id)]["used"] = True  # saved below with the roll
             else:
                 c_d = _pick_sunday_divine(db, user_id, divines) if divines else None
             random.seed()
