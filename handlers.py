@@ -2650,18 +2650,27 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
     promos = db.setdefault("promos", {})
 
     if code not in promos:
-        await safe_reply("Invalid, expired, or incorrect promo code.", parse_mode=ParseMode.HTML)
+        await safe_reply(
+            "<b>Invalid Code</b>\n"
+            "That promo code doesn't exist. Check the spelling and try again.",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     promo   = promos[code]
     user_id = str(uid_int)
 
     if user_id in promo.setdefault("claimed_by", []):
-        await safe_reply("You have already claimed this promo code!", parse_mode=ParseMode.HTML)
+        await safe_reply("<b>Already Claimed</b>\nYou have already redeemed this promo code.", parse_mode=ParseMode.HTML)
         return
 
-    if len(promo["claimed_by"]) >= promo["max_claims"]:
-        await safe_reply("This promo code has reached its maximum claim limit and is expired.", parse_mode=ParseMode.HTML)
+    # Expired because every claim has been used.
+    if len(promo["claimed_by"]) >= promo.get("max_claims", 0):
+        await safe_reply(
+            "<b>Code Expired</b>\n"
+            "This promo code has reached its claim limit and is no longer active.",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     ensure_user(user_id, message.from_user.first_name, message.from_user.username)

@@ -1335,50 +1335,78 @@ async def autoleave_toggle(message: Message, command: CommandObject):
 # ==========================================
 # RESTRICTION AND MODERATION CONTROLS
 # ==========================================
-async def _sban_target_blocked(uid: int, name: str, message: Message) -> str | None:
-    """Checks whether an /sban or /sunban target is off-limits. Returns the
-    HTML reply text to send if blocked, or None if the action may proceed.
-    Checked in order: moderator -> channel -> bot, each with its own message."""
+async def _is_bot_target(uid: int, message: Message, identifier: str | None = None) -> bool:
+    """Reliable-as-possible 'is this target a bot?' check, used by the ban
+    commands. Checked in order:
+      1. the bot itself,
+      2. the replied-to user's is_bot flag,
+      3. a typed @username ending in 'bot' (Telegram REQUIRES every bot
+         username to end in 'bot'; a display name like "Abbot" proves nothing),
+      4. for a bare numeric id inside a group: ask Telegram for the member."""
+    try:
+        if uid == message.bot.id:
+            return True
+    except Exception:
+        pass
+
+    reply_user = message.reply_to_message.from_user if message.reply_to_message else None
+    if reply_user and reply_user.id == uid:
+        return bool(reply_user.is_bot)
+
+    if identifier:
+        ident = identifier.strip()
+        if ident.startswith("@") or not ident.lstrip("-").isdigit():
+            return ident.lstrip("@").lower().endswith("bot")
+
+    if message.chat.type != ChatType.PRIVATE:
+        try:
+            member = await message.bot.get_chat_member(message.chat.id, uid)
+            return bool(member.user.is_bot)
+        except Exception:
+            return False
+    return False
+
+async def _ban_target_blocked(uid: int, name: str, message: Message,
+                              identifier: str | None = None,
+                              verb: str = "shadow banned") -> str | None:
+    """Checks whether a /gban or /sban target is off-limits. Returns the HTML
+    reply text to send if blocked, or None if the action may proceed.
+    Checked in order: moderator -> channel -> bot, each with its own message.
+    (Not used for unbans: a ban that already exists must always be removable.)"""
 
     if uid in ADMIN_IDS:
         return (
             "<b>⊘ ACTION DENIED</b>\n\n"
-            "<b>Moderators are protected and cannot be shadow banned.</b>"
+            f"<b>Moderators are protected and cannot be {verb}.</b>"
         )
 
-    is_reply = bool(message.reply_to_message)
-
     # Anonymous channel posts (message sent "as" a linked channel)
+    is_reply = bool(message.reply_to_message)
     sender_chat = message.reply_to_message.sender_chat if is_reply else None
     if sender_chat and sender_chat.type == ChatType.CHANNEL:
         return (
             "<b>⊘ ACTION DENIED</b>\n\n"
-            "<b>Channels cannot be shadow banned.</b>"
+            f"<b>Channels cannot be {verb}.</b>"
         )
 
-    # Bots
-    reply_user = message.reply_to_message.from_user if is_reply else None
-    if reply_user and reply_user.is_bot:
+    if await _is_bot_target(uid, message, identifier):
         return (
             "<b>⊘ ACTION DENIED</b>\n\n"
-            "<b>Bots cannot be shadow banned.</b>"
-        )
-    if not reply_user and isinstance(name, str) and name.lower().endswith("bot"):
-        # Best-effort fallback for id/username based resolution, where a
-        # full User object (with a reliable is_bot flag) isn't available.
-        return (
-            "<b>⊘ ACTION DENIED</b>\n\n"
-            "<b>Bots cannot be shadow banned.</b>"
+            f"<b>Bots cannot be {verb}.</b>"
         )
 
     return None
 
-@main_router.message(Command("gunban"))
+def _first_arg(command: CommandObject) -> str | None:
+    args = (command.args or "").split(maxsplit=1)
+    return args[0] if args else None
+
+@main_router.message(Command("gunban", "kaizoku"))
 async def global_unban_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
     uid, name = await resolve_target(command.args, message)
     if not uid:
-        await message.reply("⚠️ <b>Format:</b> Reply to user or use:\n• <code>/gunban &lt;user_id&gt;</code>\n• <code>/gunban &lt;@username&gt;</code>", parse_mode=ParseMode.HTML)
+        await message.reply(f"⚠️ <b>Format:</b> Reply to user or use:\n• <code>/{command.command} &lt;user_id&gt;</code>\n• <code>/{command.command} &lt;@username&gt;</code>", parse_mode=ParseMode.HTML)
         return
 
     if not is_ghost_banned(uid):
@@ -1402,13 +1430,14 @@ async def global_unban_cmd(message: Message, command: CommandObject):
 
     await message.reply(f"✅ {get_mention(uid, name)} has been globally unbanned.", parse_mode=ParseMode.HTML)
 
-@main_router.message(Command("gban"))
+@main_router.message(Command("gban", "bankai"))
 async def global_ban_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
 
     raw_args = (command.args or "").strip()
     is_reply = bool(message.reply_to_message and message.reply_to_message.from_user)
 
+    identifier = None
     if is_reply:
         uid  = message.reply_to_message.from_user.id
         name = message.reply_to_message.from_user.first_name
@@ -1417,8 +1446,8 @@ async def global_ban_cmd(message: Message, command: CommandObject):
         if not raw_args:
             await message.reply(
                 "⚠️ <b>Usage:</b>\n"
-                "<code>/gban &lt;user_id | @username&gt; [reason] [duration]</code>\n"
-                "Or reply to a user's message with <code>/gban [reason] [duration]</code>\n\n"
+                f"<code>/{command.command} &lt;user_id | @username&gt; [reason] [duration]</code>\n"
+                f"Or reply to a user's message with <code>/{command.command} [reason] [duration]</code>\n\n"
                 "<b>Duration examples:</b> <code>30d</code>, <code>7h</code>, <code>45m</code>, <code>2w</code>, <code>permanent</code>\n"
                 "If no reason is given it defaults to <b>None</b>. If no duration is given it defaults to <b>Permanent</b>.",
                 parse_mode=ParseMode.HTML
@@ -1433,6 +1462,7 @@ async def global_ban_cmd(message: Message, command: CommandObject):
             return
 
     # ── target immunity checks ──
+    ban_identifier = None if is_reply else identifier
     if uid == SUPREME_OWNER_ID:
         await message.reply(
             "<b>⊘ BAN FAILED</b>\n\n"
@@ -1447,6 +1477,12 @@ async def global_ban_cmd(message: Message, command: CommandObject):
             "<b>Moderators are protected and cannot be banned.</b>",
             parse_mode=ParseMode.HTML
         )
+        return
+
+    # Bots (including this bot itself) and channels can never be globally banned.
+    block_reason = await _ban_target_blocked(uid, name, message, ban_identifier, verb="banned")
+    if block_reason:
+        await message.reply(block_reason, parse_mode=ParseMode.HTML)
         return
 
     # Process duration and reason tokens
@@ -1503,7 +1539,7 @@ async def shadow_ban_cmd(message: Message, command: CommandObject):
         await message.reply("⚠️ <b>Format:</b> Reply to user or use:\n• <code>/sban &lt;user_id&gt;</code>\n• <code>/sban &lt;@username&gt;</code>", parse_mode=ParseMode.HTML)
         return
 
-    block_reason = await _sban_target_blocked(uid, name, message)
+    block_reason = await _ban_target_blocked(uid, name, message, _first_arg(command))
     if block_reason:
         await message.reply(block_reason, parse_mode=ParseMode.HTML)
         return
@@ -1534,17 +1570,12 @@ async def shadow_ban_cmd(message: Message, command: CommandObject):
     )
     await message.reply(f"{get_mention(uid, name)} has been <b>shadow banned</b> for 10 minutes.", parse_mode=ParseMode.HTML)
 
-@main_router.message(Command("sunban"))
+@main_router.message(Command("sunban", "tadaima"))
 async def shadow_unban_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
     uid, name = await resolve_target(command.args, message)
     if not uid:
-        await message.reply("⚠️ <b>Format:</b> Reply to user or use:\n• <code>/sunban &lt;user_id&gt;</code>\n• <code>/sunban &lt;@username&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-
-    block_reason = await _sban_target_blocked(uid, name, message)
-    if block_reason:
-        await message.reply(block_reason, parse_mode=ParseMode.HTML)
+        await message.reply(f"⚠️ <b>Format:</b> Reply to user or use:\n• <code>/{command.command} &lt;user_id&gt;</code>\n• <code>/{command.command} &lt;@username&gt;</code>", parse_mode=ParseMode.HTML)
         return
 
     if uid not in config.shadow_banned:
@@ -1636,9 +1667,9 @@ def build_admin_help_text() -> str:
         "➷ /add_promo\n〻 Generate promo codes [Admin Only]\n\n"
         "➷ /list_promos\n〻 View all active promotional codes [Admin Only]\n\n"
         "➷ /del_promo [Code]\n〻 Delete an active promotional code [Admin Only]\n\n"
-        "➷ /gban /gunban &lt;reply/id/@user&gt;\n〻 Restrict user globally\n\n"
+        "➷ /gban (/bankai) /gunban (/kaizoku) &lt;reply/id/@user&gt;\n〻 Restrict user globally\n\n"
         "➷ /gbans\n〻 List globally restricted users\n\n"
-        "➷ /sban /sunban &lt;reply/id/@user&gt;\n〻 Mute user temporarily\n\n"
+        "➷ /sban /sunban (/tadaima) &lt;reply/id/@user&gt;\n〻 Mute user temporarily\n\n"
         "➷ /sbans\n〻 List muted users\n\n"
         "➷ /autoleave on|off\n〻 Toggle automated small group departure\n\n"
         "➷ /lock_drop &lt;anime name&gt;\n〻 Prevent a specific anime series from appearing in drops\n\n"
