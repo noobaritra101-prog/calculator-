@@ -270,9 +270,48 @@ def _get_owned_cards(uid: int, db: dict) -> list:
     return [cid for cid, cd in user_cards.items() if cd.get("amount", 0) >= 1]
 
 
-def _eligible_cards(uid: int, mode: str, db: dict) -> list:
+# Field(s) on a global_cards entry that hold the card's anime/series name.
+# The first one present wins -- edit this tuple if your DB uses another key.
+CARD_ANIME_FIELDS = ("anime", "series", "anime_name", "franchise")
+ANIME_PER_PAGE    = 12   # 3 rows x 4 numbered buttons
+MIN_DRAFT_CARDS   = 8
+
+
+def _card_anime(cdata: dict) -> str:
+    """The anime/series a card belongs to ('' if the card has none)."""
+    for f in CARD_ANIME_FIELDS:
+        v = cdata.get(f)
+        if v:
+            return str(v).strip()
+    return ""
+
+
+def _anime_label(state: dict) -> str:
+    return state.get("anime") or "All Anime"
+
+
+def _anime_suffix(state: dict) -> str:
+    return f" ({html.escape(state['anime'])})" if state.get("anime") else ""
+
+
+def _anime_line(state: dict) -> str:
+    """Extra line for the challenge text; empty when no anime is selected."""
+    if not state.get("anime"):
+        return ""
+    return f"<b>⤷「 Anime: 🎬 {html.escape(state['anime'])} 」</b>\n"
+
+
+def _mode_title(state: dict) -> str:
+    """Board header text: 'Divine' or 'Divine · Solo Leveling'."""
+    if state.get("anime"):
+        return f"{state['mode']} · {html.escape(state['anime'])}"
+    return state["mode"]
+
+
+def _eligible_cards(uid: int, mode: str, db: dict, anime: str | None = None) -> list:
     """
-    Owned cards that are usable in Versus.
+    Owned cards that are usable in Versus. If `anime` is given, only cards
+    from that anime are returned.
     """
     owned = _get_owned_cards(uid, db)
     eligible = []
@@ -283,13 +322,48 @@ def _eligible_cards(uid: int, mode: str, db: dict) -> list:
             continue
         if mode != "Mix" and cs.get("tier") != mode:
             continue
+        if anime and _card_anime(cdata).lower() != anime.lower():
+            continue
         eligible.append(cid)
     return eligible
 
 
-def _pull_random_card(uid: int, mode: str, used: set, db: dict) -> str | None:
+def _anime_tier_counts(uid: int, db: dict) -> dict:
+    """{anime: {"Divine": n, "Elite": n, "Basic": n, "Mix": total}} for this user's usable cards."""
+    out: dict = {}
+    for cid in _eligible_cards(uid, "Mix", db):
+        cdata = db["global_cards"].get(cid, {})
+        a = _card_anime(cdata)
+        if not a:
+            continue
+        tier = (get_char_stats(cdata.get("name", "")) or {}).get("tier")
+        d = out.setdefault(a, {"Divine": 0, "Elite": 0, "Basic": 0, "Mix": 0})
+        d["Mix"] += 1
+        if tier in d:
+            d[tier] += 1
+    return out
+
+
+def _usable_modes(counts_a: dict, counts_b: dict, anime: str) -> list:
+    """Rarities (in MODES order) where BOTH players have >= 8 cards of `anime`."""
+    ca, cb = counts_a.get(anime, {}), counts_b.get(anime, {})
+    return [m for m in MODES if ca.get(m, 0) >= MIN_DRAFT_CARDS and cb.get(m, 0) >= MIN_DRAFT_CARDS]
+
+
+def _available_animes(uid_a: int, uid_b: int, db: dict) -> list:
+    """Anime where both players can draft in at least one rarity."""
+    ca, cb = _anime_tier_counts(uid_a, db), _anime_tier_counts(uid_b, db)
+    return sorted((a for a in ca if _usable_modes(ca, cb, a)), key=str.lower)
+
+
+def _best_mode(preferred: str, usable: list) -> str:
+    """Keep `preferred` if usable, else the first usable rarity (Divine > Elite > Basic > Mix)."""
+    return preferred if preferred in usable else usable[0]
+
+
+def _pull_random_card(uid: int, mode: str, used: set, db: dict, anime: str | None = None) -> str | None:
     """Pull a random eligible card from user's deck excluding already-used ones."""
-    eligible  = _eligible_cards(uid, mode, db)
+    eligible  = _eligible_cards(uid, mode, db, anime)
     available = [c for c in eligible if c not in used]
     return random.choice(available) if available else None
 
@@ -316,7 +390,7 @@ def _apply_pull(state: dict, uid: int, db: dict) -> tuple[bool, str, str | None]
     used       = set(roster.values())
     mode       = state["mode"]
 
-    card_id = _pull_random_card(uid, mode, used, db)
+    card_id = _pull_random_card(uid, mode, used, db, state.get("anime"))
     if not card_id:
         return False, "No available cards left in your deck!", None
 
@@ -502,29 +576,76 @@ def _pending_kb(uid_a: int, uid_b: int, match_id: str = None, show_webapp: bool 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _settings_kb(uid_a: int, uid_b: int, current_mode: str, current_display: str = "chat") -> InlineKeyboardMarkup:
-    rows = []
-    row = []
-    for m in MODES:
-        is_selected = (m == current_mode)
-        row.append(InlineKeyboardButton(
-            text=f"{MODE_ICONS[m]} {m}",
+def _settings_kb(uid_a: int, uid_b: int) -> InlineKeyboardMarkup:
+    """Main settings menu:  [Mode][Rarity] / [Universe] / [Back & Save]"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Mode",   callback_data=f"vs_submenu_mode_{uid_a}_{uid_b}",   style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="Rarity", callback_data=f"vs_submenu_rarity_{uid_a}_{uid_b}", style=ButtonStyle.PRIMARY),
+        ],
+        [InlineKeyboardButton(text="Universe", callback_data=f"vs_animepick_0_{uid_a}_{uid_b}", style=ButtonStyle.PRIMARY)],
+        [InlineKeyboardButton(text="Back & Save", callback_data=f"vs_back_{uid_a}_{uid_b}")],
+    ])
+
+
+def _mode_kb(uid_a: int, uid_b: int, current_display: str) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(
+        text=DISPLAY_LABELS[d],
+        callback_data=f"vs_setdisplay_{d}_{uid_a}_{uid_b}",
+        style=ButtonStyle.SUCCESS if d == current_display else ButtonStyle.PRIMARY
+    ) for d in DISPLAY_MODES]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        row,
+        [InlineKeyboardButton(text="Back", callback_data=f"vs_settings_{uid_a}_{uid_b}")],
+    ])
+
+
+def _rarity_kb(uid_a: int, uid_b: int, current_mode: str) -> InlineKeyboardMarkup:
+    def btn(m):
+        return InlineKeyboardButton(
+            text=(f"{MODE_ICONS[m]} {m}" if m != "Mix" else m),
             callback_data=f"vs_setmatchmode_{m}_{uid_a}_{uid_b}",
-            style=ButtonStyle.SUCCESS if is_selected else ButtonStyle.PRIMARY
+            style=ButtonStyle.SUCCESS if m == current_mode else ButtonStyle.PRIMARY
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Divine"), btn("Elite")],
+        [btn("Basic"), btn("Mix")],
+        [InlineKeyboardButton(text="Back", callback_data=f"vs_settings_{uid_a}_{uid_b}")],
+    ])
+
+
+def _anime_picker_kb(uid_a: int, uid_b: int, options: list, page: int,
+                     current_anime: str | None) -> InlineKeyboardMarkup:
+    """Numbered buttons, 4 per row, then [All Anime], paging, Back."""
+    pages = max(1, (len(options) + ANIME_PER_PAGE - 1) // ANIME_PER_PAGE)
+    page  = max(0, min(page, pages - 1))
+    start = page * ANIME_PER_PAGE
+    rows, row = [], []
+    for i, name in enumerate(options[start:start + ANIME_PER_PAGE], start=start):
+        row.append(InlineKeyboardButton(
+            text=str(i + 1),
+            callback_data=f"vs_setanime_{i}_{uid_a}_{uid_b}",
+            style=ButtonStyle.SUCCESS if (current_anime and name.lower() == current_anime.lower()) else ButtonStyle.PRIMARY
         ))
-        if len(row) == 2:
+        if len(row) == 4:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([
-        InlineKeyboardButton(
-            text=f"{DISPLAY_ICONS[d]} {DISPLAY_LABELS[d]}",
-            callback_data=f"vs_setdisplay_{d}_{uid_a}_{uid_b}",
-            style=ButtonStyle.SUCCESS if d == current_display else ButtonStyle.PRIMARY
-        ) for d in DISPLAY_MODES
-    ])
-    rows.append([InlineKeyboardButton(text="Back & Save", callback_data=f"vs_back_{uid_a}_{uid_b}")])
+    rows.append([InlineKeyboardButton(
+        text="All Anime",
+        callback_data=f"vs_setanime_x_{uid_a}_{uid_b}",
+        style=ButtonStyle.SUCCESS if not current_anime else ButtonStyle.PRIMARY
+    )])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="< Prev", callback_data=f"vs_animepick_{page - 1}_{uid_a}_{uid_b}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data=f"vs_animepick_{page}_{uid_a}_{uid_b}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="Next >", callback_data=f"vs_animepick_{page + 1}_{uid_a}_{uid_b}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="Back", callback_data=f"vs_settings_{uid_a}_{uid_b}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -536,7 +657,7 @@ def _web_mode_freeze_board(state: dict) -> tuple[str, InlineKeyboardMarkup]:
     this message, so the chat isn't left showing "in progress" forever.
     """
     text = (
-        f"<b>「  NEXUS  — {state['mode']} Draft ぁ 」</b>\n"
+        f"<b>「  NEXUS  — {_mode_title(state)} Draft ぁ 」</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"⬤ <b>{_link(state['challenger'], state['name_a'])}</b>\n"
         f"⬤ <b>{_link(state['opponent'], state['name_b'])}</b>\n"
@@ -599,7 +720,7 @@ def _build_board(state: dict, db: dict,
             draw_req_line = f"\n\n🤝 <b>{name_b}</b> has offered a draw. Waiting for {name_a}…"
 
     text = (
-        f"<b>「  NEXUS  — {mode} Draft ぁ 」</b>\n"
+        f"<b>「  NEXUS  — {_mode_title(state)} Draft ぁ 」</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"⬤ <b>{link_a}</b>\n"
         f"{lines_a}\n\n"
@@ -881,6 +1002,8 @@ async def versus_cmd(message: Message):
         "msg_id":      None,
         "stage":       "pending",
         "mode":        saved_mode,
+        "anime":       None,
+        "anime_opts":  [],
         "display":     saved_display,
         "roster_a":    {},
         "roster_b":    {},
@@ -954,146 +1077,187 @@ async def _accept_timeout(key: frozenset, msg_id: int, chat_id: int):
 # ==========================================
 # ACCEPT / DECLINE / SETTINGS CALLBACKS
 # ==========================================
-@main_router.callback_query(F.data.startswith("vs_settings_"))
-async def vs_settings_cb(cq: CallbackQuery):
-    parts = cq.data.split("_")
-    uid_a = int(parts[2])
-    uid_b = int(parts[3])
-    key   = _state_key(uid_a, uid_b)
+def _settings_summary(state: dict) -> str:
+    display = _display_of(state)
+    return (
+        f"🎮 Mode: {DISPLAY_ICONS[display]} <b>{DISPLAY_LABELS[display]}</b>\n"
+        f"💎 Rarity: {MODE_ICONS[state['mode']]} <b>{state['mode']}</b>\n"
+        f"🌌 Universe: <b>{html.escape(_anime_label(state))}</b>"
+    )
 
+
+async def _show_settings(cq: CallbackQuery, state: dict, uid_a: int, uid_b: int, section: str = "main",
+                         page: int = 0, options: list | None = None) -> None:
+    """Render one of the settings screens (main / mode / rarity / universe)."""
+    head = "<b>⚙️ Versus Match Settings</b>\n"
+    if section == "mode":
+        text = (head + "Choose where this match is played:\n\n" + _settings_summary(state) + "\n\n"
+                "<i>Chat Mode plays out as board edits in this chat. Web Mode plays out "
+                "entirely in the Battle Arena app — this chat message won't keep updating.</i>")
+        kb = _mode_kb(uid_a, uid_b, _display_of(state))
+    elif section == "rarity":
+        text = head + "Choose the rarity to draft from:\n\n" + _settings_summary(state)
+        kb = _rarity_kb(uid_a, uid_b, state["mode"])
+    elif section == "universe":
+        options = options or []
+        start = page * ANIME_PER_PAGE
+        lines = "\n".join(f"<b>{i + 1}.</b> {html.escape(n)}"
+                          for i, n in enumerate(options[start:start + ANIME_PER_PAGE], start=start))
+        text = (head + "🌌 <b>Universe</b> — only cards from the chosen anime will spawn.\n"
+                f"Showing anime where <b>both players</b> have {MIN_DRAFT_CARDS}+ usable cards.\n\n"
+                f"{lines}\n\nCurrent: <b>{html.escape(_anime_label(state))}</b>")
+        kb = _anime_picker_kb(uid_a, uid_b, options, page, state.get("anime"))
+    else:
+        text = head + "Pick a setting to change:\n\n" + _settings_summary(state)
+        kb = _settings_kb(uid_a, uid_b)
+    await _edit_pending_msg(cq, text, kb)
+
+
+async def _settings_guard(cq: CallbackQuery, uid_a: int, uid_b: int):
+    """Shared checks for every settings callback. Returns state or None."""
+    key = _state_key(uid_a, uid_b)
     if cq.from_user.id != uid_a:
         await cq.answer("⚠️ Only the challenger can change settings.", show_alert=True)
-        return
-
+        return None
     if not _click_allowed(cq.from_user.id):
         await cq.answer("⏳ Slow down a bit!", show_alert=False)
-        return
-
+        return None
     if key not in active_versus:
         await cq.answer("⚠️ Challenge has expired.", show_alert=True)
-        return
-
+        return None
     state = active_versus[key]
     if state["stage"] != "pending":
         await cq.answer("⚠️ Challenge already in progress.", show_alert=True)
+        return None
+    return state
+
+
+@main_router.callback_query(F.data.startswith("vs_settings_"))
+async def vs_settings_cb(cq: CallbackQuery):
+    parts = cq.data.split("_")
+    uid_a, uid_b = int(parts[2]), int(parts[3])
+    state = await _settings_guard(cq, uid_a, uid_b)
+    if state is None:
+        return
+    await _show_settings(cq, state, uid_a, uid_b, "main")
+    await cq.answer()
+
+
+@main_router.callback_query(F.data.startswith("vs_submenu_"))
+async def vs_submenu_cb(cq: CallbackQuery):
+    parts = cq.data.split("_")            # vs_submenu_<mode|rarity>_a_b
+    section = parts[2]
+    uid_a, uid_b = int(parts[3]), int(parts[4])
+    state = await _settings_guard(cq, uid_a, uid_b)
+    if state is None:
+        return
+    if section not in ("mode", "rarity"):
+        await cq.answer()
+        return
+    await _show_settings(cq, state, uid_a, uid_b, section)
+    await cq.answer()
+
+
+@main_router.callback_query(F.data.startswith("vs_animepick_"))
+async def vs_animepick_cb(cq: CallbackQuery):
+    parts = cq.data.split("_")            # vs_animepick_<page>_a_b
+    page = int(parts[2])
+    uid_a, uid_b = int(parts[3]), int(parts[4])
+    state = await _settings_guard(cq, uid_a, uid_b)
+    if state is None:
+        return
+    db = load_db()
+    options = _available_animes(uid_a, uid_b, db)
+    state["anime_opts"] = options
+    if not options:
+        await cq.answer(
+            f"⚠️ No anime where both of you have {MIN_DRAFT_CARDS}+ usable cards.",
+            show_alert=True
+        )
+        return
+    await _show_settings(cq, state, uid_a, uid_b, "universe", page=page, options=options)
+    await cq.answer()
+
+
+@main_router.callback_query(F.data.startswith("vs_setanime_"))
+async def vs_setanime_cb(cq: CallbackQuery):
+    parts = cq.data.split("_")            # vs_setanime_<idx|x>_a_b
+    sel = parts[2]
+    uid_a, uid_b = int(parts[3]), int(parts[4])
+    state = await _settings_guard(cq, uid_a, uid_b)
+    if state is None:
         return
 
-    current_mode    = state["mode"]
-    current_display = _display_of(state)
-    kb = _settings_kb(uid_a, uid_b, current_mode, current_display)
+    note, alert = "Universe: All Anime", False
+    if sel == "x":
+        state["anime"] = None
+    else:
+        opts = state.get("anime_opts") or []
+        try:
+            chosen = opts[int(sel)]
+        except (ValueError, IndexError):
+            await cq.answer("⚠️ That list is out of date — reopen Universe.", show_alert=True)
+            return
+        db = load_db()
+        ca, cb = _anime_tier_counts(uid_a, db), _anime_tier_counts(uid_b, db)
+        usable = _usable_modes(ca, cb, chosen)
+        if not usable:
+            await cq.answer("⚠️ One of you no longer has enough cards for that anime.", show_alert=True)
+            return
+        old_mode = state["mode"]
+        state["anime"] = chosen
+        state["mode"] = _best_mode(old_mode, usable)
+        note = f"Universe: {chosen}"
+        if state["mode"] != old_mode:
+            note = (f"Rarity switched to {MODE_ICONS[state['mode']]} {state['mode']} — "
+                    f"not enough {old_mode} cards in {chosen}.")
+            alert = True
 
-    await _edit_pending_msg(
-        cq,
-        f"<b>⚙️ Versus Match Settings</b>\n"
-        f"Select the character tier to draft from for this match:\n\n"
-        f"Current: {MODE_ICONS[current_mode]} <b>{current_mode}</b>\n"
-        f"Display: {DISPLAY_ICONS[current_display]} <b>{DISPLAY_LABELS[current_display]}</b>\n"
-        f"<i>Chat Mode plays out as board edits in this chat. Web Mode plays out "
-        f"entirely in the Battle Arena app — this chat message won't keep updating.</i>",
-        kb
-    )
-    await cq.answer()
+    await _show_settings(cq, state, uid_a, uid_b, "main")
+    await cq.answer(note, show_alert=alert)
 
 
 @main_router.callback_query(F.data.startswith("vs_setmatchmode_"))
 async def vs_setmatchmode_cb(cq: CallbackQuery):
-    parts = cq.data.split("_")
-    mode  = parts[2]
-    uid_a = int(parts[3])
-    uid_b = int(parts[4])
-    key   = _state_key(uid_a, uid_b)
-
-    if cq.from_user.id != uid_a:
-        await cq.answer("⚠️ Only the challenger can change settings.", show_alert=True)
+    parts = cq.data.split("_")            # vs_setmatchmode_<rarity>_a_b
+    mode = parts[2]
+    uid_a, uid_b = int(parts[3]), int(parts[4])
+    state = await _settings_guard(cq, uid_a, uid_b)
+    if state is None:
         return
-
-    if not _click_allowed(cq.from_user.id):
-        await cq.answer("⏳ Slow down a bit!", show_alert=False)
-        return
-
-    if key not in active_versus:
-        await cq.answer("⚠️ Challenge has expired.", show_alert=True)
-        return
-
-    state = active_versus[key]
-    if state["stage"] != "pending":
-        await cq.answer("⚠️ Challenge already in progress.", show_alert=True)
+    if mode not in MODES:
+        await cq.answer("⚠️ Invalid rarity.", show_alert=True)
         return
 
     db = load_db()
-    owned_a_mode = _eligible_cards(uid_a, mode, db)
-    owned_b_mode = _eligible_cards(uid_b, mode, db)
-    if len(owned_a_mode) < 8:
-        await cq.answer(f"⚠️ You don't own 8 eligible characters for {mode} mode.", show_alert=True)
+    anime = state.get("anime")
+    scope = f"{mode}" + (f" in {anime}" if anime else "")
+    if len(_eligible_cards(uid_a, mode, db, anime)) < MIN_DRAFT_CARDS:
+        await cq.answer(f"⚠️ You don't own {MIN_DRAFT_CARDS} eligible characters for {scope}.", show_alert=True)
         return
-    if len(owned_b_mode) < 8:
-        await cq.answer(
-            f"⚠️ {state['name_b']} doesn't own 8 eligible characters for {mode} mode.",
-            show_alert=True
-        )
+    if len(_eligible_cards(uid_b, mode, db, anime)) < MIN_DRAFT_CARDS:
+        await cq.answer(f"⚠️ {state['name_b']} doesn't own {MIN_DRAFT_CARDS} eligible characters for {scope}.", show_alert=True)
         return
 
     state["mode"] = mode
-    current_display = _display_of(state)
-    kb = _settings_kb(uid_a, uid_b, mode, current_display)
-
-    await _edit_pending_msg(
-        cq,
-        f"<b>⚙️ Versus Match Settings</b>\n"
-        f"Select the character tier to draft from for this match:\n\n"
-        f"Current: {MODE_ICONS[mode]} <b>{mode}</b>\n"
-        f"Display: {DISPLAY_ICONS[current_display]} <b>{DISPLAY_LABELS[current_display]}</b>\n"
-        f"<i>Chat Mode plays out as board edits in this chat. Web Mode plays out "
-        f"entirely in the Battle Arena app — this chat message won't keep updating.</i>",
-        kb
-    )
-    await cq.answer(f"Match mode set to {mode}!")
+    await _show_settings(cq, state, uid_a, uid_b, "rarity")
+    await cq.answer(f"Rarity set to {mode}!")
 
 
 @main_router.callback_query(F.data.startswith("vs_setdisplay_"))
 async def vs_setdisplay_cb(cq: CallbackQuery):
-    parts   = cq.data.split("_")
+    parts = cq.data.split("_")            # vs_setdisplay_<chat|web>_a_b
     display = parts[2]
-    uid_a   = int(parts[3])
-    uid_b   = int(parts[4])
-    key     = _state_key(uid_a, uid_b)
-
-    if cq.from_user.id != uid_a:
-        await cq.answer("⚠️ Only the challenger can change settings.", show_alert=True)
+    uid_a, uid_b = int(parts[3]), int(parts[4])
+    state = await _settings_guard(cq, uid_a, uid_b)
+    if state is None:
         return
-
-    if not _click_allowed(cq.from_user.id):
-        await cq.answer("⏳ Slow down a bit!", show_alert=False)
-        return
-
-    if key not in active_versus:
-        await cq.answer("⚠️ Challenge has expired.", show_alert=True)
-        return
-
-    state = active_versus[key]
-    if state["stage"] != "pending":
-        await cq.answer("⚠️ Challenge already in progress.", show_alert=True)
-        return
-
     if display not in DISPLAY_MODES:
         await cq.answer("⚠️ Invalid display mode.", show_alert=True)
         return
-
     state["display"] = display
-    mode = state["mode"]
-    kb = _settings_kb(uid_a, uid_b, mode, display)
-
-    await _edit_pending_msg(
-        cq,
-        f"<b>⚙️ Versus Match Settings</b>\n"
-        f"Select the character tier to draft from for this match:\n\n"
-        f"Current: {MODE_ICONS[mode]} <b>{mode}</b>\n"
-        f"Display: {DISPLAY_ICONS[display]} <b>{DISPLAY_LABELS[display]}</b>\n"
-        f"<i>Chat Mode plays out as board edits in this chat. Web Mode plays out "
-        f"entirely in the Battle Arena app — this chat message won't keep updating.</i>",
-        kb
-    )
-    await cq.answer(f"Display set to {DISPLAY_LABELS[display]}!")
+    await _show_settings(cq, state, uid_a, uid_b, "mode")
+    await cq.answer(f"Mode set to {DISPLAY_LABELS[display]}!")
 
 
 @main_router.callback_query(F.data.startswith("vs_back_"))
@@ -1142,6 +1306,7 @@ async def vs_back_cb(cq: CallbackQuery):
         cq,
         f"<b>{name_a} has challenged {name_b} to a Card Battle!</b>\n\n"
         f"「 Mode: {MODE_ICONS[mode]} {mode} 」\n"
+        f"{_anime_line(state)}"
         f"「 Display: {DISPLAY_ICONS[display]} {DISPLAY_LABELS[display]} 」\n"
         f"━━━━━━━━━━━━━━━━━\n\n"
         f"<b><i>{name_b}, will you accept the challenge?</i></b>",
@@ -1182,18 +1347,18 @@ async def vs_accept_cb(cq: CallbackQuery):
     try:
         db = load_db()
 
-        owned_a_mode = _eligible_cards(uid_a, state["mode"], db)
-        owned_b_mode = _eligible_cards(uid_b, state["mode"], db)
+        owned_a_mode = _eligible_cards(uid_a, state["mode"], db, state.get("anime"))
+        owned_b_mode = _eligible_cards(uid_b, state["mode"], db, state.get("anime"))
         if len(owned_a_mode) < 8:
             await cq.answer(
-                f"⚠️ {state['name_a']} no longer owns 8 eligible characters for {state['mode']} mode.",
+                f"⚠️ {state['name_a']} no longer owns 8 eligible characters for {state['mode']} mode{_anime_suffix(state)}.",
                 show_alert=True
             )
             void_text = (
                 f"<b>「 𝗔𝗡𝗜𝗠𝗘 𝗡𝗘𝗫𝗨𝗦 ぁ 」</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"⚠️ <b>Challenge cancelled</b> — {state['name_a']} doesn't have 8 eligible "
-                f"characters for {state['mode']} mode.\n"
+                f"characters for {state['mode']} mode{_anime_suffix(state)}.\n"
                 f"━━━━━━━━━━━━━━━"
             )
             try:
@@ -1204,14 +1369,14 @@ async def vs_accept_cb(cq: CallbackQuery):
             return
         if len(owned_b_mode) < 8:
             await cq.answer(
-                f"⚠️ You don't own 8 eligible characters for {state['mode']} mode.",
+                f"⚠️ You don't own 8 eligible characters for {state['mode']} mode{_anime_suffix(state)}.",
                 show_alert=True
             )
             void_text = (
                 f"<b>「 𝗔𝗡𝗜𝗠𝗘 𝗡𝗘𝗫𝗨𝗦 ぁ 」</b>\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"⚠️ <b>Challenge cancelled</b> — {state['name_b']} doesn't have 8 eligible "
-                f"characters for {state['mode']} mode.\n"
+                f"characters for {state['mode']} mode{_anime_suffix(state)}.\n"
                 f"━━━━━━━━━━━━━━━"
             )
             try:
@@ -1469,6 +1634,7 @@ async def _finalize_mutual_draw(key: frozenset, chat_id: int, db: dict, msg_id: 
             "uid_a":         uid_a, "uid_b": uid_b,
             "name_a":        state["name_a"], "name_b": state["name_b"],
             "mode":          state["mode"],
+            "anime":         state.get("anime"),
             "display":       _display_of(state),
             "chat_id":       chat_id,
             "roster_a":      state["roster_a"], "roster_b": state["roster_b"],
@@ -1868,6 +2034,7 @@ async def _finalize_battle(key: frozenset, chat_id: int, db: dict, msg_id: int):
             "uid_a":         uid_a, "uid_b": uid_b,
             "name_a":        state["name_a"], "name_b": state["name_b"],
             "mode":          state["mode"],
+            "anime":         state.get("anime"),
             "display":       _display_of(state),
             "chat_id":       chat_id,
             "roster_a":      state["roster_a"], "roster_b": state["roster_b"],
@@ -1954,6 +2121,7 @@ def _serialize_state(state: dict, db: dict, viewer_uid: int | None) -> dict:
         "match_id":   state["match_id"],
         "stage":      state["stage"],
         "mode":       state["mode"],
+        "anime":      state.get("anime"),
         "display":    _display_of(state),
         "role":       role,
         "viewer_uid": viewer_uid,
@@ -1983,6 +2151,7 @@ def _serialize_finished(snap: dict, db: dict, viewer_uid: int | None) -> dict:
         "match_id": snap["match_id"],
         "stage": "draw" if snap.get("mutual_draw") else "result",
         "mode": snap["mode"],
+        "anime": snap.get("anime"),
         "display": snap.get("display", "chat"),
         "role": role,
         "player_a": {"uid": snap["uid_a"], "name": snap["name_a"], "roster": _roster_out(snap["roster_a"], db)},
@@ -2069,7 +2238,7 @@ async def api_versus_active():
             out.append({
                 "match_id": state["match_id"],
                 "name_a": state["name_a"], "name_b": state["name_b"],
-                "mode": state["mode"], "stage": state["stage"],
+                "mode": state["mode"], "anime": state.get("anime"), "stage": state["stage"],
             })
     return {"matches": out}
 
@@ -2088,23 +2257,23 @@ async def api_versus_accept(req: VersusActionReq):
     try:
         db = load_db()
         uid_a, uid_b = state["challenger"], state["opponent"]
-        if len(_eligible_cards(uid_a, state["mode"], db)) < 8:
+        if len(_eligible_cards(uid_a, state["mode"], db, state.get("anime"))) < 8:
             _delete_versus(key)
             try:
                 await _safe_edit_photo_board(
                     state["chat_id"], state["msg_id"],
-                    f"⚠️ <b>Challenge cancelled</b> — {state['name_a']} doesn't have 8 eligible characters for {state['mode']} mode.",
+                    f"⚠️ <b>Challenge cancelled</b> — {state['name_a']} doesn't have 8 eligible characters for {state['mode']} mode{_anime_suffix(state)}.",
                     kb=None
                 )
             except Exception:
                 pass
             raise HTTPException(status_code=400, detail=f"{state['name_a']} no longer owns 8 eligible characters for this mode.")
-        if len(_eligible_cards(uid_b, state["mode"], db)) < 8:
+        if len(_eligible_cards(uid_b, state["mode"], db, state.get("anime"))) < 8:
             _delete_versus(key)
             try:
                 await _safe_edit_photo_board(
                     state["chat_id"], state["msg_id"],
-                    f"⚠️ <b>Challenge cancelled</b> — {state['name_b']} doesn't have 8 eligible characters for {state['mode']} mode.",
+                    f"⚠️ <b>Challenge cancelled</b> — {state['name_b']} doesn't have 8 eligible characters for {state['mode']} mode{_anime_suffix(state)}.",
                     kb=None
                 )
             except Exception:
@@ -2195,9 +2364,9 @@ async def api_versus_mode(req: VersusModeReq):
         raise HTTPException(status_code=400, detail="Invalid mode.")
 
     db = load_db()
-    if len(_eligible_cards(uid, req.mode, db)) < 8:
+    if len(_eligible_cards(uid, req.mode, db, state.get("anime"))) < 8:
         raise HTTPException(status_code=400, detail=f"You don't own 8 eligible characters for {req.mode} mode.")
-    if len(_eligible_cards(state["opponent"], req.mode, db)) < 8:
+    if len(_eligible_cards(state["opponent"], req.mode, db, state.get("anime"))) < 8:
         raise HTTPException(status_code=400, detail=f"{state['name_b']} doesn't own 8 eligible characters for {req.mode} mode.")
 
     state["mode"] = req.mode
@@ -2210,6 +2379,7 @@ async def api_versus_mode(req: VersusModeReq):
     text = (
         f"<b>{name_a} has challenged {name_b} to a Card Battle!</b>\n\n"
         f"「 Mode: {MODE_ICONS[req.mode]} {req.mode} 」\n"
+        f"{_anime_line(state)}"
         f"「 Display: {DISPLAY_ICONS[_display_of(state)]} {DISPLAY_LABELS[_display_of(state)]} 」\n"
         f"━━━━━━━━━━━━━━━━━\n\n"
         f"<b><i>{name_b}, will you accept the challenge?</i></b>"
@@ -2358,9 +2528,9 @@ async def api_versus_rematch(req: VersusActionReq):
 
     db = load_db()
     mode = snap["mode"]
-    if len(_eligible_cards(uid, mode, db)) < 8:
+    if len(_eligible_cards(uid, mode, db, snap.get("anime"))) < 8:
         raise HTTPException(status_code=400, detail=f"You don't own 8 eligible characters for {mode} mode.")
-    if len(_eligible_cards(other_uid, mode, db)) < 8:
+    if len(_eligible_cards(other_uid, mode, db, snap.get("anime"))) < 8:
         raise HTTPException(status_code=400, detail=f"{name_other} doesn't own 8 eligible characters for {mode} mode.")
 
     display  = snap.get("display", "chat")
@@ -2378,6 +2548,8 @@ async def api_versus_rematch(req: VersusActionReq):
         "msg_id":      None,
         "stage":       "pending",
         "mode":        mode,
+        "anime":       snap.get("anime"),
+        "anime_opts":  [],
         "display":     display,
         "roster_a":    {},
         "roster_b":    {},
@@ -2404,6 +2576,7 @@ async def api_versus_rematch(req: VersusActionReq):
         f"<b>🔁 Rematch! {_link(uid, name_mine)} has challenged {_link(other_uid, name_other)} "
         f"to another Card Battle!</b>\n\n"
         f"<b>⤷「 Mode: {MODE_ICONS[mode]} {mode} 」</b>\n"
+        f"{_anime_line(active_versus[key])}"
         f"<b>⤷「 Display: {DISPLAY_ICONS[display]} {DISPLAY_LABELS[display]} 」</b>\n"
         f"━━━━━━━━━━━━━━━\n\n"
         f"<b><i>{_link(other_uid, name_other)}, will you accept the rematch?</i></b>"
@@ -2434,6 +2607,14 @@ async def api_versus_rematch(req: VersusActionReq):
 # ==========================================
 # /vslive — LIST SPECTATABLE MATCHES
 # ==========================================
+def _strip_vs_tag(name: str) -> str:
+    """Drop a leading 'ⱽˢ' clan tag from a display name (the list adds its own ⱽˢ between players)."""
+    n = (name or "").strip()
+    while n.startswith("ⱽˢ"):
+        n = n[len("ⱽˢ"):].lstrip()
+    return n or (name or "").strip()
+
+
 @main_router.message(Command("vslive"))
 async def vslive_cmd(message: Message):
     uid = message.from_user.id
@@ -2444,11 +2625,18 @@ async def vslive_cmd(message: Message):
         await message.reply("⚔️ No live Versus matches right now.", parse_mode=ParseMode.HTML)
         return
 
-    lines = ["<b>⚔️ Live Versus Matches</b>", "━━━━━━━━━━━━━━━━━", ""]
-    rows = []
-    for s in live[:10]:
-        lines.append(f"• {s['name_a']} 🆚 {s['name_b']}  ({MODE_ICONS[s['mode']]} {s['mode']})")
-        rows.append([_versus_webapp_button(s["match_id"], f"🎮 Watch {s['name_a']} vs {s['name_b']}")])
+    lines = ["<b>All Live Versus Matches</b>", "━━━━━━━━━━━━━━━━━", ""]
+    buttons = []
+    for i, s in enumerate(live[:10], start=1):
+        name_a = html.escape(_strip_vs_tag(s["name_a"]))
+        name_b = html.escape(_strip_vs_tag(s["name_b"]))
+        lines.append(f"{i}) <b>{name_a} ⱽˢ {name_b}</b>")
+        lines.append(f"- Mode : {MODE_ICONS[s['mode']]} {s['mode']}")
+        lines.append("")
+        buttons.append(_versus_webapp_button(s["match_id"], f"Watch {i}"))
+
+    # 5 buttons per row, numbered to match the list
+    rows = [buttons[j:j + 5] for j in range(0, len(buttons), 5)]
 
     await message.reply(
         "\n".join(lines),
@@ -2620,69 +2808,80 @@ async def vstats_refresh_cb(cq: CallbackQuery):
 # ==========================================
 def _vsrule_menu_text() -> str:
     return (
-        "<b>⚡ NEXUS AWAKENING — Versus Arena ⚡</b>\n\n"
+        "<b>NEXUS AWAKENING — Versus Arena</b>\n\n"
         "Welcome to the Arena! Card Battle is a 1v1 PvP minigame where you draft "
         "cards from your own collection and clash stat-for-stat against another player.\n\n"
         "Tap a button below for details:\n"
-        "📖 <b>How to Play</b> — step-by-step walkthrough of a match.\n"
-        "📜 <b>Rules</b> — rewards, limits, and restrictions."
+        "<b>How to Play</b> — step-by-step walkthrough of a match.\n"
+        "<b>Rules</b> — rewards, limits, and restrictions.\n"
+        "<b>Stats</b> — what each stat means, with an example."
     )
 
 
 def _vsrule_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📖 How to Play", callback_data="vsrule_howto", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="📜 Rules", callback_data="vsrule_rules", style=ButtonStyle.SUCCESS),
-        ]
+            InlineKeyboardButton(text="How to Play", callback_data="vsrule_howto", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="Rules", callback_data="vsrule_rules", style=ButtonStyle.SUCCESS),
+        ],
+        [InlineKeyboardButton(text="Stats", callback_data="vsrule_stats", style=ButtonStyle.PRIMARY)],
     ])
 
 
 def _vsrule_howto_text() -> str:
     return (
-        "<b>📖 HOW TO PLAY — Versus Mode</b>\n"
+        "<b>HOW TO PLAY — Versus Mode</b>\n"
         "━━━━━━━━━━━━━━━━━\n\n"
 
-        "1️⃣ <b>Issue the Challenge</b>\n"
+        "1) <b>Issue the Challenge</b>\n"
         "<blockquote>"
         "• Reply to a player's message with <code>/versus</code> to challenge them "
         "(<b>60s</b> to Accept).\n"
-        "• Challenger picks the card tier via <b>⚙️ Settings</b>: <b>Divine, Elite, "
-        "Basic,</b> or <b>Mix</b>."
+        "• The challenger customizes the match from <b>Settings</b> on the challenge message."
         "</blockquote>\n\n"
 
-        "2️⃣ <b>Ready Up</b>\n"
+        "2) <b>Match Settings</b>\n"
+        "<blockquote>"
+        "• <b>Mode:</b> Chat or Web.\n"
+        "• <b>Rarity:</b> Divine, Elite, Basic, or Mix.\n"
+        "• <b>Universe:</b> Pick a specific anime series — only cards from that series will spawn. "
+        "Only series where <b>both players</b> have enough cards are available.\n"
+        "• If the selected rarity doesn't have enough cards, it automatically switches to a "
+        "rarity both players have enough cards for."
+        "</blockquote>\n\n"
+
+        "3) <b>Ready Up</b>\n"
         "<blockquote>"
         "• Both players tap <b>Ready</b> to start the draft."
         "</blockquote>\n\n"
 
-        "3️⃣ <b>The Draft Phase</b>\n"
+        "4) <b>The Draft Phase</b>\n"
         "<blockquote>"
-        "• Take turns: tap <b>🎲 Pull Card</b>, then assign it to a slot — "
+        "• Take turns: tap <b>Pull Card</b>, then assign it to a slot — "
         "<b>Strength, Mana, Defence, Agility, Vitality, Intelligence, Luck</b>.\n"
-        "• <b>⏭️ Skip Card</b> discards a pull for a new one (max <b>2</b> per player).\n"
-        "• <b>🤝 Let's Draw</b> ends the match early if both players agree — no reward.\n"
+        "• <b>Skip Card</b> discards a pull for a new one (max <b>2</b> per player).\n"
+        "• <b>Let's Draw</b> ends the match early if both players agree — no reward.\n"
         "• <b>5 minutes</b> per turn, or the match may be forfeited as AFK."
         "</blockquote>\n\n"
 
-        "4️⃣ <b>The Clash</b>\n"
+        "5) <b>The Clash</b>\n"
         "<blockquote>"
         "• Matching slots are compared — higher stat wins the slot (+1 point), ties split it.\n"
         "• <b>Luck</b> is a 50/50 coin flip."
         "</blockquote>\n\n"
 
-        "5️⃣ <b>The Result</b>\n"
+        "6) <b>The Result</b>\n"
         "<blockquote>"
         "• Highest total score across all 7 slots wins the duel."
         "</blockquote>\n\n"
 
-        "Tap <b>📜 Rules</b> to see rewards and limits, or <b>🔙 Back</b> to return."
+        "Tap <b>Rules</b> to see rewards and limits, or <b>Back</b> to return."
     )
 
 
 def _vsrule_rules_text() -> str:
     return (
-        "<b>📜 RULES — Rewards & Limits</b>\n"
+        "<b>RULES — Rewards & Limits</b>\n"
         "━━━━━━━━━━━━━━━━━\n\n"
         "<b>「 𝗥𝗘𝗪𝗔𝗥𝗗𝗦 」</b>\n"
         "◉ <b>Victory Reward:</b> +150 💠 Nexus Shards per win.\n"
@@ -2691,24 +2890,73 @@ def _vsrule_rules_text() -> str:
         "wins pay 0 shards until it resets, though a win that lands right at the cap can "
         "still pay out a partial amount.\n"
         "◉ <b>Defeat / Draw Reward:</b> No shards, win or nothing.\n"
-        "◉ <b>Mutual Draw:</b> If both players tap <b>🤝 Let's Draw</b>, the match ends "
+        "◉ <b>Mutual Draw:</b> If both players tap <b>Let's Draw</b>, the match ends "
         "instantly as a draw — pays no shards.\n\n"
         "<b>「 𝗥𝗘𝗦𝗧𝗥𝗜𝗖𝗧𝗜𝗢𝗡𝗦 」</b>\n"
-        "◉ You need at least <b>8 eligible cards</b> in the chosen tier to start or accept a duel.\n"
+        "◉ You need at least <b>8 eligible cards</b> in the chosen rarity (and Universe, if one is selected) "
+        "to start or accept a duel.\n"
         "◉ You can't challenge yourself or a bot.\n"
         "◉ You can only have <b>one active Versus</b> at a time — finish it before starting another.\n"
         "◉ <b>AFK Rule:</b> If either player fails to respond or participate in time, "
         "no rewards will be granted.\n\n"
-        "Tap <b>📖 How to Play</b> for a full walkthrough, or <b>🔙 Back</b> to return."
+        "Tap <b>How to Play</b> for a full walkthrough, or <b>Back</b> to return."
     )
 
 
-def _vsrule_detail_kb(other: str) -> InlineKeyboardMarkup:
-    other_label = "📖 How to Play" if other == "vsrule_howto" else "📜 Rules"
-    other_style = ButtonStyle.PRIMARY if other == "vsrule_howto" else ButtonStyle.SUCCESS
+def _vsrule_stats_text() -> str:
+    return (
+        "<b>STATS — What They Mean</b>\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "Every character card has its own value for each stat. In a match you fill "
+        "<b>7 slots</b>, one per stat, and each slot is decided by comparing the two "
+        "cards placed in it.\n\n"
+        "<b>「 𝗧𝗛𝗘 𝗦𝗧𝗔𝗧𝗦 」</b>\n"
+        "◉ <b>Strength</b> — raw physical power.\n"
+        "◉ <b>Mana</b> — magical or spiritual energy.\n"
+        "◉ <b>Defence</b> — how well the character withstands damage.\n"
+        "◉ <b>Agility</b> — speed and reflexes.\n"
+        "◉ <b>Vitality</b> — stamina and endurance.\n"
+        "◉ <b>Intelligence</b> — tactics and brainpower.\n"
+        "◉ <b>Luck</b> — pure chance. Card stats don't matter; it's a 50/50 coin flip.\n\n"
+        "<b>「 𝗘𝗫𝗔𝗠𝗣𝗟𝗘 」</b>\n"
+        "<blockquote>"
+        "You pull <b>Card X</b> with Strength <b>90</b> and Mana <b>40</b>.\n"
+        "• Put it in the <b>Strength</b> slot and it fights with <b>90</b>.\n"
+        "• Put it in the <b>Mana</b> slot and it fights with only <b>40</b>.\n"
+        "Only the stat matching the slot counts, so place each card where it is strongest."
+        "</blockquote>\n\n"
+        "<b>「 𝗦𝗖𝗢𝗥𝗜𝗡𝗚 」</b>\n"
+        "<blockquote>"
+        "Player A vs Player B:\n"
+        "• Strength: 90 vs 75 — A wins (+1 to A)\n"
+        "• Mana: 60 vs 80 — B wins (+1 to B)\n"
+        "• Defence: 70 vs 55 — A wins (+1 to A)\n"
+        "• Agility: 65 vs 65 — tie (+0.5 each)\n"
+        "• Vitality: 85 vs 70 — A wins (+1 to A)\n"
+        "• Intelligence: 50 vs 72 — B wins (+1 to B)\n"
+        "• Luck: coin flip — A wins (+1 to A)\n\n"
+        "Final score: <b>A 4.5 — B 2.5</b>. Player A wins the duel."
+        "</blockquote>\n\n"
+        "Tap <b>How to Play</b> or <b>Rules</b> for more, or <b>Back</b> to return."
+    )
+
+
+_VSRULE_PAGES = {
+    "vsrule_howto": ("How to Play", ButtonStyle.PRIMARY),
+    "vsrule_rules": ("Rules",       ButtonStyle.SUCCESS),
+    "vsrule_stats": ("Stats",       ButtonStyle.PRIMARY),
+}
+
+
+def _vsrule_detail_kb(current: str) -> InlineKeyboardMarkup:
+    """Buttons for the two pages other than `current`, plus Back."""
+    others = [
+        InlineKeyboardButton(text=label, callback_data=key, style=style)
+        for key, (label, style) in _VSRULE_PAGES.items() if key != current
+    ]
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=other_label, callback_data=other, style=other_style)],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="vsrule_menu", style=ButtonStyle.DANGER)]
+        others,
+        [InlineKeyboardButton(text="Back", callback_data="vsrule_menu", style=ButtonStyle.DANGER)]
     ])
 
 
@@ -2737,7 +2985,7 @@ async def vsrule_howto_cb(cq: CallbackQuery):
     await cq.message.edit_text(
         _vsrule_howto_text(),
         parse_mode=ParseMode.HTML,
-        reply_markup=_vsrule_detail_kb("vsrule_rules")
+        reply_markup=_vsrule_detail_kb("vsrule_howto")
     )
     await cq.answer()
 
@@ -2752,7 +3000,22 @@ async def vsrule_rules_cb(cq: CallbackQuery):
     await cq.message.edit_text(
         _vsrule_rules_text(),
         parse_mode=ParseMode.HTML,
-        reply_markup=_vsrule_detail_kb("vsrule_howto")
+        reply_markup=_vsrule_detail_kb("vsrule_rules")
+    )
+    await cq.answer()
+
+
+@main_router.callback_query(F.data == "vsrule_stats")
+async def vsrule_stats_cb(cq: CallbackQuery):
+    uid = cq.from_user.id
+    if is_ghost_banned(uid) or is_shadow_banned(uid):
+        await cq.answer()
+        return
+
+    await cq.message.edit_text(
+        _vsrule_stats_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_vsrule_detail_kb("vsrule_stats")
     )
     await cq.answer()
 
