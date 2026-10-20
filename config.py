@@ -631,7 +631,7 @@ def is_shadow_banned(uid: int) -> bool:
 # Both minigames draw from the SAME daily shard pool per user, so hitting
 # the cap in one game blocks further rewards in the other for the day.
 # ==========================================
-DAILY_MINIGAME_REWARD_CAP = 3000
+DAILY_MINIGAME_REWARD_CAP = 3300
 
 def get_daily_minigame_rewards(user_data: dict) -> dict:
     """Returns (and resets if stale) the user's shared daily minigame reward tracker."""

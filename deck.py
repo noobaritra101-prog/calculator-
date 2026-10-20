@@ -120,7 +120,7 @@ ADSGRAM_RARITY_WEIGHTS = {
 # instead of the normal weighted odds. Expiry is stored as a timestamp in
 # db["settings"], so it survives restarts and switches itself off after 24h.
 FAD_DURATION_SECONDS = 24 * 60 * 60
-FAD_ADS_PER_CYCLE = 6   # ads required per daily card while /fad is ON (normally ADSGRAM_ADS_PER_CYCLE)
+FAD_ADS_PER_CYCLE = 4   # ads required per daily card while /fad is ON (normally ADSGRAM_ADS_PER_CYCLE)
 
 def _fad_seconds_left(db: dict) -> int:
     """Seconds of Force-Ads-Divine remaining (0 = off). Clears an expired flag."""
@@ -884,7 +884,26 @@ def caption_visible_length(html_text: str) -> int:
     return sum(2 if ord(ch) > 0xFFFF else 1 for ch in plain)
 
 
-async def send_deck_page(message, db: dict, user_id: str, page=0, edit=False, mult=1):
+def _match_anime_name(query: str, names) -> "str | None":
+    """Best owned-anime match for a typed query: exact > prefix > substring > close spelling."""
+    norm = lambda t: re.sub(r"[^a-z0-9]+", " ", unicodedata.normalize("NFKD", t).lower()).strip()
+    q = norm(query)
+    if not q:
+        return None
+    by_norm = {}
+    for n in names:
+        by_norm.setdefault(norm(n), n)
+    if q in by_norm:
+        return by_norm[q]
+    for test in (lambda k: k.startswith(q), lambda k: q in k):
+        hits = sorted((k for k in by_norm if test(k)), key=len)
+        if hits:
+            return by_norm[hits[0]]
+    close = difflib.get_close_matches(q, list(by_norm), n=1, cutoff=0.6)
+    return by_norm[close[0]] if close else None
+
+
+async def send_deck_page(message, db: dict, user_id: str, page=0, edit=False, mult=1, jump_anime=None):
     actual_key, user_data = get_user_from_db(db, user_id)
     if not user_data:
         ensure_user(user_id, "User", None)
@@ -914,6 +933,19 @@ async def send_deck_page(message, db: dict, user_id: str, page=0, edit=False, mu
     elif sort_pref == "name":   enriched.sort(key=lambda x: (x[2], x[1].get("name", "").lower()))
     elif sort_pref == "amount": enriched.sort(key=lambda x: (x[2], x[1].get("amount", 1)), reverse=True)
     else:                       enriched.sort(key=lambda x: x[2])
+
+    if jump_anime:
+        matched = _match_anime_name(jump_anime, {a for _, _, a in enriched})
+        if not matched:
+            safe_q = _html_esc(jump_anime)
+            text = (f"<b>「 ANIME NOT FOUND 」</b>\n━━━━━━━━━━━━━━━━━\n"
+                    f"You don't own any cards from <b>{safe_q}</b>.\n"
+                    f"Use <code>/deck</code> to open your full deck.")
+            target = message.message if isinstance(message, CallbackQuery) else message
+            await smart_reply(target, text, parse_mode=ParseMode.HTML)
+            return
+        first_idx = next(i for i, (_, _, a) in enumerate(enriched) if a == matched)
+        page = first_idx // DECK_PER_PAGE
 
     total_pages = max(1, math.ceil(len(enriched) / DECK_PER_PAGE))
     if page >= total_pages: page = total_pages - 1
@@ -1060,7 +1092,7 @@ async def send_deck_page(message, db: dict, user_id: str, page=0, edit=False, mu
 
 
 @main_router.message(Command("deck"))
-async def view_deck_cmd(message: Message):
+async def view_deck_cmd(message: Message, command: CommandObject):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
 
@@ -1085,7 +1117,8 @@ async def view_deck_cmd(message: Message):
 
     user_id = str(message.from_user.id)
     db      = ensure_user(user_id, message.from_user.first_name, message.from_user.username)
-    await send_deck_page(message, db, user_id, page=0, edit=False)
+    anime_query = (command.args or "").strip()   # /deck -> normal | /deck <anime> -> jump to that anime's page
+    await send_deck_page(message, db, user_id, page=0, edit=False, jump_anime=anime_query or None)
 
 
 @main_router.callback_query(F.data == "check_deck_access")
