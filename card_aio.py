@@ -76,7 +76,7 @@ def create_logged_task(coro, name: str):
 # ==========================================
 import config
 from config import (
-    bot, dp, main_router, check_autoleave, is_ghost_banned, check_spam,
+    bot, dp, main_router, is_ghost_banned, check_spam,
     is_shadow_banned, ensure_group, periodic_save, backup_to_group,
     load_from_group, load_settings, _flush_db
 )
@@ -159,12 +159,6 @@ async def bot_added_to_group(event: ChatMemberUpdated):
 _cb_cooldown: dict[int, float] = {}
 CB_COOLDOWN_SEC = 1.2
 
-# check_autoleave ran on EVERY group message. A chat that passed the check is
-# not re-checked for AUTOLEAVE_RECHECK_SEC; a chat that failed is handled at once.
-_autoleave_ok_until: dict[int, float] = {}
-AUTOLEAVE_RECHECK_SEC = 30
-
-
 class GlobalGuardMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data: dict):
         is_msg = isinstance(event, Message)
@@ -181,13 +175,6 @@ class GlobalGuardMiddleware(BaseMiddleware):
         if is_msg:
             if not user.is_bot:
                 config.total_messages += 1
-            if event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-                _now = time.time()
-                if _autoleave_ok_until.get(event.chat.id, 0.0) <= _now:
-                    if await check_autoleave(event.chat.id):
-                        _autoleave_ok_until.pop(event.chat.id, None)
-                        return
-                    _autoleave_ok_until[event.chat.id] = _now + AUTOLEAVE_RECHECK_SEC
 
         # ADMIN IMMUNITY
         if uid not in config.ADMIN_IDS:

@@ -36,6 +36,7 @@ from config import (
 )
 from handlers import smart_reply, smart_reply_photo, _check_action_cooldown
 from vlog import log_action
+from halloween import halloween_flex_line, quest_progress, hw_locked, hw_lock_text
 
 # ==========================================
 # ERROR-ONLY FILE LOGGER (dlog.txt / /dlog)
@@ -55,6 +56,16 @@ if not dlog.handlers:
 # FASTAPI WEB APP API ROUTER (/api/deck)
 # ==========================================
 deck_api = APIRouter(prefix="/api/deck", tags=["Deck"])
+
+# Halloween Mini App API (/api/halloween/state | login | buy | ads/reward | ping).
+# Attached to this router with its FULL path, so it is served wherever deck_api is mounted
+# (no change needed in the file that creates the FastAPI app).
+try:
+    import halloween as _hw
+    for _r in _hw.get_router(prefix="/api/halloween").routes:
+        deck_api.routes.append(_r)
+except Exception as _e:
+    print(f"[halloween] could not attach web API: {_e}")
 
 
 def verify_init_data(init_data: str, max_age: int = 86400):
@@ -274,6 +285,7 @@ async def claim_ad_reward(user_id: str):
         "rarity": format_rarity(card_data["rarity"]),
         "chat_title": "Adsgram Daily Reward"
     })
+    quest_progress(str(actual_key), "airdrop", db=db)            # 🎃 quest
     save_db()
 
     display_rarity = format_rarity(card_data["rarity"])
@@ -585,6 +597,9 @@ async def api_burn_card(req: BurnRequest):
         if req.card_id in user_data.get("star_purchases", []):
             raise HTTPException(status_code=400, detail="Star cards cannot be burned.")
 
+        if hw_locked(db, req.card_id):
+            raise HTTPException(status_code=400, detail="Halloween cards cannot be burned.")
+
         card_data = user_cards[req.card_id]
         rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
 
@@ -602,6 +617,8 @@ async def api_burn_card(req: BurnRequest):
                 user_data["special_card"] = None
 
         user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + burn_payout
+        quest_progress(str(actual_key), "burn", db=db)               # 🎃 quest (web burn)
+        quest_progress(str(actual_key), "shards", burn_payout, db=db)
 
         log_action(db, str(actual_key), {
             "type": "web_burn",
@@ -690,6 +707,7 @@ WEBAPP_LINKS = {
     "airdrop":  f"https://t.me/{BOT_USERNAME}/airdrop",
     "mine":     f"https://t.me/{BOT_USERNAME}/webmine",
     "scramble": f"https://t.me/{BOT_USERNAME}/scramble",
+    "halloween": f"https://t.me/{BOT_USERNAME}/Halloween",
 }
 
 
@@ -704,6 +722,7 @@ async def all_webapps_cmd(message: Message):
          InlineKeyboardButton(text="🪂 Airdrop", url=L["airdrop"])],
         [InlineKeyboardButton(text="💣 Mine", url=L["mine"]),
          InlineKeyboardButton(text="🕵️ Scramble", url=L["scramble"])],
+        [InlineKeyboardButton(text="🎃 Halloween", url=L["halloween"])],
     ])
     await smart_reply(
         message,
@@ -1357,6 +1376,7 @@ async def _send_flex_card(message: Message, db: dict, user_id: str, first_name: 
         f"<b>⦿ <i>Character </i>» {flex_name} ⟪ {global_data.get('anime', 'Unknown')} ⟫ \n"
         f"⦾ <i>Rarity </i>» {display_rarity}\n"
         f"⬤ <i>Owned</i>  » x{matched_data.get('amount', 1)}</b>"
+        f"{halloween_flex_line(global_data)}"
     )
 
     try:
@@ -1487,6 +1507,9 @@ async def burn_cmd(message: Message, command: CommandObject):
     if matched_cid in db["users"][user_id].get("star_purchases", []):
         await smart_reply(message, "🌟 <b>Star cards cannot be burned.</b>", parse_mode=ParseMode.HTML)
         return
+    if hw_locked(db, matched_cid):
+        await smart_reply(message, hw_lock_text("burned"), parse_mode=ParseMode.HTML)
+        return
 
     global_data       = db["global_cards"].get(matched_cid, {})
     rarity_normalized = format_rarity(matched_data.get("rarity", "Common"))
@@ -1540,6 +1563,10 @@ async def confirm_burn_cb(cq: CallbackQuery):
         await cq.answer("🌟 Star cards cannot be burned.", show_alert=True)
         return
 
+    if hw_locked(db, card_id):
+        await cq.answer("🎃 Halloween cards cannot be burned.", show_alert=True)
+        return
+
     my_cards = user_data["cards"]
     card_data = my_cards[card_id]
     rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
@@ -1559,6 +1586,8 @@ async def confirm_burn_cb(cq: CallbackQuery):
             user_data["special_card"] = None
 
     user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + burn_payout
+    quest_progress(str(actual_key), "burn", db=db)               # 🎃 quest
+    quest_progress(str(actual_key), "shards", burn_payout, db=db)
 
     log_action(db, str(actual_key), {
         "type": "burn", "card_name": card_data.get("name", "Card"), "rarity": rarity_normalized,

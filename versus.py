@@ -26,6 +26,7 @@ from config import (
 )
 from char_stats import get_char_stats, STAT_FIELDS
 from gcard import GCARD_REWARD_PER_GUESS
+from halloween import quest_progress
 
 # ==========================================
 # CONSTANTS
@@ -1609,6 +1610,7 @@ async def _finalize_mutual_draw(key: frozenset, chat_id: int, db: dict, msg_id: 
         )
         p_record["draws"] = p_record.get("draws", 0) + 1
         p_record["streak"] = 0
+        quest_progress(u, "versus_play", db=db)   # 🎃 quest
 
     save_db()
 
@@ -2004,6 +2006,14 @@ async def _finalize_battle(key: frozenset, chat_id: int, db: dict, msg_id: int):
             p_record["draws"] = p_record.get("draws", 0) + 1
             p_record["streak"] = 0
         reward_msg = "\n\n<b>「 𝗩𝗘𝗥𝗦𝗨𝗦 𝗥𝗘𝗪𝗔𝗥𝗗𝗦 」</b>\n⚖️ Match ended in a draw! No rewards distributed."
+
+    # 🎃 Halloween quests: both players played, the winner also won (+ shards paid)
+    for _qu in (uid_a, uid_b):
+        quest_progress(_qu, "versus_play", db=db)
+    if winner_uid:
+        quest_progress(winner_uid, "versus_win", db=db)
+        if reward_amount:
+            quest_progress(winner_uid, "shards", reward_amount, db=db)
 
     save_db()
 

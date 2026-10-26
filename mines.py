@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from config import main_router, load_db, save_db, ensure_user, ADMIN_IDS, is_ghost_banned, is_shadow_banned
 from vlog import log_action
+from halloween import quest_progress
 
 # ==========================================
 # SETTINGS
@@ -349,6 +350,7 @@ async def api_start_game(req: StartGameReq):
     user_data["nexus_shards"] -= req.bet
     user_data["mines_bet"] = user_data.get("mines_bet", 0) + req.bet
     user_data["mines_games"] = user_data.get("mines_games", 0) + 1
+    quest_progress(uid, "mines", db=db)   # 🎃 quest
 
     global_stats = db.setdefault("mines_global", {})
     global_stats["total_bet"] = global_stats.get("total_bet", 0) + req.bet
@@ -606,6 +608,7 @@ async def mines_cmd(message: Message, command: CommandObject):
     user_data["nexus_shards"] -= bet
     user_data["mines_bet"] = user_data.get("mines_bet", 0) + bet
     user_data["mines_games"] = user_data.get("mines_games", 0) + 1
+    quest_progress(uid, "mines", db=db)   # 🎃 quest
 
     global_stats = db.setdefault("mines_global", {})
     global_stats["total_bet"] = global_stats.get("total_bet", 0) + bet

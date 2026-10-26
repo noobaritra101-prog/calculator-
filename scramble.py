@@ -40,6 +40,7 @@ from config import (
 from fastapi import HTTPException
 from pydantic import BaseModel
 from vlog import log_action   # /vlog activity log
+from halloween import quest_progress
 from deck import dlog, deck_api   # same FastAPI router the deck / chicken Mini Apps use   # same error-only log file (dlog.txt) the deck uses
 
 # /scramble            -> the bot picks a random card and scrambles it
@@ -366,6 +367,9 @@ def _scramble_settle(user_id: str, name: str, username, elapsed: float, earned: 
         log_action(db, user_id, entry)
     except Exception as e:
         dlog.error(f"[scramble_vlog] {e}", exc_info=True)
+    quest_progress(user_id, "scramble", db=db)   # 🎃 quest
+    if paid:
+        quest_progress(user_id, "shards", paid, db=db)
     save_db()
     return paid
 

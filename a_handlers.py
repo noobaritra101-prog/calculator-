@@ -1108,7 +1108,6 @@ def get_botstats_content() -> tuple[str, InlineKeyboardMarkup]:
         "<b>System</b>\n"
         f"  ├ Uptime: <code>{h}h {m}m {s}s</code>\n"
         f"  ├ Messages Processed: <code>{config.total_messages}</code>\n"
-        f"  ├ Auto-Leave Guard: <code>{'Active' if config.autoleave_enabled else 'Inactive'}</code>\n"
         f"  └ New Users Today: <code>+{users_today}</code>\n\n"
         "<b>Database</b>\n"
         f"  ├ Registered Cards: <code>{len(db['global_cards'])}</code>\n"
@@ -1319,19 +1318,6 @@ async def info_groups_page_cb(cq: CallbackQuery):
     await cq.message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
     await cq.answer()
 
-@main_router.message(Command("autoleave"))
-async def autoleave_toggle(message: Message, command: CommandObject):
-    if message.from_user.id not in ADMIN_IDS: return
-    if not command.args or command.args.lower() not in ["on", "off"]:
-        await message.reply("⚠️ Usage: <code>/autoleave on</code> or <code>off</code>", parse_mode=ParseMode.HTML)
-        return
-    
-    config.autoleave_enabled = (command.args.lower() == "on")
-    db = load_db()
-    db["settings"]["autoleave"] = config.autoleave_enabled
-    save_db()
-    await message.reply(f"🔄 Auto-leave: {'✅ ON' if config.autoleave_enabled else 'OFF'}\nMin: {config.AUTOLEAVE_MIN_MEMBERS} members", parse_mode=ParseMode.HTML)
-
 # ==========================================
 # RESTRICTION AND MODERATION CONTROLS
 # ==========================================
@@ -1401,7 +1387,7 @@ def _first_arg(command: CommandObject) -> str | None:
     args = (command.args or "").split(maxsplit=1)
     return args[0] if args else None
 
-@main_router.message(Command("gunban", "kaizoku"))
+@main_router.message(Command("gunban"))
 async def global_unban_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
     uid, name = await resolve_target(command.args, message)
@@ -1430,7 +1416,7 @@ async def global_unban_cmd(message: Message, command: CommandObject):
 
     await message.reply(f"✅ {get_mention(uid, name)} has been globally unbanned.", parse_mode=ParseMode.HTML)
 
-@main_router.message(Command("gban", "bankai"))
+@main_router.message(Command("gban"))
 async def global_ban_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
 
@@ -1570,7 +1556,7 @@ async def shadow_ban_cmd(message: Message, command: CommandObject):
     )
     await message.reply(f"{get_mention(uid, name)} has been <b>shadow banned</b> for 10 minutes.", parse_mode=ParseMode.HTML)
 
-@main_router.message(Command("sunban", "tadaima"))
+@main_router.message(Command("sunban"))
 async def shadow_unban_cmd(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS: return
     uid, name = await resolve_target(command.args, message)
@@ -1652,6 +1638,8 @@ def build_admin_help_text() -> str:
         "➷ /up [mode] (reply img)\n〻 Update interface images (st/hp/lb/sm/store/onst/offst)\n\n"
         "➷ /add_card Character|Anime|Rarity\n〻 Upload a new card image (reply to photo)\n\n"
         "➷ /edit_card DB-ID | Name | Anime | Rarity\n〻 Edit an existing card's details/image\n\n"
+        "➷ /hcard on DB-ID | off DB-ID | list\n〻 Mark / unmark / list 🎃 Halloween cards\n\n"
+        "➷ /halloween on [days] | pause | status | off\n〻 Control the Halloween event\n\n"
         "➷ /remove_card [ID]\n〻 Remove card from global db & GC\n\n"
         "➷ /forcedrop\n〻 Manually trigger a drop in chat\n\n"
         "➷ /backup\n〻 Force instant backup upload\n\n"
@@ -1667,11 +1655,10 @@ def build_admin_help_text() -> str:
         "➷ /add_promo\n〻 Generate promo codes [Admin Only]\n\n"
         "➷ /list_promos\n〻 View all active promotional codes [Admin Only]\n\n"
         "➷ /del_promo [Code]\n〻 Delete an active promotional code [Admin Only]\n\n"
-        "➷ /gban (/bankai) /gunban (/kaizoku) &lt;reply/id/@user&gt;\n〻 Restrict user globally\n\n"
+        "➷ /gban /gunban &lt;reply/id/@user&gt;\n〻 Restrict user globally\n\n"
         "➷ /gbans\n〻 List globally restricted users\n\n"
-        "➷ /sban /sunban (/tadaima) &lt;reply/id/@user&gt;\n〻 Mute user temporarily\n\n"
+        "➷ /sban /sunban &lt;reply/id/@user&gt;\n〻 Mute user temporarily\n\n"
         "➷ /sbans\n〻 List muted users\n\n"
-        "➷ /autoleave on|off\n〻 Toggle automated small group departure\n\n"
         "➷ /lock_drop &lt;anime name&gt;\n〻 Prevent a specific anime series from appearing in drops\n\n"
         "➷ /unlock_drop &lt;anime name&gt;\n〻 Re-enable drops for a previously locked anime series\n\n"
         "➷ /hide on|off &lt;anime name&gt;\n〻 Show/hide a series from the /cardlists browser\n\n"

@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import config
+from halloween import quest_progress, hw_locked
 from config import (
     bot, main_router, load_db, save_db, ensure_user, 
     format_rarity, SHOP_PRICES, OFFLINE_STORE_GROUP
@@ -700,6 +701,7 @@ async def buy_online_execute_cb(cq: CallbackQuery):
 
         db["users"][uid]["daily_purchases"]["bought"].append(card_id)
         _record_store_event(db, "online_buy", price, rarity, uid)
+        quest_progress(uid, "store_buy", db=db)   # 🎃 quest
         save_db()
         await config.flush_db_now()
 
@@ -788,6 +790,11 @@ async def sell_cmd(message: Message, command: CommandObject):
         await message.reply_rich(InputRichMessage(html="🌟 <b>Star cards cannot be sold in the Offline Store.</b>"))
         return
 
+    # Halloween cards are event-bound and can never be sold on the Offline Store
+    if hw_locked(db, matched_cid):
+        await message.reply_rich(InputRichMessage(html="🎃 <b>Halloween cards cannot be sold in the Offline Store.</b>"))
+        return
+
     global_data = db["global_cards"].get(matched_cid, {})
     
     # safeguard 2: Enforce rarity-based price floors to protect market value boundaries
@@ -857,6 +864,10 @@ async def confirm_sell_cb(cq: CallbackQuery):
     # Re-check at confirmation time (the card may have become a star card since /sell)
     if card_id in db["users"][uid].get("star_purchases", []):
         await cq.answer("🌟 Star cards cannot be sold in the Offline Store.", show_alert=True)
+        return
+
+    if hw_locked(db, card_id):
+        await cq.answer("🎃 Halloween cards cannot be sold in the Offline Store.", show_alert=True)
         return
 
     my_cards[card_id]["amount"] -= 1
@@ -1141,6 +1152,7 @@ async def _execute_offline_buy(cq: CallbackQuery, uid: str, lid: str):
 
         del db["offline_store"][lid]
         _record_store_event(db, "offline_sale", price, format_rarity(global_card["rarity"]), uid)
+        quest_progress(uid, "store_buy", db=db)   # 🎃 quest (the buyer)
         save_db()
         await config.flush_db_now()
 
@@ -1622,6 +1634,7 @@ async def api_online_buy(req: OnlineBuyRequest):
             user_data["total_claimed"] = user_data.get("total_claimed", 0) + 1
             dp["bought"].append(req.card_id)
             _record_store_event(db, "online_buy", price, rarity, req.user_id)
+            quest_progress(req.user_id, "store_buy", db=db)   # 🎃 quest (web buy)
             save_db()
             await config.flush_db_now()
 
@@ -1879,6 +1892,7 @@ async def api_buy_offline(req: OfflineBuyRequest):
 
             del db["offline_store"][req.listing_id]
             _record_store_event(db, "offline_sale", price, format_rarity(global_card["rarity"]), req.user_id)
+            quest_progress(req.user_id, "store_buy", db=db)   # 🎃 quest (web buy, the buyer)
             save_db()
             await config.flush_db_now()
 

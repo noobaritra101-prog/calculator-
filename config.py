@@ -132,8 +132,7 @@ MEMBER_CACHE_TTL   = 3600
 SPAM_WINDOW           = 10
 SPAM_THRESHOLD        = 10
 SHADOW_BAN_DUR        = 600
-AUTOLEAVE_MIN_MEMBERS = 40
-autoleave_enabled     = True
+DROP_MIN_MEMBERS      = 40   # groups below this never get card drops
 
 RARITIES     = ["Divine ❄️", "Elite ⚓", "Basic 🃏"]
 RARITY_ORDER = {"Divine ❄️": 0, "Elite ⚓": 1, "Basic 🃏": 2}
@@ -537,9 +536,7 @@ def ensure_group(chat_id, chat_title):
     return db
 
 def load_settings():
-    global autoleave_enabled
     db = load_db()
-    autoleave_enabled = db["settings"].get("autoleave", True)
     
     ghost_banned.clear()
     for uid in db["settings"].get("ghost_banned", []):
@@ -653,6 +650,11 @@ def get_query_daily_tracker(user_data: dict) -> dict:
 
 def check_spam(uid: int) -> bool:
     if uid in ADMIN_IDS: return False
+    # Already shadow-banned: do not count their messages, so the ban
+    # message is not triggered again and the ban is not extended.
+    if is_shadow_banned(uid):
+        spam_tracker[uid] = []
+        return False
     now = time.time()
     spam_tracker.setdefault(uid, [])
     spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < SPAM_WINDOW]
@@ -666,35 +668,22 @@ def check_spam(uid: int) -> bool:
         return True
     return False
 
-async def check_autoleave(chat_id: int) -> bool:
-    if chat_id in [DB_GROUP_ID, DATABASE_BACKUP_ID, PUBLIC_LOG_GROUP_ID]: 
-        return False
-        
-    if not autoleave_enabled: return False
+async def group_has_min_members(chat_id: int) -> bool:
+    """True if the group has at least DROP_MIN_MEMBERS members (card drops allowed).
+    Count is cached for MEMBER_CACHE_TTL. If Telegram cannot be reached, a stale
+    cached count is used; with no count at all the drop is skipped."""
     now = time.time()
     cached_count, last_checked = group_member_cache.get(chat_id, (None, 0))
     if cached_count is not None and (now - last_checked) < MEMBER_CACHE_TTL:
-        count = cached_count
-    else:
-        try:
-            count = await bot.get_chat_member_count(chat_id)
-            group_member_cache[chat_id] = (count, now)
-        except Exception:
-            return False
-
-    if count is not None and count < AUTOLEAVE_MIN_MEMBERS:
-        try:
-            await bot.send_message(
-                chat_id,
-                "<b>「 ANIME NEXUS ぁ 」</b>\n"
-                "⚠️ This group has fewer than <b>40 members</b>.\n"
-                "I'm leaving now — さようなら 👋",
-                parse_mode=ParseMode.HTML
-            )
-            await bot.leave_chat(chat_id)
-            return True
-        except Exception: pass
-    return False
+        return cached_count >= DROP_MIN_MEMBERS
+    try:
+        count = await bot.get_chat_member_count(chat_id)
+        group_member_cache[chat_id] = (count, now)
+        return count >= DROP_MIN_MEMBERS
+    except Exception:
+        if cached_count is not None:
+            return cached_count >= DROP_MIN_MEMBERS
+        return False
 
 # ==========================================
 # TARGET RESOLVER FOR ADMIN COMMANDS

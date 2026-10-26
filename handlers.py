@@ -21,6 +21,7 @@ from aiogram.enums import ParseMode, ChatType, ChatMemberStatus
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 import config
+from halloween import halloween_flex_line, maybe_halloween_drop, award_seize_candies, quest_progress, hw_locked, hw_lock_text
 from config import (
     bot, main_router, ADMIN_IDS, DECK_PER_PAGE, CARDS_PER_PAGE, BROWSE_PER_PAGE,
     group_counters, active_drops, bot_start_time, spoiler_cache, RARITIES,
@@ -583,6 +584,9 @@ async def bowling_roll_cmd(message: Message):
         shards_won = random.randint(40, 60)
         user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + shards_won
 
+    quest_progress(user_id, "roll", db=db)                       # 🎃 quest
+    if shards_won:
+        quest_progress(user_id, "shards", shards_won, db=db)
     save_db()
 
     if shards_won:
@@ -663,6 +667,9 @@ async def basketball_throw_cmd(message: Message):
         shards_won = random.randint(40, 60)
         user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + shards_won
 
+    quest_progress(user_id, "throw", db=db)                      # 🎃 quest
+    if shards_won:
+        quest_progress(user_id, "shards", shards_won, db=db)
     save_db()
 
     if shards_won:
@@ -959,6 +966,9 @@ async def expire_drop(chat_id: str, msg_id: int):
 
 
 async def trigger_drop(chat_id: int):
+    # Groups under DROP_MIN_MEMBERS (40) do not get card drops
+    if not await config.group_has_min_members(chat_id):
+        return
     db = load_db()
     if not db["global_cards"]: return
 
@@ -985,6 +995,7 @@ async def trigger_drop(chat_id: int):
     if not pool:
         pool = db["global_cards"]
 
+    pool = maybe_halloween_drop(db, pool, target_rarity)   # 🎃 event boost
     card_id, card_data = random.choice(list(pool.items()))
     display_rarity     = format_rarity(card_data["rarity"])
 
@@ -1206,6 +1217,9 @@ async def seize_cmd(message: Message, command: CommandObject):
         db["users"][user_id]["cards"][card_id] = {"name": global_card["name"], "rarity": global_card["rarity"], "amount": 0}
     db["users"][user_id]["cards"][card_id]["amount"] += 1
     db["users"][user_id]["total_claimed"] = db["users"][user_id].get("total_claimed", 0) + 1
+    candy_gain = award_seize_candies(db, db["users"][user_id], global_card)   # 🎃 event
+    quest_progress(user_id, "seize", db=db)
+    quest_progress(user_id, "shards", total_earned, db=db)
 
     if cid_str in db["groups"]:
         db["groups"][cid_str]["claims"] = db["groups"][cid_str].get("claims", 0) + 1
@@ -1217,6 +1231,8 @@ async def seize_cmd(message: Message, command: CommandObject):
     bonus_breakdown    = f" (+{speed_bonus} Speed⚡)" if speed_bonus else ""
     if dupe_bonus:
         bonus_breakdown += " (+10 Dupe♻️)"
+    if candy_gain:
+        bonus_breakdown += f" (+{candy_gain} 🍬)"
 
     winner_text = (
         "<b>「 🎊 CARD SEIZED ぁ 」\n"
@@ -1344,6 +1360,9 @@ async def gift_cmd(message: Message, command: CommandObject):
     if matched_cid in db["users"][user_id].get("star_purchases", []):
         await message.reply("🌟 <b>Star cards cannot be gifted.</b>", parse_mode=ParseMode.HTML)
         return
+    if hw_locked(db, matched_cid):
+        await message.reply(hw_lock_text("gifted"), parse_mode=ParseMode.HTML)
+        return
     global_data    = db["global_cards"].get(matched_cid, {})
     display_rarity = format_rarity(matched_data["rarity"])
 
@@ -1432,6 +1451,9 @@ async def confirm_gift_cb(cq: CallbackQuery):
 
     if card_id in db["users"][user_id].get("star_purchases", []):
         await cq.answer("🌟 Star cards cannot be gifted.", show_alert=True)
+        return
+    if hw_locked(db, card_id):
+        await cq.answer("🎃 Halloween cards cannot be gifted.", show_alert=True)
         return
 
     if _check_action_cooldown(f"gift_{user_id}"):
@@ -1615,6 +1637,10 @@ async def trade_cmd(message: Message, command: CommandObject):
         )
         return
 
+    if hw_locked(db, my_cid) or hw_locked(db, their_cid):
+        await message.reply(hw_lock_text("traded"), parse_mode=ParseMode.HTML)
+        return
+
     my_rarity    = format_rarity(my_cdata["rarity"])
     their_rarity = format_rarity(their_cdata["rarity"])
 
@@ -1703,6 +1729,20 @@ async def accept_trade_cb(cq: CallbackQuery):
             pass
         return
 
+    # Halloween cards can never be traded (re-checked in case a card was flagged after the offer)
+    if hw_locked(db, my_cid) or hw_locked(db, their_cid):
+        trade["status"] = "cancelled"
+        active_trades.pop(trade_id, None)
+        await cq.answer("🎃 Halloween cards cannot be traded.", show_alert=True)
+        try:
+            await cq.message.edit_text(
+                "<b>「 TRADE CANCELLED 」</b>\n━━━━━━━━━━━━━━━━━\n🎃 Halloween cards cannot be traded.",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
     # Star cards can never be traded (re-checked here in case it was bought after the offer)
     if my_cid in db["users"].get(sender_id, {}).get("star_purchases", []) or \
        their_cid in db["users"].get(target_id, {}).get("star_purchases", []):
@@ -1750,6 +1790,8 @@ async def accept_trade_cb(cq: CallbackQuery):
         "cp_id": sender_id, "cp_name": db["users"][sender_id].get("name", "User"),
         "chat_id": cq.message.chat.id, "chat_title": chat_title,
     })
+    quest_progress(sender_id, "trade", db=db)                    # 🎃 quest (both sides)
+    quest_progress(target_id, "trade", db=db)
     save_db()
     await config.flush_db_now()
 
@@ -2240,6 +2282,7 @@ async def inline_query_handler(inline_query: InlineQuery):
             f"<b>⦿ <i>Character </i>» {cdata['name']} ⟪ {full.get('anime', '?')} ⟫ \n"
             f"⦾ <i>Rarity </i>» {disp_rarity}\n"
             f"⬤ <i>Owned</i>  » x{cdata['amount']}</b>"
+            f"{halloween_flex_line(full)}"
         )
 
         if file_id.startswith("http://") or file_id.startswith("https://"):
