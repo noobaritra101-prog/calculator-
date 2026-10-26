@@ -92,6 +92,7 @@ import market
 import mines
 import gcard
 import scramble  # /scramble puzzle minigame
+import match  # /match card-matching minigame
 import tree 
 
 from handlers import trigger_drop
