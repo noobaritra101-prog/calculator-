@@ -123,6 +123,9 @@ LOGIN_EVENT = (
 # Adsgram reward postback (create a rewarded block in the Adsgram dashboard and set its reward URL to):
 #   https://<your-worker>/api/halloween/ads/reward?userid=[userId]&secret=<HW_AD_SECRET>   (&key=... also works)
 HW_AD_SECRET = "gUz6e7bs0-TrdtHVtx7EAM63mMpfvQsc"   # same secret as ADSGRAM_REWARD_SECRET in deck.py
+# Catch-up window: when this many event days (or fewer) are left, or the event is past night 7, a player can
+# watch the ads of ALL missed nights together and claim them in one go (no reset to night 1).
+LOGIN_CATCHUP_DAYS_LEFT = 2
 
 # /treat (reply to a player, 3 uses per giver per day) and /trick (once per UTC day) — community (group chat) commands
 TOT_COMMUNITY_ONLY = True        # False = also allow them in private chats
@@ -2069,6 +2072,29 @@ def _login(db: dict, user: dict) -> dict:
     return h
 
 
+def _catchup_open(db: dict, user: dict) -> bool:
+    """True in the catch-up window: the last LOGIN_CATCHUP_DAYS_LEFT days of the event, or any day after
+    night 7 has passed. Missed nights can then be watched and claimed together."""
+    dn = event_day(db) if event_active(db) else None
+    if not dn and user.get("hw_test"):
+        dn = _tester_clock(user)[:2]
+    if not dn:
+        return False
+    day, total = dn
+    return (total - day + 1) <= LOGIN_CATCHUP_DAYS_LEFT or day > len(LOGIN_EVENT)
+
+
+def _afford(streak: int, seen: int) -> tuple:
+    """(how many nights the `seen` ads pay for, ads those nights cost), counting from night streak+1."""
+    k = cost = 0
+    for d in LOGIN_EVENT[streak:]:
+        if cost + d["ads"] > seen:
+            break
+        cost += d["ads"]
+        k += 1
+    return k, cost
+
+
 def _login_view(db: dict, user: dict):
     """(nights claimed in the current run, can claim tonight?, streak just broke?, catch-up?)
     catch-up = exactly ONE night was missed: tonight completes the missed night AND tonight together."""
@@ -2076,6 +2102,8 @@ def _login_view(db: dict, user: dict):
     today, last, streak = _today(), h.get("last"), int(h.get("streak", 0))
     if streak >= len(LOGIN_EVENT):
         return streak, False, False, False      # finished all nights: nothing more to claim or watch this event
+    if _catchup_open(db, user):
+        return streak, True, False, False       # catch-up window: keep progress, claim missed nights together
     broken = catchup = False
     if last and last != today:
         if streak > 0 and _gap(last, today) > 1:
@@ -2091,13 +2119,16 @@ def login_completed(db: dict, user: dict) -> bool:
     return int(_login(db, user).get("streak", 0)) >= len(LOGIN_EVENT)
 
 
-def _nights_due(streak: int, catchup: bool) -> tuple:
-    """The LOGIN_EVENT nights that tonight's claim pays out (2 when catching up a missed night)."""
+def _nights_due(streak: int, catchup: bool, bulk: bool = False) -> tuple:
+    """The LOGIN_EVENT nights that tonight's claim pays out (2 when catching up a missed night;
+    every remaining night in the final catch-up window)."""
+    if bulk:
+        return LOGIN_EVENT[streak:]
     return LOGIN_EVENT[streak:streak + (2 if catchup else 1)]
 
 
-def _ads_needed(streak: int, catchup: bool) -> int:
-    nights = _nights_due(streak, catchup)
+def _ads_needed(streak: int, catchup: bool, bulk: bool = False) -> int:
+    nights = _nights_due(streak, catchup, bulk)
     return sum(d["ads"] for d in nights) if nights else LOGIN_EVENT[-1]["ads"]
 
 
@@ -2121,7 +2152,7 @@ def record_ad(db: dict, user: dict, uid=None) -> int:
     streak, can, _broken, catchup = _login_view(db, user)
     if not can:
         return _ads_today(user)
-    n = min(_ads_needed(streak, catchup), _ads_today(user) + 1)
+    n = min(_ads_needed(streak, catchup, _catchup_open(db, user)), _ads_today(user) + 1)
     user["hw_login_ads"] = {"date": _today(), "n": n}
     save_db()
     return n
@@ -2151,13 +2182,22 @@ def claim_login(db: dict, user: dict, uid=None):
     streak, can, _broken, catchup = _login_view(db, user)
     if not can:
         return False, {"error": "Already claimed tonight — come back after 00:00 UTC."}
-    nights = _nights_due(streak, catchup)
-    if not nights:
-        return False, {"error": "Nothing to claim right now."}
-    need = _ads_needed(streak, catchup)
     seen = _ads_today(user)
-    if seen < need:
-        return False, {"error": f"Watch {need} ad(s) first ({seen}/{need})."}
+    bulk = _catchup_open(db, user)
+    if bulk:
+        k, used = _afford(streak, seen)          # pay as many missed nights as the watched ads cover
+        nights = LOGIN_EVENT[streak:streak + k]
+        if not nights:
+            first = LOGIN_EVENT[streak]["ads"]
+            return False, {"error": f"Watch {first} ad(s) first ({seen}/{first})."}
+        catchup = k > 1
+    else:
+        nights = _nights_due(streak, catchup)
+        if not nights:
+            return False, {"error": "Nothing to claim right now."}
+        used = need = _ads_needed(streak, catchup)
+        if seen < need:
+            return False, {"error": f"Watch {need} ad(s) first ({seen}/{need})."}
 
     # Pick the cards BEFORE granting anything, so an empty pool never costs the player.
     picks = []
@@ -2178,7 +2218,7 @@ def claim_login(db: dict, user: dict, uid=None):
         cards.append({"name": str(c.get("name", "Card")), "rarity": format_rarity(c.get("rarity", ""))})
     h = _login(db, user)
     h["streak"], h["last"] = streak + len(nights), _today()
-    user["hw_login_ads"] = {"date": _today(), "n": 0}
+    user["hw_login_ads"] = {"date": _today(), "n": max(0, seen - used) if bulk else 0}
     save_db()
     return True, {"day": streak + len(nights), "nights": [streak + 1 + i for i in range(len(nights))],
                   "catchup": bool(catchup), "shards": shards, "cards": cards}
@@ -2187,6 +2227,7 @@ def claim_login(db: dict, user: dict, uid=None):
 def _login_text(db: dict, user: dict) -> str:
     """The /hwlogin card. Bold only (the whole text is one bold block)."""
     streak, can, broken, catchup = _login_view(db, user)
+    bulk = can and _catchup_open(db, user)
     total = len(LOGIN_EVENT)
     rows = []
     for i, d in enumerate(LOGIN_EVENT):
@@ -2196,14 +2237,18 @@ def _login_text(db: dict, user: dict) -> str:
         cur = f"[Current]: Night {total} (complete)"
     elif not can:
         cur = f"[Current]: Night {streak} (complete)"
+    elif bulk:
+        cur = f"[Current]: Nights {streak + 1}-{total} (catch-up, claim together)"
     elif catchup:
         cur = f"[Current]: Nights {streak + 1} + {streak + 2} (incomplete)"
     else:
         cur = f"[Current]: Night {streak + 1} (incomplete)"
     lines = [f"「 {HW_EMOJI} 7-NIGHT LOGIN EVENT 」", "━━━━━━━━━━━━━━━━━"] + rows + ["", cur]
     if streak < total and can:
-        need = _ads_needed(streak, catchup)
+        need = _ads_needed(streak, catchup, bulk)
         lines.append(f"[Ads]: {min(_ads_today(user), need)}/{need} watched")
+        if bulk:
+            lines.append("The event is ending: watch the ads of every missed night and claim them together.")
     if broken:
         lines += ["", "You missed a night, so the event restarted at night 1."]
     return "<b>" + "\n".join(lines) + "</b>"
@@ -2462,7 +2507,9 @@ def _web_view(db: dict, user: dict, uid=None) -> dict:
     lon, hon = login_enabled(db, uid), haunt_enabled(db, uid)
     q, h = (_roll_quests(user) if hon else None), _haunt(db, user)
     streak, can, broken, catchup = _login_view(db, user)
-    need = _ads_needed(streak, catchup)
+    bulk = bool(can and lon and _catchup_open(db, user))
+    need = _ads_needed(streak, catchup, bulk)
+    claimable = _afford(streak, _ads_today(user))[0] if bulk else 0
     dn, bought, active = event_day(db), user.get("hw_bought", {}), (event_active(db) or bool(user.get("hw_test")))
     left = event_seconds_left(db)
     if not left and user.get("hw_test"):          # no real event: the tester runs their own (starts at /hwtest on)
@@ -2475,7 +2522,7 @@ def _web_view(db: dict, user: dict, uid=None) -> dict:
         "shards": int(user.get("nexus_shards", 0) or 0),
         "features": {"login": lon, "haunt": hon},
         "login": {"streak": streak, "completed": streak >= len(LOGIN_EVENT), "can_claim": bool(can and lon), "broken": broken, "catchup": bool(catchup),
-                  "ads_needed": need,
+                  "ads_needed": need, "bulk": bulk, "claimable": claimable,
                   "ads_watched": min(_ads_today(user), need) if (can and lon) else 0},
         "quests": {"items": [{"k": i["k"], "text": QUESTS[i["k"]][0].format(t=i["t"]), "t": i["t"],
                               "p": i["p"], "r": i["r"], "done": i["done"], "claimed": _it_claimed(i)} for i in q["items"]] if q else [],
