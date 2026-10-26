@@ -17,6 +17,8 @@ that are not picked up. Check it: open <BACKEND>/api/deck/match/ping -> {"ok": t
 BotFather -> /newapp -> short name "match" -> Web App URL = where match.html is hosted.
 """
 import io
+import os
+import hashlib
 import math
 import time
 import random
@@ -77,6 +79,11 @@ MATCH_POOL_LOW = 30
 MATCH_RECENT_MAX = 60
 MATCH_REFILL_PARALLEL = 4           # simultaneous Telegram downloads while refilling
 
+# Disk cache of finished thumbnails (survives restarts/redeploys on a volume; harmless without one).
+# Keyed by Telegram file_id, so replaced card art is never served stale.
+MATCH_CACHE_DIR = "match_cache"
+MATCH_CACHE_MAX = 600
+
 _match_runs: dict = {}              # run token -> game state (see match_web_start)
 _match_pool: dict = {}              # card_id -> prepared JPEG thumbnail
 _match_recent: deque = deque(maxlen=MATCH_RECENT_MAX)
@@ -102,11 +109,45 @@ def _match_prepare(raw: bytes) -> bytes:
     return out.getvalue()
 
 
+def _match_disk_path(file_id: str) -> str:
+    return os.path.join(MATCH_CACHE_DIR, hashlib.sha1(file_id.encode()).hexdigest() + ".jpg")
+
+
+def _match_disk_get(file_id: str):
+    try:
+        with open(_match_disk_path(file_id), "rb") as f:
+            return f.read() or None
+    except OSError:
+        return None
+
+
+def _match_disk_put(file_id: str, data: bytes):
+    try:
+        os.makedirs(MATCH_CACHE_DIR, exist_ok=True)
+        path = _match_disk_path(file_id)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)   # atomic: never a half-written file
+        files = [os.path.join(MATCH_CACHE_DIR, n) for n in os.listdir(MATCH_CACHE_DIR) if n.endswith(".jpg")]
+        if len(files) > MATCH_CACHE_MAX:   # trim the oldest
+            files.sort(key=os.path.getmtime)
+            for old in files[:len(files) - MATCH_CACHE_MAX + 20]:
+                os.remove(old)
+    except OSError:
+        pass
+
+
 async def _match_fetch(file_id: str) -> bytes:
-    """Download a card and prepare its thumbnail."""
+    """A card's thumbnail: from the disk cache if present, else download + prepare + cache."""
+    hit = await asyncio.to_thread(_match_disk_get, file_id)
+    if hit:
+        return hit
     buf = io.BytesIO()
     await bot.download(file_id, destination=buf)
-    return await asyncio.to_thread(_match_prepare, buf.getvalue())
+    thumb = await asyncio.to_thread(_match_prepare, buf.getvalue())
+    await asyncio.to_thread(_match_disk_put, file_id, thumb)
+    return thumb
 
 
 def _match_valid_ids(db: dict) -> list:
@@ -444,6 +485,10 @@ async def match_web_avatar(req: MatchReq):
 async def match_cmd(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+    try:   # warm the card pool now, so the board is ready by the time they tap Play
+        _match_kick_refill(ensure_user(str(uid_int), message.from_user.first_name, message.from_user.username))
+    except Exception as e:
+        dlog.error(f"[match_warm] {e}", exc_info=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         _scr_url_btn("Play Match", MATCH_WEB_LINK, "primary")]])
     text = (
