@@ -21,7 +21,7 @@ from aiogram.enums import ParseMode, ChatType, ChatMemberStatus
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 import config
-from halloween import halloween_flex_line, maybe_halloween_drop, award_seize_candies, quest_progress, hw_locked, hw_lock_text
+from halloween import halloween_flex_line, maybe_halloween_drop, award_seize_candies, quest_progress
 from config import (
     bot, main_router, ADMIN_IDS, DECK_PER_PAGE, CARDS_PER_PAGE, BROWSE_PER_PAGE,
     group_counters, active_drops, bot_start_time, spoiler_cache, RARITIES,
@@ -1360,9 +1360,6 @@ async def gift_cmd(message: Message, command: CommandObject):
     if matched_cid in db["users"][user_id].get("star_purchases", []):
         await message.reply("🌟 <b>Star cards cannot be gifted.</b>", parse_mode=ParseMode.HTML)
         return
-    if hw_locked(db, matched_cid):
-        await message.reply(hw_lock_text("gifted"), parse_mode=ParseMode.HTML)
-        return
     global_data    = db["global_cards"].get(matched_cid, {})
     display_rarity = format_rarity(matched_data["rarity"])
 
@@ -1451,9 +1448,6 @@ async def confirm_gift_cb(cq: CallbackQuery):
 
     if card_id in db["users"][user_id].get("star_purchases", []):
         await cq.answer("🌟 Star cards cannot be gifted.", show_alert=True)
-        return
-    if hw_locked(db, card_id):
-        await cq.answer("🎃 Halloween cards cannot be gifted.", show_alert=True)
         return
 
     if _check_action_cooldown(f"gift_{user_id}"):
@@ -1637,10 +1631,6 @@ async def trade_cmd(message: Message, command: CommandObject):
         )
         return
 
-    if hw_locked(db, my_cid) or hw_locked(db, their_cid):
-        await message.reply(hw_lock_text("traded"), parse_mode=ParseMode.HTML)
-        return
-
     my_rarity    = format_rarity(my_cdata["rarity"])
     their_rarity = format_rarity(their_cdata["rarity"])
 
@@ -1723,20 +1713,6 @@ async def accept_trade_cb(cq: CallbackQuery):
         try:
             await cq.message.edit_text(
                 "<b>「 TRADE CANCELLED 」</b>\n━━━━━━━━━━━━━━━━━\nOne of the cards is no longer available.",
-                parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            pass
-        return
-
-    # Halloween cards can never be traded (re-checked in case a card was flagged after the offer)
-    if hw_locked(db, my_cid) or hw_locked(db, their_cid):
-        trade["status"] = "cancelled"
-        active_trades.pop(trade_id, None)
-        await cq.answer("🎃 Halloween cards cannot be traded.", show_alert=True)
-        try:
-            await cq.message.edit_text(
-                "<b>「 TRADE CANCELLED 」</b>\n━━━━━━━━━━━━━━━━━\n🎃 Halloween cards cannot be traded.",
                 parse_mode=ParseMode.HTML
             )
         except Exception:

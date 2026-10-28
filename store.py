@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import config
-from halloween import quest_progress, hw_locked
+from halloween import quest_progress
 from config import (
     bot, main_router, load_db, save_db, ensure_user, 
     format_rarity, SHOP_PRICES, OFFLINE_STORE_GROUP
@@ -790,11 +790,6 @@ async def sell_cmd(message: Message, command: CommandObject):
         await message.reply_rich(InputRichMessage(html="🌟 <b>Star cards cannot be sold in the Offline Store.</b>"))
         return
 
-    # Halloween cards are event-bound and can never be sold on the Offline Store
-    if hw_locked(db, matched_cid):
-        await message.reply_rich(InputRichMessage(html="🎃 <b>Halloween cards cannot be sold in the Offline Store.</b>"))
-        return
-
     global_data = db["global_cards"].get(matched_cid, {})
     
     # safeguard 2: Enforce rarity-based price floors to protect market value boundaries
@@ -864,10 +859,6 @@ async def confirm_sell_cb(cq: CallbackQuery):
     # Re-check at confirmation time (the card may have become a star card since /sell)
     if card_id in db["users"][uid].get("star_purchases", []):
         await cq.answer("🌟 Star cards cannot be sold in the Offline Store.", show_alert=True)
-        return
-
-    if hw_locked(db, card_id):
-        await cq.answer("🎃 Halloween cards cannot be sold in the Offline Store.", show_alert=True)
         return
 
     my_cards[card_id]["amount"] -= 1
