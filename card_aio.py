@@ -9,8 +9,14 @@ import time
 from contextlib import asynccontextmanager
 
 import uvicorn
+try:   # faster event loop (pip install uvloop) - Linux/macOS only
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    pass
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
@@ -103,7 +109,6 @@ from mines import mines_router
 from deck import deck_api  # <--- IMPORT DECK API ROUTER
 from admin_api import admin_api  # <--- IMPORT ADMIN API ROUTER
 from store import store_api  # <--- IMPORT STORE API ROUTER
-from keep_alive import keep_alive_router, keep_alive_loop  # <--- Render keep-alive
 
 
 # ==========================================
@@ -325,8 +330,6 @@ async def lifespan(app: FastAPI):
     logger.info("Starting vault-log auto-purge cycle...")
     create_logged_task(vlog_cleanup_loop(), name="vlog_cleanup_loop")
 
-    create_logged_task(keep_alive_loop(), name="keep_alive")
-
     logger.info("Launching Telegram Bot Resilient Polling...")
     create_logged_task(run_polling_resilient(), name="bot_polling")
 
@@ -374,13 +377,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(Exception)
+async def _unhandled_error(request, exc):
+    logger.error(f"Unhandled API error on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Server error: {type(exc).__name__}: {exc}"},
+        headers={"Access-Control-Allow-Origin": request.headers.get("origin", "*")},
+    )
+
+
 # Mount REST Routers
 app.include_router(mines_router)
 app.include_router(deck_api)  # <--- MOUNT DECK API ROUTER
 app.include_router(admin_api)  # <--- MOUNT ADMIN API ROUTER
 app.include_router(store_api)  # <--- MOUNT STORE API ROUTER
 app.include_router(versus_router)  # <--- MOUNT VERSUS WEB APP ROUTER
-app.include_router(keep_alive_router)  # <--- /health for uptime monitors
 
 
 @app.get("/")
@@ -399,4 +411,4 @@ async def root_health_check():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting Web API server listening on 0.0.0.0:{port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, access_log=False, log_level="warning")
