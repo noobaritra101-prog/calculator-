@@ -78,7 +78,7 @@ import config
 from config import (
     bot, dp, main_router, is_ghost_banned, check_spam,
     is_shadow_banned, ensure_group, periodic_save, backup_to_group,
-    load_from_group, load_settings, _flush_db
+    load_from_group, load_settings, _flush_db, perform_backup
 )
 
 # Import module handlers to register routing
@@ -348,6 +348,13 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(vlog._flush_vlogs, force=True)
     except Exception as e:
         logger.critical(f"Failed to flush database on shutdown: {e}", exc_info=True)
+
+    # The disk is wiped after this process stops (Render), so push one last backup to the group.
+    try:
+        logger.info("Final backup to the group before shutdown...")
+        await asyncio.wait_for(perform_backup(), timeout=20)
+    except Exception as e:
+        logger.warning(f"Final backup did not finish: {e}")
 
     await bot.session.close()
 

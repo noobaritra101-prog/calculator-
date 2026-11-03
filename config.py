@@ -44,7 +44,7 @@ MAIN_GROUP_LINK     = "https://t.me/animex_nexus"
 # that must point back at THIS running app. Import it from config everywhere
 # instead of hardcoding it — if it drifts from the actual host, every image
 # link silently points at a dead service and every <img> in the Mini Apps breaks.
-BACKEND_PUBLIC_URL  = os.environ.get("BACKEND_PUBLIC_URL", "https://calculator-production-a33f.up.railway.app").rstrip("/")
+BACKEND_PUBLIC_URL  = os.environ.get("BACKEND_PUBLIC_URL", "https://calculator-2czz.onrender.com").rstrip("/")
 OFFLINE_STORE_GROUP = int(os.environ.get("OFFLINE_STORE_GROUP", -1003982098657))  # 🏪 Peer-to-Peer Consignment Group/Channel ID
 
 # Fixed Shards Card Purchase Prices for Online Shop - Balanced Values
@@ -213,10 +213,16 @@ def load_db() -> dict:
             
     return _db_cache
 
+_db_changed = False       # something changed since the last successful group backup
+_restore_ok = True        # False if the startup restore from the group FAILED (never overwrite the backup then)
+BACKUP_INTERVAL_MIN = int(os.environ.get("BACKUP_INTERVAL_MIN", "5"))
+
+
 def save_db(data: dict = None):
-    global _db_cache, _db_dirty
+    global _db_cache, _db_dirty, _db_changed
     if data is not None: _db_cache = data
     _db_dirty = True
+    _db_changed = True
 
 def _flush_db(force: bool = False):
     """Fully synchronous flush for callers outside the async event loop
@@ -292,17 +298,22 @@ async def flush_db_now():
 _backup_lock = None
 
 
-async def perform_backup():
+async def perform_backup() -> bool:
     """Serialised: two overlapping backups would both write database.zip at once
     and could leave a corrupt archive."""
     global _backup_lock
     if _backup_lock is None:
         _backup_lock = asyncio.Lock()
     async with _backup_lock:
-        await _perform_backup()
+        return await _perform_backup()
 
 
-async def _perform_backup():
+async def _perform_backup() -> bool:
+    if not _restore_ok:
+        # The restore at startup failed, so what is in memory may be an EMPTY database. Uploading it
+        # would replace the good pinned backup and delete it. Refuse until a restart restores properly.
+        print("[BACKUP] Skipped: the startup restore failed, not overwriting the pinned backup.")
+        return False
     # Force flush both cached databases directly to disk before archiving
     await _async_flush_db(force=True)
     try:
@@ -349,23 +360,50 @@ async def _perform_backup():
             except Exception:
                 pass
         print("[BACKUP] Successfully backed up database.zip and pinned to backup group.")
+        return True
     except Exception as e:
         print(f"[BACKUP] Task failed: {e}")
+        return False
 
 
 async def backup_to_group():
+    """On Render the disk is wiped on every restart, so the group backup IS the database.
+    The first backup runs after 90 s (not after 20 minutes: a service that restarts more often than
+    that would never back up at all), then every BACKUP_INTERVAL_MIN minutes, only when data changed."""
+    global _db_changed
+    await asyncio.sleep(90)
     while True:
-        await asyncio.sleep(20 * 60) # 20 minutes
-        await perform_backup()
+        if _db_changed:
+            _db_changed = False
+            ok = await perform_backup()
+            if not ok:
+                _db_changed = True      # try again next cycle
+        await asyncio.sleep(max(1, BACKUP_INTERVAL_MIN) * 60)
 
 
 async def load_from_group():
+    """Restore with retries. A single failed Telegram call at boot used to leave the bot running on an
+    EMPTY database, and the next backup then replaced the good one."""
+    global _restore_ok
+    status = None
+    for attempt in range(1, 5):
+        status = await _load_from_group_once()
+        if status != "error":
+            break
+        print(f"⚠️ Restore attempt {attempt} failed, retrying...")
+        await asyncio.sleep(3 * attempt)
+    _restore_ok = status != "error"
+    if not _restore_ok:
+        print("❌ Could not restore the database from the group. Backups are paused so the old backup is not overwritten.")
+
+
+async def _load_from_group_once():
     global _db_cache
 
     # Skip restore if local database.json is already present and non-empty
     if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0:
         print("✅ Local database found and non-empty — skipping group restore.")
-        return
+        return "skipped"
 
     print("🔄 Local database missing/empty — checking pinned backup in group...")
     try:
@@ -413,6 +451,8 @@ async def load_from_group():
             print("⚠️ No pinned document found in the backup group.")
     except Exception as e:
         print(f"❌ Failed to restore backup from group: {e}")
+        return "error"
+    return "ok"
 
 
 async def init_db_on_startup():
