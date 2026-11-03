@@ -14,7 +14,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import config
-from halloween import quest_progress
 from config import (
     bot, main_router, load_db, save_db, ensure_user, 
     format_rarity, SHOP_PRICES, OFFLINE_STORE_GROUP
@@ -701,7 +700,6 @@ async def buy_online_execute_cb(cq: CallbackQuery):
 
         db["users"][uid]["daily_purchases"]["bought"].append(card_id)
         _record_store_event(db, "online_buy", price, rarity, uid)
-        quest_progress(uid, "store_buy", db=db)   # 🎃 quest
         save_db()
         await config.flush_db_now()
 
@@ -732,6 +730,9 @@ async def buy_online_execute_cb(cq: CallbackQuery):
 # ==========================================
 # OFFLINE STORE CONSIGNMENT (/sell & Mgmt)
 # ==========================================
+
+MAX_SELL_PRICE = 10_000_000   # keeps callback_data (listsell_<uid>_<cid>_<price>) under Telegram's 64-byte limit
+
 @main_router.message(Command("sell"))
 async def sell_cmd(message: Message, command: CommandObject):
     user_id = str(message.from_user.id)
@@ -752,7 +753,7 @@ async def sell_cmd(message: Message, command: CommandObject):
         return
 
     parts = command.args.rsplit(maxsplit=1)
-    if len(parts) < 2 or not parts[1].isdigit():
+    if len(parts) < 2 or not (parts[1].isascii() and parts[1].isdigit()) or len(parts[1]) > 12:
         await message.reply_rich(InputRichMessage(html="⚠️ Invalid format. Make sure you specify the price at the end.\nExample: <code>/sell naruto 250</code>"))
         return
 
@@ -761,6 +762,9 @@ async def sell_cmd(message: Message, command: CommandObject):
 
     if price < 1:
         await message.reply_rich(InputRichMessage(html="Price must be at least 1 Shard."))
+        return
+    if price > MAX_SELL_PRICE:
+        await message.reply_rich(InputRichMessage(html=f"Price cannot be higher than <b>{MAX_SELL_PRICE:,}</b> Shards."))
         return
 
     my_cards = user_data.get("cards", {})
@@ -1143,7 +1147,6 @@ async def _execute_offline_buy(cq: CallbackQuery, uid: str, lid: str):
 
         del db["offline_store"][lid]
         _record_store_event(db, "offline_sale", price, format_rarity(global_card["rarity"]), uid)
-        quest_progress(uid, "store_buy", db=db)   # 🎃 quest (the buyer)
         save_db()
         await config.flush_db_now()
 
@@ -1625,7 +1628,6 @@ async def api_online_buy(req: OnlineBuyRequest):
             user_data["total_claimed"] = user_data.get("total_claimed", 0) + 1
             dp["bought"].append(req.card_id)
             _record_store_event(db, "online_buy", price, rarity, req.user_id)
-            quest_progress(req.user_id, "store_buy", db=db)   # 🎃 quest (web buy)
             save_db()
             await config.flush_db_now()
 
@@ -1678,6 +1680,8 @@ async def api_create_listing(req: SellRequest):
 
         if req.price < 1:
             raise HTTPException(status_code=400, detail="Price must be at least 1 Shard.")
+        if req.price > MAX_SELL_PRICE:
+            raise HTTPException(status_code=400, detail=f"Price cannot be higher than {MAX_SELL_PRICE:,} Shards.")
 
         my_cards = user_data.get("cards", {})
         if req.card_id not in my_cards or my_cards[req.card_id]["amount"] <= 0:
@@ -1883,7 +1887,6 @@ async def api_buy_offline(req: OfflineBuyRequest):
 
             del db["offline_store"][req.listing_id]
             _record_store_event(db, "offline_sale", price, format_rarity(global_card["rarity"]), req.user_id)
-            quest_progress(req.user_id, "store_buy", db=db)   # 🎃 quest (web buy, the buyer)
             save_db()
             await config.flush_db_now()
 

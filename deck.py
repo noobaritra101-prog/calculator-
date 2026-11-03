@@ -16,6 +16,8 @@ from urllib.parse import parse_qsl
 from collections import OrderedDict
 from datetime import datetime, timezone
 from aiogram import F
+import html as _html_mod
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, WebAppInfo
@@ -32,11 +34,10 @@ import config
 from config import (
     bot, main_router, DECK_PER_PAGE, RARITY_ORDER, BACKEND_PUBLIC_URL,
     format_rarity, ensure_user, load_db, save_db, is_ghost_banned, is_shadow_banned,
-    ADMIN_IDS, format_duration_seconds
+    ADMIN_IDS, format_duration_seconds, halloween_flex_line, is_halloween_card
 )
 from handlers import smart_reply, smart_reply_photo, _check_action_cooldown
 from vlog import log_action
-from halloween import halloween_flex_line, quest_progress, hw_locked, hw_lock_text
 
 # ==========================================
 # ERROR-ONLY FILE LOGGER (dlog.txt / /dlog)
@@ -56,17 +57,6 @@ if not dlog.handlers:
 # FASTAPI WEB APP API ROUTER (/api/deck)
 # ==========================================
 deck_api = APIRouter(prefix="/api/deck", tags=["Deck"])
-
-# Halloween Mini App API (/api/halloween/state | login | buy | ads/reward | ping).
-# Attached to this router with its FULL path, so it is served wherever deck_api is mounted
-# (no change needed in the file that creates the FastAPI app).
-try:
-    import halloween as _hw
-    for _r in _hw.get_router(prefix="/api/halloween").routes:
-        deck_api.routes.append(_r)
-except Exception as _e:
-    print(f"[halloween] could not attach web API: {_e}")
-
 
 def verify_init_data(init_data: str, max_age: int = 86400):
     """Returns the Telegram user dict if Mini App initData is genuine and fresh, else None."""
@@ -285,7 +275,6 @@ async def claim_ad_reward(user_id: str):
         "rarity": format_rarity(card_data["rarity"]),
         "chat_title": "Adsgram Daily Reward"
     })
-    quest_progress(str(actual_key), "airdrop", db=db)            # 🎃 quest
     save_db()
 
     display_rarity = format_rarity(card_data["rarity"])
@@ -597,9 +586,6 @@ async def api_burn_card(req: BurnRequest):
         if req.card_id in user_data.get("star_purchases", []):
             raise HTTPException(status_code=400, detail="Star cards cannot be burned.")
 
-        if hw_locked(db, req.card_id):
-            raise HTTPException(status_code=400, detail="Halloween cards cannot be burned.")
-
         card_data = user_cards[req.card_id]
         rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
 
@@ -617,8 +603,6 @@ async def api_burn_card(req: BurnRequest):
                 user_data["special_card"] = None
 
         user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + burn_payout
-        quest_progress(str(actual_key), "burn", db=db)               # 🎃 quest (web burn)
-        quest_progress(str(actual_key), "shards", burn_payout, db=db)
 
         log_action(db, str(actual_key), {
             "type": "web_burn",
@@ -707,7 +691,6 @@ WEBAPP_LINKS = {
     "airdrop":  f"https://t.me/{BOT_USERNAME}/airdrop",
     "mine":     f"https://t.me/{BOT_USERNAME}/webmine",
     "scramble": f"https://t.me/{BOT_USERNAME}/scramble",
-    "halloween": f"https://t.me/{BOT_USERNAME}/Halloween",
 }
 
 
@@ -722,7 +705,6 @@ async def all_webapps_cmd(message: Message):
          InlineKeyboardButton(text="🪂 Airdrop", url=L["airdrop"])],
         [InlineKeyboardButton(text="💣 Mine", url=L["mine"]),
          InlineKeyboardButton(text="🕵️ Scramble", url=L["scramble"])],
-        [InlineKeyboardButton(text="🎃 Halloween", url=L["halloween"])],
     ])
     await smart_reply(
         message,
@@ -731,6 +713,86 @@ async def all_webapps_cmd(message: Message):
         reply_markup=kb,
         parse_mode=ParseMode.HTML
     )
+
+
+# ==========================================
+# /tophalloweens — top 10 Halloween card holders
+# ==========================================
+HW_TOP_IMAGE = "https://i.ibb.co/Xf5vchw7/f30237d4091ecf7099d78e0fcaea07f8.jpg"
+
+
+def _hw_top_caption() -> str:
+    db = load_db()
+    hw_ids = {cid for cid, c in (db.get("global_cards", {}) or {}).items() if is_halloween_card(c)}
+    rows = []
+    for uid, u in (db.get("users", {}) or {}).items():
+        if not isinstance(u, dict):
+            continue
+        total = unique = 0
+        for cid, cd in (u.get("cards", {}) or {}).items():
+            if cid in hw_ids:
+                amt = int((cd or {}).get("amount", 0) or 0)
+                if amt > 0:
+                    total += amt
+                    unique += 1
+        if total > 0:
+            rows.append((total, unique, str(u.get("name") or "Unknown")))
+    rows.sort(key=lambda r: (-r[0], -r[1], r[2].lower()))
+    head = "<b>「 🎃 TOP 10 HALLOWEEN HOLDERS 」</b>\n━━━━━━━━━━━━━━━━━\n"
+    if not rows:
+        return head + "No one holds a Halloween card yet."
+    lines = []
+    for i, (total, unique, name) in enumerate(rows[:10], 1):
+        lines.append(f"<b>{i}.</b> {_html_mod.escape(name)} — <b>{total}</b> cards ({unique} unique)")
+    return (head + "\n".join(lines) +
+            f"\n━━━━━━━━━━━━━━━━━\n<i>Halloween cards in total: {len(hw_ids)}</i>")
+
+
+def _hw_top_kb(owner_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Refresh", callback_data=f"hwtop_refresh:{owner_id}"),
+        InlineKeyboardButton(text="Close", callback_data=f"hwtop_close:{owner_id}"),
+    ]])
+
+
+@main_router.message(Command("tophalloweens"))
+async def top_halloweens_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+    caption = _hw_top_caption()
+    kb = _hw_top_kb(uid_int)
+    try:
+        await smart_reply_photo(message, photo=HW_TOP_IMAGE, caption=caption,
+                                reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        # image could not be fetched by Telegram -> still show the list
+        await smart_reply(message, caption, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@main_router.callback_query(F.data.startswith("hwtop_"))
+async def top_halloweens_cb(cq: CallbackQuery):
+    action, _, owner = cq.data[len("hwtop_"):].partition(":")
+    if cq.from_user.id != int(owner or 0) and cq.from_user.id not in ADMIN_IDS:
+        await cq.answer("This list belongs to someone else. Use /tophalloweens.", show_alert=True)
+        return
+    if action == "close":
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+        await cq.answer()
+        return
+    caption = _hw_top_caption()
+    try:
+        if cq.message.photo:
+            await cq.message.edit_caption(caption=caption, reply_markup=_hw_top_kb(int(owner)),
+                                          parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(caption, reply_markup=_hw_top_kb(int(owner)),
+                                       parse_mode=ParseMode.HTML)
+        await cq.answer("Refreshed")
+    except TelegramBadRequest:
+        await cq.answer("Already up to date")
 
 
 # ==========================================
@@ -1507,9 +1569,6 @@ async def burn_cmd(message: Message, command: CommandObject):
     if matched_cid in db["users"][user_id].get("star_purchases", []):
         await smart_reply(message, "🌟 <b>Star cards cannot be burned.</b>", parse_mode=ParseMode.HTML)
         return
-    if hw_locked(db, matched_cid):
-        await smart_reply(message, hw_lock_text("burned"), parse_mode=ParseMode.HTML)
-        return
 
     global_data       = db["global_cards"].get(matched_cid, {})
     rarity_normalized = format_rarity(matched_data.get("rarity", "Common"))
@@ -1563,10 +1622,6 @@ async def confirm_burn_cb(cq: CallbackQuery):
         await cq.answer("🌟 Star cards cannot be burned.", show_alert=True)
         return
 
-    if hw_locked(db, card_id):
-        await cq.answer("🎃 Halloween cards cannot be burned.", show_alert=True)
-        return
-
     my_cards = user_data["cards"]
     card_data = my_cards[card_id]
     rarity_normalized = format_rarity(card_data.get("rarity", "Common"))
@@ -1586,8 +1641,6 @@ async def confirm_burn_cb(cq: CallbackQuery):
             user_data["special_card"] = None
 
     user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + burn_payout
-    quest_progress(str(actual_key), "burn", db=db)               # 🎃 quest
-    quest_progress(str(actual_key), "shards", burn_payout, db=db)
 
     log_action(db, str(actual_key), {
         "type": "burn", "card_name": card_data.get("name", "Card"), "rarity": rarity_normalized,

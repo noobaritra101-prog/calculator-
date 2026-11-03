@@ -45,7 +45,6 @@ from config import (
     get_daily_minigame_rewards, DAILY_MINIGAME_REWARD_CAP
 )
 from vlog import log_action   # /vlog activity log
-from halloween import quest_progress
 from deck import dlog, deck_api   # same FastAPI router the deck / scramble Mini Apps use
 from scramble import (   # shared helpers: Telegram initData check, coloured buttons, avatars
     ScrWebReq, scramble_web_avatar, _scramble_web_user,
@@ -297,11 +296,6 @@ def _match_settle(user_id: str, name: str, username, elapsed: float, earned: int
         })
     except Exception as e:
         dlog.error(f"[match_vlog] {e}", exc_info=True)
-    if paid:
-        try:
-            quest_progress(user_id, "shards", paid, db=db)   # 🎃 quest
-        except Exception as e:
-            dlog.error(f"[match_quest] {e}", exc_info=True)
     save_db()
     return paid
 

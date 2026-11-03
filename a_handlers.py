@@ -1638,8 +1638,6 @@ def build_admin_help_text() -> str:
         "➷ /up [mode] (reply img)\n〻 Update interface images (st/hp/lb/sm/store/onst/offst)\n\n"
         "➷ /add_card Character|Anime|Rarity\n〻 Upload a new card image (reply to photo)\n\n"
         "➷ /edit_card DB-ID | Name | Anime | Rarity\n〻 Edit an existing card's details/image\n\n"
-        "➷ /hcard on DB-ID | off DB-ID | list\n〻 Mark / unmark / list 🎃 Halloween cards\n\n"
-        "➷ /halloween on [days] | pause | status | off\n〻 Control the Halloween event\n\n"
         "➷ /remove_card [ID]\n〻 Remove card from global db & GC\n\n"
         "➷ /forcedrop\n〻 Manually trigger a drop in chat\n\n"
         "➷ /backup\n〻 Force instant backup upload\n\n"

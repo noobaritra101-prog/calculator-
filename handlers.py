@@ -21,13 +21,12 @@ from aiogram.enums import ParseMode, ChatType, ChatMemberStatus
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 import config
-from halloween import halloween_flex_line, maybe_halloween_drop, award_seize_candies, quest_progress
 from config import (
     bot, main_router, ADMIN_IDS, DECK_PER_PAGE, CARDS_PER_PAGE, BROWSE_PER_PAGE,
     group_counters, active_drops, bot_start_time, spoiler_cache, RARITIES,
     RARITY_ORDER, RARITY_SAFE, SAFE_RARITY, format_rarity, load_db, save_db,
     ensure_user, ensure_group, get_mention, is_ghost_banned, is_shadow_banned,
-    format_wait_mmss, QUERY_GROUP_ID, get_query_daily_tracker
+    format_wait_mmss, QUERY_GROUP_ID, get_query_daily_tracker, halloween_flex_line
 )
 from vlog import log_action
 
@@ -584,9 +583,6 @@ async def bowling_roll_cmd(message: Message):
         shards_won = random.randint(40, 60)
         user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + shards_won
 
-    quest_progress(user_id, "roll", db=db)                       # 🎃 quest
-    if shards_won:
-        quest_progress(user_id, "shards", shards_won, db=db)
     save_db()
 
     if shards_won:
@@ -667,9 +663,6 @@ async def basketball_throw_cmd(message: Message):
         shards_won = random.randint(40, 60)
         user_data["nexus_shards"] = user_data.get("nexus_shards", 0) + shards_won
 
-    quest_progress(user_id, "throw", db=db)                      # 🎃 quest
-    if shards_won:
-        quest_progress(user_id, "shards", shards_won, db=db)
     save_db()
 
     if shards_won:
@@ -995,7 +988,6 @@ async def trigger_drop(chat_id: int):
     if not pool:
         pool = db["global_cards"]
 
-    pool = maybe_halloween_drop(db, pool, target_rarity)   # 🎃 event boost
     card_id, card_data = random.choice(list(pool.items()))
     display_rarity     = format_rarity(card_data["rarity"])
 
@@ -1217,9 +1209,6 @@ async def seize_cmd(message: Message, command: CommandObject):
         db["users"][user_id]["cards"][card_id] = {"name": global_card["name"], "rarity": global_card["rarity"], "amount": 0}
     db["users"][user_id]["cards"][card_id]["amount"] += 1
     db["users"][user_id]["total_claimed"] = db["users"][user_id].get("total_claimed", 0) + 1
-    candy_gain = award_seize_candies(db, db["users"][user_id], global_card)   # 🎃 event
-    quest_progress(user_id, "seize", db=db)
-    quest_progress(user_id, "shards", total_earned, db=db)
 
     if cid_str in db["groups"]:
         db["groups"][cid_str]["claims"] = db["groups"][cid_str].get("claims", 0) + 1
@@ -1231,8 +1220,6 @@ async def seize_cmd(message: Message, command: CommandObject):
     bonus_breakdown    = f" (+{speed_bonus} Speed⚡)" if speed_bonus else ""
     if dupe_bonus:
         bonus_breakdown += " (+10 Dupe♻️)"
-    if candy_gain:
-        bonus_breakdown += f" (+{candy_gain} 🍬)"
 
     winner_text = (
         "<b>「 🎊 CARD SEIZED ぁ 」\n"
@@ -1766,8 +1753,6 @@ async def accept_trade_cb(cq: CallbackQuery):
         "cp_id": sender_id, "cp_name": db["users"][sender_id].get("name", "User"),
         "chat_id": cq.message.chat.id, "chat_title": chat_title,
     })
-    quest_progress(sender_id, "trade", db=db)                    # 🎃 quest (both sides)
-    quest_progress(target_id, "trade", db=db)
     save_db()
     await config.flush_db_now()
 

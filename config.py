@@ -44,7 +44,7 @@ MAIN_GROUP_LINK     = "https://t.me/animex_nexus"
 # that must point back at THIS running app. Import it from config everywhere
 # instead of hardcoding it — if it drifts from the actual host, every image
 # link silently points at a dead service and every <img> in the Mini Apps breaks.
-BACKEND_PUBLIC_URL  = os.environ.get("BACKEND_PUBLIC_URL", "https://worker-production-52c3.up.railway.app").rstrip("/")
+BACKEND_PUBLIC_URL  = os.environ.get("BACKEND_PUBLIC_URL", "https://calculator-production-a33f.up.railway.app").rstrip("/")
 OFFLINE_STORE_GROUP = int(os.environ.get("OFFLINE_STORE_GROUP", -1003982098657))  # 🏪 Peer-to-Peer Consignment Group/Channel ID
 
 # Fixed Shards Card Purchase Prices for Online Shop - Balanced Values
@@ -106,6 +106,42 @@ except ImportError:
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     _loads = json.loads
+
+# orjson refuses integers above 64 bits, which made every save fail ("Integer exceeds 64-bit range")
+# until the bot was restarted. If that ever happens again, clamp the offending numbers, log where they
+# were, and save normally instead of losing every change.
+_INT64_MAX = 2**63 - 1
+_raw_dumps = _dumps
+
+
+def _clamp_big_ints(root) -> list:
+    found, stack = [], [("db", root)]
+    while stack:
+        path, node = stack.pop()
+        if isinstance(node, dict):
+            items = list(node.items())
+        elif isinstance(node, list):
+            items = list(enumerate(node))
+        else:
+            continue
+        for k, v in items:
+            if isinstance(v, int) and not isinstance(v, bool) and abs(v) > _INT64_MAX:
+                node[k] = _INT64_MAX if v > 0 else -_INT64_MAX
+                found.append(f"{path}/{k}")
+            elif isinstance(v, (dict, list)):
+                stack.append((f"{path}/{k}", v))
+    return found
+
+
+def _dumps(obj):
+    try:
+        return _raw_dumps(obj)
+    except TypeError as e:
+        if "64-bit" not in str(e):
+            raise
+        found = _clamp_big_ints(obj)
+        print(f"[DB] Clamped {len(found)} oversized number(s): {found[:10]}")
+        return _raw_dumps(obj)
 
 # ── In-memory DB cache ───────────────────────────────────────────────────────
 _db_cache        = None
@@ -756,3 +792,19 @@ async def log_gunban_to_public(unbanned_uid: int, unbanned_name: str, admin_uid:
         )
     except Exception as e:
         print(f"[LOG] Failed to send public gunban log to Topic {LOG_THREAD_BAN}: {e}")
+
+
+# ==========================================
+# Halloween edition card caption (kept after the event ended)
+# ==========================================
+def is_halloween_card(global_card) -> bool:
+    if not isinstance(global_card, dict):
+        return False
+    return global_card.get("event") == "halloween" or "🎃" in str(global_card.get("name", ""))
+
+
+def halloween_flex_line(global_card: dict) -> str:
+    """Caption suffix for flex/inline captions ('' for normal cards)."""
+    if is_halloween_card(global_card):
+        return "\n\n<b><i>This is a halloween (🎃) edition card !</i></b>"
+    return ""

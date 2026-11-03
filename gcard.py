@@ -21,7 +21,6 @@ from aiogram.enums import ParseMode, ChatType
 from aiogram.exceptions import TelegramBadRequest
 
 import config
-from halloween import quest_progress
 from config import (
     bot, main_router, load_db, save_db, format_rarity,
     get_mention, is_ghost_banned, is_shadow_banned,
@@ -474,9 +473,6 @@ async def gcard_plain_guess_listener(message: Message):
     if best is None or time_taken < best:
         rec["best_time"] = time_taken
 
-    quest_progress(user_id, "guess", db=db)   # 🎃 quest
-    if reward_amount > 0:
-        quest_progress(user_id, "shards", reward_amount, db=db)
     save_db()
 
     if reward_amount > 0:
