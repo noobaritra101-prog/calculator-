@@ -23,7 +23,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, WebAppInfo
 )
 from aiogram.filters import Command, CommandObject
-from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.enums import ParseMode, ChatMemberStatus, ButtonStyle
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse, Response
@@ -691,6 +691,7 @@ WEBAPP_LINKS = {
     "airdrop":  f"https://t.me/{BOT_USERNAME}/airdrop",
     "mine":     f"https://t.me/{BOT_USERNAME}/webmine",
     "scramble": f"https://t.me/{BOT_USERNAME}/scramble",
+    "match":    f"https://t.me/{BOT_USERNAME}/match",
 }
 
 
@@ -705,6 +706,8 @@ async def all_webapps_cmd(message: Message):
          InlineKeyboardButton(text="🪂 Airdrop", url=L["airdrop"])],
         [InlineKeyboardButton(text="💣 Mine", url=L["mine"]),
          InlineKeyboardButton(text="🕵️ Scramble", url=L["scramble"])],
+        [InlineKeyboardButton(text="🫯 Match", url=L["match"])],
+        [InlineKeyboardButton(text="Close", callback_data=f"webclose:{uid_int}", style=ButtonStyle.DANGER)],
     ])
     await smart_reply(
         message,
@@ -715,13 +718,26 @@ async def all_webapps_cmd(message: Message):
     )
 
 
+@main_router.callback_query(F.data.startswith("webclose:"))
+async def web_close_cb(cq: CallbackQuery):
+    owner = cq.data.split(":", 1)[1]
+    if str(cq.from_user.id) != owner and cq.from_user.id not in ADMIN_IDS:
+        await cq.answer("Only the person who opened this menu can close it.", show_alert=True)
+        return
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await cq.answer()
+
+
 # ==========================================
 # /tophalloweens — top 10 Halloween card holders
 # ==========================================
 HW_TOP_IMAGE = "https://i.ibb.co/Xf5vchw7/f30237d4091ecf7099d78e0fcaea07f8.jpg"
 
 
-def _hw_top_caption() -> str:
+def _hw_top_caption(viewer_id: int = 0) -> str:
     db = load_db()
     hw_ids = {cid for cid, c in (db.get("global_cards", {}) or {}).items() if is_halloween_card(c)}
     rows = []
@@ -736,22 +752,27 @@ def _hw_top_caption() -> str:
                     total += amt
                     unique += 1
         if total > 0:
-            rows.append((total, unique, str(u.get("name") or "Unknown")))
+            rows.append((total, unique, str(u.get("name") or "Unknown"), str(uid)))
     rows.sort(key=lambda r: (-r[0], -r[1], r[2].lower()))
     head = "<b>「 🎃 TOP 10 HALLOWEEN HOLDERS 」</b>\n━━━━━━━━━━━━━━━━━\n"
     if not rows:
         return head + "No one holds a Halloween card yet."
     lines = []
-    for i, (total, unique, name) in enumerate(rows[:10], 1):
+    for i, (total, unique, name, _uid) in enumerate(rows[:10], 1):
         lines.append(f"<b>{i}.</b> {_html_mod.escape(name)} — <b>{total}</b> cards ({unique} unique)")
+    mine = next(((i, r) for i, r in enumerate(rows, 1) if r[3] == str(viewer_id)), None)
+    if mine:
+        your = f"<b>Your rank:</b> #{mine[0]} of {len(rows)} — <b>{mine[1][0]}</b> cards ({mine[1][1]} unique)"
+    else:
+        your = "<b>Your rank:</b> not ranked yet (you hold no Halloween card)"
     return (head + "\n".join(lines) +
-            f"\n━━━━━━━━━━━━━━━━━\n<i>Halloween cards in total: {len(hw_ids)}</i>")
+            f"\n━━━━━━━━━━━━━━━━━\n{your}\n<i>Halloween cards in total: {len(hw_ids)}</i>")
 
 
 def _hw_top_kb(owner_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Refresh", callback_data=f"hwtop_refresh:{owner_id}"),
-        InlineKeyboardButton(text="Close", callback_data=f"hwtop_close:{owner_id}"),
+        InlineKeyboardButton(text="Close", callback_data=f"hwtop_close:{owner_id}", style=ButtonStyle.DANGER),
     ]])
 
 
@@ -759,7 +780,7 @@ def _hw_top_kb(owner_id: int) -> InlineKeyboardMarkup:
 async def top_halloweens_cmd(message: Message):
     uid_int = message.from_user.id
     if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
-    caption = _hw_top_caption()
+    caption = _hw_top_caption(uid_int)
     kb = _hw_top_kb(uid_int)
     try:
         await smart_reply_photo(message, photo=HW_TOP_IMAGE, caption=caption,
@@ -782,7 +803,7 @@ async def top_halloweens_cb(cq: CallbackQuery):
             pass
         await cq.answer()
         return
-    caption = _hw_top_caption()
+    caption = _hw_top_caption(int(owner))
     try:
         if cq.message.photo:
             await cq.message.edit_caption(caption=caption, reply_markup=_hw_top_kb(int(owner)),
