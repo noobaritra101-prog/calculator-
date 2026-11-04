@@ -38,6 +38,7 @@ from config import (
 )
 from handlers import smart_reply, smart_reply_photo, _check_action_cooldown
 from vlog import log_action
+import diwali   # Diwali event: registers its bot commands on main_router; its web API is mounted below
 
 # ==========================================
 # ERROR-ONLY FILE LOGGER (dlog.txt / /dlog)
@@ -57,6 +58,11 @@ if not dlog.handlers:
 # FASTAPI WEB APP API ROUTER (/api/deck)
 # ==========================================
 deck_api = APIRouter(prefix="/api/deck", tags=["Deck"])
+
+# Diwali Mini App API (diwali.html) lives under the deck API:
+#   POST /api/deck/diwali/state | /api/deck/diwali/login | GET /api/deck/diwali/ping
+#   Adsgram reward postback (Diwali block): /api/deck/diwali/ads/reward?userid=[userId]&secret=<DW_AD_SECRET>
+deck_api.include_router(diwali.get_router(prefix="/diwali"))
 
 def verify_init_data(init_data: str, max_age: int = 86400):
     """Returns the Telegram user dict if Mini App initData is genuine and fresh, else None."""
@@ -692,6 +698,7 @@ WEBAPP_LINKS = {
     "mine":     f"https://t.me/{BOT_USERNAME}/webmine",
     "scramble": f"https://t.me/{BOT_USERNAME}/scramble",
     "match":    f"https://t.me/{BOT_USERNAME}/match",
+    "diwali":   f"https://t.me/{BOT_USERNAME}/Diwali",
 }
 
 
@@ -707,6 +714,7 @@ async def all_webapps_cmd(message: Message):
         [InlineKeyboardButton(text="💣 Mine", url=L["mine"]),
          InlineKeyboardButton(text="🕵️ Scramble", url=L["scramble"])],
         [InlineKeyboardButton(text="🫯 Match", url=L["match"])],
+        [InlineKeyboardButton(text="Diwali 🪔", url=L["diwali"], style="success")],
         [InlineKeyboardButton(text="Close", callback_data=f"webclose:{uid_int}", style=ButtonStyle.DANGER)],
     ])
     await smart_reply(
