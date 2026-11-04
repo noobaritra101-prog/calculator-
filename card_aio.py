@@ -352,7 +352,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.critical(f"Failed to flush database on shutdown: {e}", exc_info=True)
 
-    # The disk is wiped after this process stops (Render), so push one last backup to the group.
+    # The disk is wiped after this process stops (Railway/Render), so push one last backup to the group.
     try:
         logger.info("Final backup to the group before shutdown...")
         await asyncio.wait_for(perform_backup(), timeout=20)

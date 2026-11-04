@@ -44,7 +44,7 @@ MAIN_GROUP_LINK     = "https://t.me/animex_nexus"
 # that must point back at THIS running app. Import it from config everywhere
 # instead of hardcoding it — if it drifts from the actual host, every image
 # link silently points at a dead service and every <img> in the Mini Apps breaks.
-BACKEND_PUBLIC_URL  = os.environ.get("BACKEND_PUBLIC_URL", "https://calculator-2czz.onrender.com").rstrip("/")
+BACKEND_PUBLIC_URL  = os.environ.get("BACKEND_PUBLIC_URL", "https://calculator-production-cdf0.up.railway.app").rstrip("/")
 OFFLINE_STORE_GROUP = int(os.environ.get("OFFLINE_STORE_GROUP", -1003982098657))  # 🏪 Peer-to-Peer Consignment Group/Channel ID
 
 # Fixed Shards Card Purchase Prices for Online Shop - Balanced Values
@@ -215,7 +215,7 @@ def load_db() -> dict:
 
 _db_changed = False       # something changed since the last successful group backup
 _restore_ok = True        # False if the startup restore from the group FAILED (never overwrite the backup then)
-BACKUP_INTERVAL_MIN = int(os.environ.get("BACKUP_INTERVAL_MIN", "5"))
+BACKUP_INTERVAL_MIN = int(os.environ.get("BACKUP_INTERVAL_MIN", "20"))
 
 
 def save_db(data: dict = None):
@@ -367,7 +367,7 @@ async def _perform_backup() -> bool:
 
 
 async def backup_to_group():
-    """On Render the disk is wiped on every restart, so the group backup IS the database.
+    """On Railway/Render the disk may be wiped on every restart, so the group backup IS the database.
     The first backup runs after 90 s (not after 20 minutes: a service that restarts more often than
     that would never back up at all), then every BACKUP_INTERVAL_MIN minutes, only when data changed."""
     global _db_changed
