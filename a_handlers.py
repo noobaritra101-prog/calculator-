@@ -2210,6 +2210,8 @@ async def list_promos_cmd(message: Message):
                 elif r["type"] == "banner":
                     target_desc = "Random" if r.get("banner_id") == "r" else f"ID {r.get('banner_id')}"
                     rewards_summary.append(f"🖼️ x{r['amount']} Banner ({target_desc})")
+                elif r["type"] == "anycard":
+                    rewards_summary.append(f"🎴 x{r['amount']} Random card")
                 else:
                     rewards_summary.append(f"🎴 x{r['amount']} {r['rarity']}")
         else:
@@ -2219,7 +2221,12 @@ async def list_promos_cmd(message: Message):
                 rewards_summary.append(f"🎴 x{data.get('amount', 1)} {data.get('rarity')}")
                 
         payouts_desc = ", ".join(rewards_summary)
-        text += f"{idx}. 🎫 <code>{code}</code> ➜ [{payouts_desc}]\n   └ Claims Status: <b>{claimed}/{limit}</b>\n\n"
+        exp = data.get("expires_at")
+        exp_line = ""
+        if exp:
+            left = int(exp - time.time())
+            exp_line = f"\n   └ Expires: <b>{format_duration_seconds(left) + ' left' if left > 0 else 'EXPIRED'}</b>"
+        text += f"{idx}. 🎫 <code>{code}</code> ➜ [{payouts_desc}]\n   └ Claims Status: <b>{claimed}/{limit}</b>{exp_line}\n\n"
         
     text += "━━━━━━━━━━━━━━━━━━━"
     await message.reply(text, parse_mode=ParseMode.HTML)

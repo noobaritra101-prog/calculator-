@@ -2614,6 +2614,63 @@ async def _seize_channel_joined(uid_int: int) -> bool:
     return joined
 
 
+# Series that the "anycard" promo reward never gives (matched on the letters/digits of the
+# anime name, so "Demon Slayer", "demon-slayer" and "Demon Slayer: Kimetsu no Yaiba" all match).
+ANYCARD_EXCLUDED_SERIES = ("haikyu", "bleach", "demonslayer", "naruto", "onepiece", "sakamotodays")
+
+
+def _norm_series(name) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+# Built-in promo codes. Each one is written into db["promos"] once (the first time anyone uses /redeem
+# after deploy); after that it behaves like a normal promo (/list_promos, /del_promo work on it, and
+# deleting it keeps it deleted). Edit here BEFORE deploying; changing it later won't touch a code that's
+# already in the database.
+SPECIAL_PROMO_START = datetime(2026, 11, 6, 8, 0, tzinfo=timezone.utc)   # start of the 7-day window
+BUILTIN_PROMOS = {
+    "4KSPECIAL": {
+        "rewards": [
+            {"type": "anycard", "amount": 1, "locked_chance": 20},   # 20% from a locked series, 80% unlocked
+            {"type": "shards", "shards": 2000},
+        ],
+        "max_claims": 5000,
+        "claimed_by": [],
+        "expires_at": int((SPECIAL_PROMO_START + timedelta(days=7)).timestamp()),
+    },
+}
+
+
+def _seed_builtin_promos(db: dict) -> None:
+    promos = db.setdefault("promos", {})
+    seeded = db.setdefault("settings", {}).setdefault("seeded_promos", [])
+    for code, data in BUILTIN_PROMOS.items():
+        if code not in seeded:
+            if code not in promos:
+                promos[code] = {**data, "rewards": [dict(r) for r in data["rewards"]], "claimed_by": []}
+            seeded.append(code)
+
+
+def _anycard_pool(db: dict) -> dict:
+    """Cards the 'anycard' promo reward can give: every rarity, locked or unlocked series, but never
+    a star card (starred by any user), a Halloween card, a Diwali card, or one of ANYCARD_EXCLUDED_SERIES."""
+    import diwali   # lazy: diwali only imports config, but this keeps module import order safe
+    star_ids = set()
+    for u in db.get("users", {}).values():
+        star_ids.update(u.get("star_purchases", []) or [])
+    pool = {}
+    for cid, c in db.get("global_cards", {}).items():
+        if cid in star_ids:
+            continue
+        if config.is_halloween_card(c) or diwali.is_diwali_card(c):
+            continue
+        anime = _norm_series(c.get("anime", ""))
+        if any(ex in anime for ex in ANYCARD_EXCLUDED_SERIES):
+            continue
+        pool[cid] = c
+    return pool
+
+
 @main_router.message(Command("redeem"))
 async def redeem_promo_cmd(message: Message, command: CommandObject):
     uid_int = message.from_user.id
@@ -2651,6 +2708,7 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
 
     code = command.args.upper().strip()
     db   = load_db()
+    _seed_builtin_promos(db)
     promos = db.setdefault("promos", {})
 
     if code not in promos:
@@ -2666,6 +2724,15 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
 
     if user_id in promo.setdefault("claimed_by", []):
         await safe_reply("<b>Already Claimed</b>\nYou have already redeemed this promo code.", parse_mode=ParseMode.HTML)
+        return
+
+    # Expired by time (promos made with a days:N option carry an expires_at).
+    if promo.get("expires_at") and time.time() > promo["expires_at"]:
+        await safe_reply(
+            "<b>Code Expired</b>\n"
+            "This promo code is no longer valid.",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     # Expired because every claim has been used.
@@ -2735,6 +2802,33 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
 
                     card_id, card_data = random.choice(list(eligible_pool.items()))
 
+                    if card_id not in user_cards:
+                        user_cards[card_id] = {"name": card_data["name"], "rarity": card_data["rarity"], "amount": 0}
+                    user_cards[card_id]["amount"] += 1
+                    db["users"][user_id]["total_claimed"] = db["users"][user_id].get("total_claimed", 0) + 1
+                    cards_awarded.append((card_data, 1))
+
+        elif reward["type"] == "anycard":
+            any_pool = _anycard_pool(db)
+            if any_pool:
+                user_cards = db["users"][user_id].setdefault("cards", {})
+                locked_pool   = {k: v for k, v in any_pool.items() if v["anime"].lower().strip() in locked_animes_lower}
+                unlocked_pool = {k: v for k, v in any_pool.items() if k not in locked_pool}
+                locked_chance = reward.get("locked_chance", 20)
+                for _ in range(reward.get("amount", 1)):
+                    # locked_chance % of the time the card comes from a locked series, otherwise from an
+                    # unlocked one (falls back to the other side if that side has no cards).
+                    if locked_pool and (not unlocked_pool or random.randint(1, 100) <= locked_chance):
+                        base_pool = locked_pool
+                    else:
+                        base_pool = unlocked_pool or locked_pool
+                    # Same duplicate rule as rarity cards: 20% may repeat, otherwise prefer unowned.
+                    eligible = base_pool
+                    if random.randint(1, 100) > 20:
+                        fresh = {k: v for k, v in base_pool.items() if k not in user_cards}
+                        if fresh:
+                            eligible = fresh
+                    card_id, card_data = random.choice(list(eligible.items()))
                     if card_id not in user_cards:
                         user_cards[card_id] = {"name": card_data["name"], "rarity": card_data["rarity"], "amount": 0}
                     user_cards[card_id]["amount"] += 1
