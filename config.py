@@ -34,8 +34,8 @@ LOG_THREAD_BAN      = 3  # Topic ID for Ban/Unban logs
 LOG_THREAD_TRANSFER = 4  # Topic ID for Transfer logs
 LOG_THREAD_TRADE    = 1452  # Topic ID for Card Trade logs (@anexlog)
 
-MAIN_GROUP_USERNAME = "@animex_nexus"
-MAIN_GROUP_LINK     = "https://t.me/animex_nexus"
+MAIN_GROUP_USERNAME = "@MainNexus"
+MAIN_GROUP_LINK     = "https://t.me/MainNexus"
 
 # ==========================================
 # BACKEND'S OWN PUBLIC URL (this Railway service)

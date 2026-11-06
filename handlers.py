@@ -2571,8 +2571,8 @@ async def referral_cmd(message: Message):
 # ==========================================
 # PROMOTIONAL CODES ENGINE (/redeem)
 # ==========================================
-FORCE_JOIN_CHANNEL = "@animenx_news"
-FORCE_JOIN_LINK    = "https://t.me/animenx_news"
+FORCE_JOIN_CHANNEL = "@MainNexus"
+FORCE_JOIN_LINK    = "https://t.me/MainNexus"
 
 async def _redeem_channel_joined(uid_int: int) -> bool:
     """True if the user has joined the mandatory promo channel. Fails
@@ -2638,7 +2638,7 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
         ])
         await safe_reply(
             "<b>▸ Join our channel to redeem promo codes!</b>\n\n"
-            "<b>↳ Join :</b> t.me/animenx_news\n\n"
+            "<b>↳ Join :</b> t.me/MainNexus\n\n"
             "<b>↻ Then send your /redeem command again.</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb
