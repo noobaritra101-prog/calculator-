@@ -55,7 +55,7 @@ import a_handlers                                # eval safety check + admin log
 import vlog                                      # vault activity log storage
 
 # Where admin.html is hosted (same place as index.html / chicken.html).
-ADMIN_WEB_URL = "https://animenexuss.netlify.app/admin.html"
+ADMIN_WEB_URL = "https://nexusanimex.netlify.app/admin.html"
 
 admin_api = APIRouter(prefix="/api/admin", tags=["Admin"])
 

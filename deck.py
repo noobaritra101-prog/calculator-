@@ -203,6 +203,13 @@ async def adsgram_reward_callback(userid: str, key: str = ""):
     progress = _get_ad_progress(user_data)
     required = _ads_required(db)
 
+    # Every confirmed ad view also counts toward the Stock Market bonus buy allotment.
+    try:
+        import market
+        market.credit_market_ad(user_data)
+    except Exception as e:
+        dlog.error(f"[ads/reward] market credit failed for {userid}: {e}")
+
     if progress["claimed"]:
         save_db()
         return {"ok": True, "status": "already_claimed_today", "watched": progress["watched"]}
@@ -699,6 +706,7 @@ WEBAPP_LINKS = {
     "scramble": f"https://t.me/{BOT_USERNAME}/scramble",
     "match":    f"https://t.me/{BOT_USERNAME}/match",
     "diwali":   f"https://t.me/{BOT_USERNAME}/Diwali",
+    "stockmarket": f"https://t.me/{BOT_USERNAME}/stockmarket",
 }
 
 
@@ -713,7 +721,8 @@ async def all_webapps_cmd(message: Message):
          InlineKeyboardButton(text="🪂 Airdrop", url=L["airdrop"])],
         [InlineKeyboardButton(text="💣 Mine", url=L["mine"]),
          InlineKeyboardButton(text="🕵️ Scramble", url=L["scramble"])],
-        [InlineKeyboardButton(text="🫯 Match", url=L["match"])],
+        [InlineKeyboardButton(text="🫯 Match", url=L["match"]),
+         InlineKeyboardButton(text="💹 Stockmarket", url=L["stockmarket"])],
         [InlineKeyboardButton(text="Diwali 🪔", url=L["diwali"], style="success")],
         [InlineKeyboardButton(text="Close", callback_data=f"webclose:{uid_int}", style=ButtonStyle.DANGER)],
     ])
@@ -1142,6 +1151,7 @@ async def send_deck_page(message, db: dict, user_id: str, page=0, edit=False, mu
             InlineKeyboardButton(text="Collection 🫧", switch_inline_query_current_chat=f"card_user.{user_id}"),
             InlineKeyboardButton(text="🌐 Web", url=WEBDECK_APP_LINK)
         ],
+        [InlineKeyboardButton(text="💹 Stockmarket", url=f"https://t.me/{BOT_USERNAME}/stockmarket")],
         [InlineKeyboardButton(text="🗑️", callback_data=f"deckdel_{user_id}", style="danger")]
     ])
 

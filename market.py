@@ -12,6 +12,8 @@ from aiogram.exceptions import TelegramBadRequest
 
 import config
 from config import bot, main_router, load_db, save_db, ensure_user, STOCKS, ADMIN_IDS
+from config import is_ghost_banned, is_shadow_banned
+from html import escape as _html_esc
 from vlog import log_action
 
 # ==========================================
@@ -61,12 +63,48 @@ PRICE_CEILING_MULTIPLIER = 4
 PROFIT_TAX_THRESHOLD = 2.0   # tax kicks in once sale price >= 2x avg buy price
 PROFIT_TAX_RATE = 0.08       # 8% of the profit portion, once past threshold (was 15%)
 
+# ── REWARDED ADS: EXTRA DAILY BUY ALLOTMENT ──
+# Each rewarded ad watched (confirmed by Adsgram's server postback) adds
+# AD_BONUS_SHARES to that day's buy limit, up to AD_MAX_PER_DAY ads/day.
+# Credited by deck.py's existing Adsgram postback (/api/deck/ads/reward) via
+# credit_market_ad(); there is no separate market reward URL.
+# Resets with the daily buy limit (UTC midnight).
+AD_BONUS_SHARES = 10
+AD_MAX_PER_DAY = 3
+
+
+def _market_ad_watched(udata: dict) -> int:
+    """Rewarded ads confirmed today (auto-resets on the UTC date change)."""
+    today = config.get_shop_rotation_seed()
+    ad = udata.setdefault("market_ad", {"date": today, "watched": 0})
+    if ad.get("date") != today:
+        ad["date"] = today
+        ad["watched"] = 0
+    return ad.get("watched", 0)
+
+
+def credit_market_ad(udata: dict) -> int:
+    """Called from the existing Adsgram postback in deck.py. Caller saves the db."""
+    watched = _market_ad_watched(udata)
+    if watched < AD_MAX_PER_DAY:
+        udata["market_ad"]["watched"] = watched + 1
+    return udata["market_ad"]["watched"]
+
+
+def _daily_limit(udata: dict) -> int:
+    """Today's buy allotment including ad bonuses."""
+    return config.DAILY_STOCK_BUY_LIMIT + _market_ad_watched(udata) * AD_BONUS_SHARES
+
+
 # ── MARKET HOURS ──
 # The market trades 24 hours a day, Monday through Friday. At the Friday
 # -> Saturday UTC rollover every open position is auto-sold at the current
 # price (same fee/tax as a manual sale), and the market stays closed for
 # all of Saturday and Sunday, reopening automatically at Monday 00:00 UTC.
 MARKET_CLOSED_WEEKDAYS = {5, 6}   # Python weekday(): Saturday=5, Sunday=6
+
+
+STOCKMARKET_APP_LINK = "https://t.me/Animenx_bot/stockmarket"
 
 
 def is_extreme_risk(sym: str) -> bool:
@@ -1007,7 +1045,7 @@ def _market_rules_text() -> str:
         "• 🌙 <b>Nightly Settlement:</b> All open positions are auto-sold at midnight UTC each night, at the last price.\n"
         "• 🏦 <b>Brokerage Fee:</b> A standard <b>1.5% fee</b> applies to both buy and sell trades.\n"
         f"• 📈 <b>Windfall Tax:</b> Selling at 2x+ your buy price adds a {int(PROFIT_TAX_RATE*100)}% tax on the profit portion.\n"
-        f"• 📅 <b>Buy Limit:</b> A maximum daily allotment of <b>{config.DAILY_STOCK_BUY_LIMIT} shares</b> resets at midnight UTC.\n"
+        f"• 📅 <b>Buy Limit:</b> A maximum daily allotment of <b>{config.DAILY_STOCK_BUY_LIMIT} shares</b> (+{AD_BONUS_SHARES} per rewarded ad, up to {AD_MAX_PER_DAY}/day) resets at midnight UTC.\n"
         "━━━━━━━━━━━━━━━━━"
     )
 
@@ -1027,6 +1065,7 @@ async def stockmarket_cmd(message: Message):
         [InlineKeyboardButton(text="🛒 Buy Stocks", callback_data=f"sm_bl_{uid}", style=ButtonStyle.SUCCESS),
          InlineKeyboardButton(text="💵 Sell Stocks", callback_data=f"sm_sl_{uid}", style=ButtonStyle.DANGER)],
         [InlineKeyboardButton(text="💼 Your Portfolio", callback_data=f"sm_p_{uid}", style=ButtonStyle.PRIMARY)],
+        [InlineKeyboardButton(text="💹 Stockmarket", url=STOCKMARKET_APP_LINK, style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="📖 Stock Market Help", callback_data=f"sm_help_{uid}")]
     ])
     
@@ -1051,6 +1090,7 @@ async def sm_main_cb(cq: CallbackQuery):
         [InlineKeyboardButton(text="🛒 Buy Stocks", callback_data=f"sm_bl_{uid}", style=ButtonStyle.SUCCESS),
          InlineKeyboardButton(text="💵 Sell Stocks", callback_data=f"sm_sl_{uid}", style=ButtonStyle.DANGER)],
         [InlineKeyboardButton(text="💼 Your Portfolio", callback_data=f"sm_p_{uid}", style=ButtonStyle.PRIMARY)],
+        [InlineKeyboardButton(text="💹 Stockmarket", url=STOCKMARKET_APP_LINK, style=ButtonStyle.SUCCESS)],
         [InlineKeyboardButton(text="📖 Stock Market Help", callback_data=f"sm_help_{uid}")]
     ])
     
@@ -1184,7 +1224,7 @@ async def sm_view_stock_cb(cq: CallbackQuery):
     today = config.get_shop_rotation_seed()
     daily_stock_data = db["users"].get(uid, {}).get("daily_stock_bought", {"date": "", "amount": 0})
     current_daily_amount = daily_stock_data.get("amount", 0) if daily_stock_data.get("date") == today else 0
-    remaining_limit = max(0, config.DAILY_STOCK_BUY_LIMIT - current_daily_amount)
+    remaining_limit = max(0, _daily_limit(db['users'].get(uid, {})) - current_daily_amount)
     
     caption = (
         f"<b>「 {stock['name']} ({sym}) 」</b>\n"
@@ -1193,7 +1233,7 @@ async def sm_view_stock_cb(cq: CallbackQuery):
         f"💵 <b>Current Valuation:</b> <b>{price} 💠</b>\n"
         f"📊 <b>24h Direct Trend:</b> <i>{trend}</i>\n"
         f"⚠️ <b>Risk Tier:</b> <b>{risk_level}</b>\n"
-        f"📅 <b>Daily Buy Limit:</b> <code>{current_daily_amount}/{config.DAILY_STOCK_BUY_LIMIT}</code> shares\n"
+        f"📅 <b>Daily Buy Limit:</b> <code>{current_daily_amount}/{_daily_limit(db['users'].get(uid, {}))}</code> shares\n"
         f"📥 <b>Remaining Today:</b> <code>{remaining_limit}</code> shares\n\n"
         f"🛒 <b>Purchase Volume:</b> <b>{amount} shares</b>\n"
         f"💰 <b>Estimated Cost:</b> <b>{total_cost} 💠</b> <i>(incl. 1.5% fee)</i>\n\n"
@@ -1279,10 +1319,10 @@ async def sm_confirm_buy_cb(cq: CallbackQuery):
         save_db()
 
     current_daily_amount = daily_stock_data.get("amount", 0)
-    if current_daily_amount + amount > config.DAILY_STOCK_BUY_LIMIT:
+    if current_daily_amount + amount > _daily_limit(db['users'].get(uid, {})):
         await cq.answer(
             f"❌ Limit Exceeded!\n"
-            f"Daily allotment allows buying {config.DAILY_STOCK_BUY_LIMIT} shares.\n"
+            f"Daily allotment allows buying {_daily_limit(db['users'].get(uid, {}))} shares.\n"
             f"You have already bought {current_daily_amount} shares today.",
             show_alert=True
         )
@@ -1301,7 +1341,7 @@ async def sm_confirm_buy_cb(cq: CallbackQuery):
         f"📦 <b>Volume:</b> <b>{amount} shares</b>\n"
         f"💵 <b>Base Valuation:</b> {base_cost} 💠\n"
         f"🏦 <b>Brokerage Fee (1.5%):</b> {fee} 💠\n"
-        f"📅 <b>Quota Forecast:</b> <code>{current_daily_amount + amount}/{config.DAILY_STOCK_BUY_LIMIT}</code> shares\n"
+        f"📅 <b>Quota Forecast:</b> <code>{current_daily_amount + amount}/{_daily_limit(db['users'].get(uid, {}))}</code> shares\n"
         f"━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>Total Deducted:</b> <b>{total_cost} 💠</b>"
     )
@@ -1347,10 +1387,10 @@ async def sm_execute_buy_cb(cq: CallbackQuery):
         daily_stock_data["amount"] = 0
 
     current_daily_amount = daily_stock_data.get("amount", 0)
-    if current_daily_amount + amount > config.DAILY_STOCK_BUY_LIMIT:
+    if current_daily_amount + amount > _daily_limit(db['users'].get(uid, {})):
         await cq.answer(
             f"❌ Quota Exceeded!\n"
-            f"This purchase exceeds your remaining daily allowance of {config.DAILY_STOCK_BUY_LIMIT - current_daily_amount} shares.",
+            f"This purchase exceeds your remaining daily allowance of {_daily_limit(db['users'].get(uid, {})) - current_daily_amount} shares.",
             show_alert=True
         )
         return
@@ -1424,7 +1464,7 @@ async def sm_execute_buy_cb(cq: CallbackQuery):
         f"━━━━━━━━━━━━━━━━━\n\n"
         f"<blockquote><i>Fiduciary transfer complete. Securities moved to your portfolio.</i></blockquote>\n\n"
         f"Acquired <b>{amount}x {sym}</b> shares successfully.\n"
-        f"📅 <b>Daily Quota Status:</b> <code>{current_daily_amount + amount}/{config.DAILY_STOCK_BUY_LIMIT}</code> shares\n"
+        f"📅 <b>Daily Quota Status:</b> <code>{current_daily_amount + amount}/{_daily_limit(db['users'].get(uid, {}))}</code> shares\n"
         f"💰 <b>Cost:</b> <b>{total_cost} 💠</b> (including brokerage commission)."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⤶", callback_data=f"sm_bl_{uid}", style=ButtonStyle.DANGER)]])
@@ -1816,3 +1856,303 @@ async def sm_execute_sell_cb(cq: CallbackQuery):
             await cq.message.edit_text(success_text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception: pass
     await cq.answer(f"✅ Sold {amount}x {sym}!", show_alert=True)
+
+
+# ==========================================================================
+# MINI APP WEB API  (/api/market)  —  backs market.html
+# ==========================================================================
+# Endpoints used by market.html:
+#   GET  /api/market/state        -> full state snapshot
+#   POST /api/market/buy   {symbol, amount}  -> {state, message}
+#   POST /api/market/sell  {symbol, amount}  -> {state, message}
+# Every request carries the Telegram Mini App initData in the
+# X-Telegram-Init-Data header; it is verified server-side, so the user id is
+# never taken from the client body.
+import json
+import hmac
+import hashlib
+from urllib.parse import parse_qsl
+from fastapi import APIRouter, HTTPException, Header
+from pydantic import BaseModel
+
+market_api = APIRouter(prefix="/api/market", tags=["Market"])
+
+
+def _verify_init_data(init_data: str, max_age: int = 86400):
+    """Returns the Telegram user dict if Mini App initData is genuine and fresh, else None."""
+    try:
+        pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
+        recv_hash = pairs.pop("hash", None)
+        if not recv_hash:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", config.bot.token.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, recv_hash):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > max_age:
+            return None
+        return json.loads(pairs.get("user", "{}"))
+    except Exception:
+        return None
+
+
+def _auth_user(init_data: str) -> dict:
+    tg_user = _verify_init_data(init_data)
+    if not tg_user or not tg_user.get("id"):
+        raise HTTPException(status_code=401, detail="Open this page from the bot in Telegram.")
+    return tg_user
+
+
+def _build_market_state(db: dict, uid: str) -> dict:
+    market = db.get("market", {})
+    udata = db["users"].get(uid, {})
+
+    stocks = []
+    prices = {}
+    for sym, info in STOCKS.items():
+        entry = market.get(sym, {})
+        price = entry.get("current_price", info["base_price"])
+        hist = list(entry.get("history") or [price])
+        prev = hist[0] if hist and hist[0] > 0 else (price or 1)
+        prices[sym] = price
+        stocks.append({
+            "sym": sym,
+            "name": info["name"],
+            "price": price,
+            "prev": prev,
+            "vol": info["volatility"],
+            "hist": hist,
+            "frozen": is_frozen(entry),
+        })
+
+    positions = []
+    total_value = 0
+    total_pl = 0
+    for sym, pos in (udata.get("stocks") or {}).items():
+        shares = pos.get("shares", 0)
+        if shares <= 0 or sym not in STOCKS:
+            continue
+        avg = pos.get("avg_price", prices[sym])
+        value = prices[sym] * shares
+        pl = int((prices[sym] - avg) * shares)
+        total_value += value
+        total_pl += pl
+        positions.append({"sym": sym, "shares": shares, "avg": avg, "value": value, "pl": pl})
+
+    tracker = _touch_user_stock_daily(udata) if udata else {"profit": 0, "prev_day_profit": 0}
+    today = config.get_shop_rotation_seed()
+    dsb = udata.get("daily_stock_bought", {"date": "", "amount": 0})
+    bought_today = dsb.get("amount", 0) if dsb.get("date") == today else 0
+    ads_watched = _market_ad_watched(udata) if udata else 0
+
+    return {
+        "open": is_trading_open(db),
+        "stocks": stocks,
+        "user": {
+            "id": uid,
+            "name": udata.get("name", "Trader"),
+            "username": udata.get("username"),
+            "shards": udata.get("nexus_shards", 0),
+            "banned": is_stock_banned(db, uid),
+            "positions": positions,
+            "total_value": total_value,
+            "total_pl": total_pl,
+            "today_profit": tracker.get("profit", 0),
+            "prev_profit": tracker.get("prev_day_profit", 0),
+            "bought_today": bought_today,
+            "cards": len(udata.get("cards") or {}),
+            "ads_watched": ads_watched,
+            "ads_max": AD_MAX_PER_DAY,
+            "ad_bonus": AD_BONUS_SHARES,
+        },
+        "cfg": {
+            "limit": config.DAILY_STOCK_BUY_LIMIT + ads_watched * AD_BONUS_SHARES,
+            "fee": config.MARKET_FEE_PCT,
+            "tax_rate": PROFIT_TAX_RATE,
+            "tax_mult": PROFIT_TAX_THRESHOLD,
+        },
+    }
+
+
+def _web_ctx(init_data: str):
+    tg_user = _auth_user(init_data)
+    uid = str(tg_user["id"])
+    if is_ghost_banned(int(uid)) or is_shadow_banned(int(uid)):
+        raise HTTPException(status_code=403, detail="You are currently restricted.")
+    db = ensure_user(uid, tg_user.get("first_name", "Trader"), tg_user.get("username"))
+    # keep username fresh for the profile screen
+    db["users"][uid]["username"] = tg_user.get("username")
+    return db, uid, tg_user
+
+
+class TradeRequest(BaseModel):
+    symbol: str
+    amount: int
+
+
+def _check_trade_common(db: dict, uid: str, sym: str, amount: int):
+    if sym not in STOCKS:
+        raise HTTPException(status_code=400, detail="Unknown stock.")
+    if amount < 1 or amount > 100000:
+        raise HTTPException(status_code=400, detail="Invalid amount.")
+    if is_stock_banned(db, uid):
+        raise HTTPException(status_code=403, detail="You are restricted from the Stock Market.")
+    if not is_trading_open(db):
+        raise HTTPException(status_code=400, detail="Market is closed on Saturday and Sunday.")
+    if is_frozen(db.get("market", {}).get(sym, {})):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{sym} is halted for {freeze_time_left_str(db['market'][sym])} after a crash.",
+        )
+
+
+@market_api.get("/state")
+async def market_web_state(x_telegram_init_data: str = Header(default="")):
+    db, uid, _ = _web_ctx(x_telegram_init_data)
+    state = _build_market_state(db, uid)
+    save_db()  # persists the daily-profit rollover done by _touch_user_stock_daily
+    return state
+
+
+@market_api.post("/buy")
+async def market_web_buy(req: TradeRequest, x_telegram_init_data: str = Header(default="")):
+    db, uid, tg_user = _web_ctx(x_telegram_init_data)
+    sym, amount = req.symbol.upper(), req.amount
+    _check_trade_common(db, uid, sym, amount)
+
+    udata = db["users"][uid]
+    today = config.get_shop_rotation_seed()
+    dsb = udata.setdefault("daily_stock_bought", {"date": "", "amount": 0})
+    if dsb.get("date") != today:
+        dsb["date"] = today
+        dsb["amount"] = 0
+    current = dsb.get("amount", 0)
+    limit_now = _daily_limit(udata)
+    if current + amount > limit_now:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Daily limit: {max(0, limit_now - current)} shares left today. Watch an ad for more.",
+        )
+
+    market_entry = db.setdefault("market", {}).setdefault(
+        sym, {"current_price": STOCKS[sym]["base_price"], "history": [STOCKS[sym]["base_price"]], "flow": 0}
+    )
+    price = market_entry.get("current_price", STOCKS[sym]["base_price"])
+    base_cost = price * amount
+    fee = int(base_cost * config.MARKET_FEE_PCT)
+    total_cost = base_cost + fee
+
+    if udata.get("nexus_shards", 0) < total_cost:
+        raise HTTPException(status_code=400, detail=f"Not enough Shards. You need {total_cost}.")
+
+    udata["nexus_shards"] -= total_cost
+    user_stocks = udata.setdefault("stocks", {})
+    pos = user_stocks.setdefault(sym, {"shares": 0, "avg_price": 0.0})
+    new_shares = pos["shares"] + amount
+    pos["avg_price"] = ((pos["shares"] * pos["avg_price"]) + base_cost) / new_shares
+    pos["shares"] = new_shares
+
+    market_entry["flow"] = market_entry.get("flow", 0) + amount
+    dsb["amount"] = current + amount
+
+    mstats = db.setdefault("market_stats", {})
+    mstats["total_buy_orders"] = mstats.get("total_buy_orders", 0) + 1
+    mstats["total_shares_bought"] = mstats.get("total_shares_bought", 0) + amount
+    mstats["total_shards_spent"] = mstats.get("total_shards_spent", 0) + total_cost
+    mstats["total_fees_collected"] = mstats.get("total_fees_collected", 0) + fee
+    daily = _touch_market_daily(db)
+    daily["buy_orders"] += 1
+    daily["shares_bought"] += amount
+    daily["shards_spent"] += total_cost
+    daily["fees_collected"] += fee
+    daily.setdefault("by_symbol", {}).setdefault(sym, {"bought": 0, "sold": 0})["bought"] += amount
+    mstats.setdefault("by_symbol", {}).setdefault(sym, {"bought": 0, "sold": 0})["bought"] += amount
+    save_db()
+
+    try:
+        await bot.send_message(
+            chat_id=config.PUBLIC_LOG_GROUP_ID,
+            text=(f"{_html_esc(tg_user.get('first_name', 'User'))} (<code>{uid}</code>) <b>Purchased</b> "
+                  f"[ {sym} x{amount} ] for <b>{base_cost} shards</b> (Web)"),
+            message_thread_id=config.LOG_THREAD_STOCKMARKET,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        print(f"[LOG] web buy log failed: {e}")
+
+    return {"state": _build_market_state(db, uid), "message": f"Bought {amount}x {sym} for {total_cost}"}
+
+
+@market_api.post("/sell")
+async def market_web_sell(req: TradeRequest, x_telegram_init_data: str = Header(default="")):
+    db, uid, tg_user = _web_ctx(x_telegram_init_data)
+    sym, amount = req.symbol.upper(), req.amount
+    _check_trade_common(db, uid, sym, amount)
+
+    udata = db["users"][uid]
+    user_stocks = udata.get("stocks", {})
+    owned = user_stocks.get(sym, {}).get("shares", 0)
+    if owned < amount:
+        raise HTTPException(status_code=400, detail=f"You only own {owned} shares of {sym}.")
+
+    price = db.get("market", {}).get(sym, {}).get("current_price", STOCKS[sym]["base_price"])
+    avg_price = user_stocks[sym].get("avg_price", price)
+    gross = price * amount
+    fee = int(gross * config.MARKET_FEE_PCT)
+    cost_basis = avg_price * amount
+    profit = gross - cost_basis
+    profit_tax = 0
+    if avg_price > 0 and price >= avg_price * PROFIT_TAX_THRESHOLD and profit > 0:
+        profit_tax = int(profit * PROFIT_TAX_RATE)
+    net = gross - fee - profit_tax
+
+    udata["nexus_shards"] = udata.get("nexus_shards", 0) + net
+    user_stocks[sym]["shares"] -= amount
+    if user_stocks[sym]["shares"] <= 0:
+        del user_stocks[sym]
+
+    tracker = _touch_user_stock_daily(udata)
+    tracker["profit"] += int(net - cost_basis)
+
+    market_entry = db.setdefault("market", {}).setdefault(
+        sym, {"current_price": STOCKS[sym]["base_price"], "history": [STOCKS[sym]["base_price"]], "flow": 0}
+    )
+    market_entry["flow"] = market_entry.get("flow", 0) - amount
+
+    mstats = db.setdefault("market_stats", {})
+    mstats["total_sell_orders"] = mstats.get("total_sell_orders", 0) + 1
+    mstats["total_shares_sold"] = mstats.get("total_shares_sold", 0) + amount
+    mstats["total_shards_generated"] = mstats.get("total_shards_generated", 0) + net
+    mstats["total_fees_collected"] = mstats.get("total_fees_collected", 0) + fee
+    mstats["total_windfall_tax_collected"] = mstats.get("total_windfall_tax_collected", 0) + profit_tax
+    daily = _touch_market_daily(db)
+    daily["sell_orders"] += 1
+    daily["shares_sold"] += amount
+    daily["shards_generated"] += net
+    daily["fees_collected"] += fee
+    daily["windfall_tax_collected"] += profit_tax
+    daily.setdefault("by_symbol", {}).setdefault(sym, {"bought": 0, "sold": 0})["sold"] += amount
+    mstats.setdefault("by_symbol", {}).setdefault(sym, {"bought": 0, "sold": 0})["sold"] += amount
+    save_db()
+
+    log_action(db, uid, {
+        "type": "market_sell", "amount": net, "symbol": sym, "shares": amount,
+        "profit": int(profit), "chat_id": "web", "chat_title": "Web App",
+    })
+
+    profit_int = int(profit)
+    pl_label = f"(Profit: {profit_int})" if profit_int >= 0 else f"(Loss: {abs(profit_int)})"
+    try:
+        await bot.send_message(
+            chat_id=config.PUBLIC_LOG_GROUP_ID,
+            text=(f"{_html_esc(tg_user.get('first_name', 'User'))} (<code>{uid}</code>) <b>Sold</b> "
+                  f"[ {sym} x{amount} ] for <b>{gross} shards</b> {pl_label} (Web)"),
+            message_thread_id=config.LOG_THREAD_STOCKMARKET,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        print(f"[LOG] web sell log failed: {e}")
+
+    return {"state": _build_market_state(db, uid), "message": f"Sold {amount}x {sym} for {net}"}
+
