@@ -36,6 +36,8 @@ LOG_THREAD_TRADE    = 1452  # Topic ID for Card Trade logs (@anexlog)
 
 MAIN_GROUP_USERNAME = "@MainNexus"
 MAIN_GROUP_LINK     = "https://t.me/MainNexus"
+NEWS_CHANNEL_USERNAME = os.environ.get("NEWS_CHANNEL_USERNAME", "@animenx_news")
+NEWS_CHANNEL_LINK     = "https://t.me/animenx_news"
 
 # ==========================================
 # BACKEND'S OWN PUBLIC URL (this Railway service)

@@ -32,7 +32,7 @@ from config import (
     QUERY_GROUP_ID, active_drops
 )
 
-from handlers import trigger_drop
+from handlers import trigger_drop, _seed_builtin_promos
 
 # deck.py owns the ad-reward system and its shared error logger — reuse the
 # same objects here rather than duplicating them, so /dlog and /bug read the
@@ -2191,6 +2191,8 @@ async def list_promos_cmd(message: Message):
     if uid_int not in ADMIN_IDS: return
 
     db = load_db()
+    _seed_builtin_promos(db)      # make sure built-in codes (e.g. 4KSPECIAL) exist before listing
+    save_db()
     promos = db.setdefault("promos", {})
 
     if not promos:
@@ -2211,7 +2213,7 @@ async def list_promos_cmd(message: Message):
                     target_desc = "Random" if r.get("banner_id") == "r" else f"ID {r.get('banner_id')}"
                     rewards_summary.append(f"🖼️ x{r['amount']} Banner ({target_desc})")
                 elif r["type"] == "anycard":
-                    rewards_summary.append(f"🎴 x{r['amount']} Random card")
+                    rewards_summary.append(f"🎴 x{r['amount']} Random {r.get('rarity', 'any-rarity')} card")
                 else:
                     rewards_summary.append(f"🎴 x{r['amount']} {r['rarity']}")
         else:

@@ -109,6 +109,7 @@ from mines import mines_router
 from deck import deck_api  # <--- IMPORT DECK API ROUTER
 from admin_api import admin_api  # <--- IMPORT ADMIN API ROUTER
 from store import store_api  # <--- IMPORT STORE API ROUTER
+from ranking_link import ranking_link_api  # <--- IMPORT RANKING-BOT LINK ROUTER
 
 
 # ==========================================
@@ -393,6 +394,7 @@ app.include_router(deck_api)  # <--- MOUNT DECK API ROUTER
 app.include_router(admin_api)  # <--- MOUNT ADMIN API ROUTER
 app.include_router(store_api)  # <--- MOUNT STORE API ROUTER
 app.include_router(versus_router)  # <--- MOUNT VERSUS WEB APP ROUTER
+app.include_router(ranking_link_api)  # <--- MOUNT RANKING-BOT LINK (withdraw credits)
 
 
 @app.get("/")

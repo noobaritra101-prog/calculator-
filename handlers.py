@@ -2571,47 +2571,89 @@ async def referral_cmd(message: Message):
 # ==========================================
 # PROMOTIONAL CODES ENGINE (/redeem)
 # ==========================================
-FORCE_JOIN_CHANNEL = "@MainNexus"
-FORCE_JOIN_LINK    = "https://t.me/MainNexus"
+FORCE_JOIN_CHANNEL = config.MAIN_GROUP_USERNAME
+FORCE_JOIN_LINK    = config.MAIN_GROUP_LINK
+
+# Everything /redeem requires, in the order the buttons are shown.
+# (key, button label, chat to check, join link)
+_JOIN_TARGETS = (
+    ("main", "Main Group",   config.MAIN_GROUP_USERNAME,   config.MAIN_GROUP_LINK),
+    ("news", "News Channel", config.NEWS_CHANNEL_USERNAME, config.NEWS_CHANNEL_LINK),
+)
+
+# Only /seize uses this cache (it fires on every guess in busy groups).
+# /redeem ALWAYS does a live check: caching there let users leave the news
+# channel and still redeem until the cache expired.
+_JOIN_CACHE_TTL = 600  # seconds
+_join_cache: dict[tuple, float] = {}
+
+
+def _status_is_member(member) -> bool:
+    """A 'restricted' user is still inside the chat unless is_member is False
+    (the old check treated every non-left/kicked status the same way)."""
+    st = member.status
+    if st in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        return False
+    if st == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(member, "is_member", True))
+    return True
+
+
+async def _is_joined(key: str, chat, uid_int: int, use_cache: bool = False):
+    """True = joined, False = confirmed not joined, None = could not verify
+    (bot not admin / wrong chat / API error). None is kept separate from False
+    so a broken lookup is never reported to the user as 'you haven't joined'."""
+    now = time.time()
+    if use_cache:
+        exp = _join_cache.get((key, uid_int))
+        if exp and exp > now:
+            return True
+    for attempt in range(2):
+        try:
+            member = await bot.get_chat_member(chat, uid_int)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(e.retry_after, 2))
+            continue
+        except (TelegramBadRequest, TelegramForbiddenError) as e:
+            print(f"[join-check] cannot verify {uid_int} in {chat}: {e}")
+            return None
+        except Exception as e:
+            print(f"[join-check] error for {uid_int} in {chat}: {e}")
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+                continue
+            return None
+        joined = _status_is_member(member)
+        if joined and use_cache:
+            if len(_join_cache) > 10000:
+                _join_cache.clear()
+            _join_cache[(key, uid_int)] = now + _JOIN_CACHE_TTL
+        return joined
+    return None
+
+
+async def _missing_joins(uid_int: int) -> list:
+    """Targets the user still has to join, as (key, label, link, unverified).
+    Joined targets are left out entirely so no button is shown for them."""
+    results = await asyncio.gather(*(_is_joined(k, chat, uid_int) for k, _, chat, _ in _JOIN_TARGETS))
+    missing = []
+    for (key, label, _chat, link), joined in zip(_JOIN_TARGETS, results):
+        if joined is True:
+            continue
+        missing.append((key, label, link, joined is None))
+    return missing
+
 
 async def _redeem_channel_joined(uid_int: int) -> bool:
-    """True if the user has joined the mandatory promo channel. Fails
-    closed on lookup errors (e.g. the bot losing admin rights in the
-    channel, or Telegram rate-limiting the check) so a broken check
-    can't silently let redemptions through unverified."""
-    try:
-        member = await bot.get_chat_member(FORCE_JOIN_CHANNEL, uid_int)
-    except (TelegramBadRequest, TelegramForbiddenError):
-        return False
-    return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
+    """True when the user has joined every required chat."""
+    return not await _missing_joins(uid_int)
 
 
-# /seize channel lock. A busy group can fire /seize many times per drop, so
-# a positive result is cached briefly instead of calling get_chat_member on
-# every guess. Only "joined" is cached — someone who hasn't joined is
-# re-checked every time, so they're let through the moment they join.
-_SEIZE_JOIN_CACHE_TTL = 600  # seconds
-_seize_join_cache: dict[int, float] = {}
-
+# /seize lock stays on the main group only. FAILS OPEN on lookup errors (a
+# broken check would stop every player in every group from claiming drops);
+# only a confirmed 'not joined' blocks.
 async def _seize_channel_joined(uid_int: int) -> bool:
-    """Channel check for /seize. Unlike /redeem this FAILS OPEN on lookup
-    errors (bot lost admin in the channel, rate limit, network hiccup):
-    a broken check here would otherwise stop every player in every group
-    from claiming drops. Only a confirmed 'left'/'kicked' blocks."""
-    now = time.time()
-    exp = _seize_join_cache.get(uid_int)
-    if exp and exp > now:
-        return True
-    try:
-        member = await bot.get_chat_member(FORCE_JOIN_CHANNEL, uid_int)
-    except Exception:
-        return True
-    joined = member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
-    if joined:
-        if len(_seize_join_cache) > 5000:
-            _seize_join_cache.clear()
-        _seize_join_cache[uid_int] = now + _SEIZE_JOIN_CACHE_TTL
-    return joined
+    return (await _is_joined("main", config.MAIN_GROUP_USERNAME, uid_int, use_cache=True)) is not False
 
 
 # Series that the "anycard" promo reward never gives (matched on the letters/digits of the
@@ -2631,7 +2673,8 @@ SPECIAL_PROMO_START = datetime(2026, 11, 6, 8, 0, tzinfo=timezone.utc)   # start
 BUILTIN_PROMOS = {
     "4KSPECIAL": {
         "rewards": [
-            {"type": "anycard", "amount": 1, "locked_chance": 20},   # 20% from a locked series, 80% unlocked
+            {"type": "anycard", "amount": 1, "rarity": "Divine ❄️", "locked_chance": 8,   # Divine only; 8% from a locked series, 92% unlocked
+             "exclude_ids": ["DB-0513F7"]},   # these card IDs can never come out of this reward
             {"type": "shards", "shards": 2000},
         ],
         "max_claims": 5000,
@@ -2649,18 +2692,26 @@ def _seed_builtin_promos(db: dict) -> None:
             if code not in promos:
                 promos[code] = {**data, "rewards": [dict(r) for r in data["rewards"]], "claimed_by": []}
             seeded.append(code)
+        elif code in promos:
+            # Keep an already-saved built-in code in step with the rewards written above
+            # (claims and expiry are left alone).
+            promos[code]["rewards"] = [dict(r) for r in data["rewards"]]
 
 
-def _anycard_pool(db: dict) -> dict:
-    """Cards the 'anycard' promo reward can give: every rarity, locked or unlocked series, but never
-    a star card (starred by any user), a Halloween card, a Diwali card, or one of ANYCARD_EXCLUDED_SERIES."""
+def _anycard_pool(db: dict, rarity: str | None = None, exclude_ids=()) -> dict:
+    """Cards the 'anycard' promo reward can give: the given rarity (any rarity if None), locked or unlocked series, but never
+    a star card (starred by any user), a Halloween card, a Diwali card, one of ANYCARD_EXCLUDED_SERIES, or a card ID in
+    `exclude_ids` (set per reward, e.g. 4KSPECIAL never gives DB-0513F7)."""
+    blocked_ids = {str(x).upper() for x in (exclude_ids or ())}
     import diwali   # lazy: diwali only imports config, but this keeps module import order safe
     star_ids = set()
     for u in db.get("users", {}).values():
         star_ids.update(u.get("star_purchases", []) or [])
     pool = {}
     for cid, c in db.get("global_cards", {}).items():
-        if cid in star_ids:
+        if cid in star_ids or str(cid).upper() in blocked_ids:
+            continue
+        if rarity and format_rarity(c.get("rarity", "")) != format_rarity(rarity):
             continue
         if config.is_halloween_card(c) or diwali.is_diwali_card(c):
             continue
@@ -2669,6 +2720,66 @@ def _anycard_pool(db: dict) -> dict:
             continue
         pool[cid] = c
     return pool
+
+
+def _join_prompt(missing: list, uid_int: int):
+    """(text, keyboard) for the join gate. Only chats not yet joined get a
+    Join button; a Check Again button always sits underneath."""
+    rows = [[InlineKeyboardButton(text=f"Join {label}", url=link)]
+            for _key, label, link, _unverified in missing]
+    rows.append([_styled_btn("Check Again", f"redeem_recheck_{uid_int}", "success")])
+    lines = [
+        ("<b>▸ Join our main group and news channel to redeem promo codes!</b>"
+         if len(missing) > 1 else
+         f"<b>▸ Join our {missing[0][1].lower()} to redeem promo codes!</b>"),
+        ""
+    ]
+    for _key, label, link, _unverified in missing:
+        lines.append(f"<b>↳ {label} :</b> {link.replace('https://', '')}")
+    if any(u for *_, u in missing):
+        lines.append("")
+        lines.append("<i>I couldn't verify one of these right now. If you already joined, "
+                     "wait a few seconds and tap Check Again.</i>")
+    lines.append("")
+    lines.append("<b>↻ Then tap Check Again or send your /redeem command again.</b>")
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@main_router.callback_query(F.data.startswith("redeem_recheck_"))
+async def redeem_recheck_cb(cq: CallbackQuery):
+    try:
+        owner_id = int(cq.data.rsplit("_", 1)[1])
+    except ValueError:
+        await cq.answer()
+        return
+    if cq.from_user.id != owner_id:
+        await cq.answer("This button is not for you.", show_alert=True)
+        return
+
+    missing = await _missing_joins(owner_id)
+    if not missing:
+        try:
+            await cq.message.edit_text(
+                "<b>▸ Verified</b>\n\n"
+                "You have joined all required chats.\n"
+                "<b>↻ Now send</b> <code>/redeem &lt;CODE&gt;</code> <b>to claim your reward.</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+        await cq.answer("Verified. You can redeem now.")
+        return
+
+    text, kb = _join_prompt(missing, owner_id)
+    try:
+        await cq.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except TelegramBadRequest:
+        pass  # message identical to what is already shown
+    except TelegramForbiddenError:
+        pass
+    names = " and ".join(label for _k, label, _l, _u in missing)
+    await cq.answer(f"You have not joined the {names} yet.", show_alert=True)
 
 
 @main_router.message(Command("redeem"))
@@ -2689,17 +2800,11 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
     # Works in DMs and groups; the channel join gate below applies everywhere.
     # Mandatory channel join gate — checked before anything else so an
     # unjoined user never learns whether their code was even valid.
-    if not await _redeem_channel_joined(uid_int):
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Join Channel", url=FORCE_JOIN_LINK)]
-        ])
-        await safe_reply(
-            "<b>▸ Join our channel to redeem promo codes!</b>\n\n"
-            "<b>↳ Join :</b> t.me/MainNexus\n\n"
-            "<b>↻ Then send your /redeem command again.</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb
-        )
+    missing = await _missing_joins(uid_int)
+    if missing:
+        # Smart buttons: only chats the user has NOT joined get a button.
+        text, kb = _join_prompt(missing, uid_int)
+        await safe_reply(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     if not command.args:
@@ -2809,7 +2914,7 @@ async def redeem_promo_cmd(message: Message, command: CommandObject):
                     cards_awarded.append((card_data, 1))
 
         elif reward["type"] == "anycard":
-            any_pool = _anycard_pool(db)
+            any_pool = _anycard_pool(db, reward.get("rarity"), reward.get("exclude_ids"))
             if any_pool:
                 user_cards = db["users"][user_id].setdefault("cards", {})
                 locked_pool   = {k: v for k, v in any_pool.items() if v["anime"].lower().strip() in locked_animes_lower}
