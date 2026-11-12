@@ -845,8 +845,22 @@ def is_halloween_card(global_card) -> bool:
     return global_card.get("event") == "halloween" or "🎃" in str(global_card.get("name", ""))
 
 
+def is_diwali_edition_card(global_card) -> bool:
+    """Diwali card check. Uses diwali.is_diwali_card (imported lazily: diwali imports config),
+    with a name/event fallback if that is unavailable."""
+    if not isinstance(global_card, dict):
+        return False
+    try:
+        import diwali
+        return bool(diwali.is_diwali_card(global_card))
+    except Exception:
+        return global_card.get("event") == "diwali" or "🪔" in str(global_card.get("name", ""))
+
+
 def halloween_flex_line(global_card: dict) -> str:
     """Caption suffix for flex/inline captions ('' for normal cards)."""
     if is_halloween_card(global_card):
         return "\n\n<b><i>This is a halloween (🎃) edition card !</i></b>"
+    if is_diwali_edition_card(global_card):
+        return "\n\n<b><i>This is a diwali (🪔) edition card !</i></b>"
     return ""

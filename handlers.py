@@ -2669,24 +2669,20 @@ def _norm_series(name) -> str:
 # after deploy); after that it behaves like a normal promo (/list_promos, /del_promo work on it, and
 # deleting it keeps it deleted). Edit here BEFORE deploying; changing it later won't touch a code that's
 # already in the database.
-SPECIAL_PROMO_START = datetime(2026, 11, 6, 8, 0, tzinfo=timezone.utc)   # start of the 7-day window
-BUILTIN_PROMOS = {
-    "4KSPECIAL": {
-        "rewards": [
-            {"type": "anycard", "amount": 1, "rarity": "Divine ❄️", "locked_chance": 8,   # Divine only; 8% from a locked series, 92% unlocked
-             "exclude_ids": ["DB-0513F7"]},   # these card IDs can never come out of this reward
-            {"type": "shards", "shards": 2000},
-        ],
-        "max_claims": 5000,
-        "claimed_by": [],
-        "expires_at": int((SPECIAL_PROMO_START + timedelta(days=7)).timestamp()),
-    },
-}
+BUILTIN_PROMOS = {}   # no built-in codes right now
+
+# Codes that used to be built in. They are deleted from db["promos"] the next time /redeem runs,
+# so a copy already saved in the database stops working too.
+REMOVED_BUILTIN_PROMOS = ("4KSPECIAL",)
 
 
 def _seed_builtin_promos(db: dict) -> None:
     promos = db.setdefault("promos", {})
     seeded = db.setdefault("settings", {}).setdefault("seeded_promos", [])
+    for code in REMOVED_BUILTIN_PROMOS:
+        promos.pop(code, None)
+        if code not in seeded:
+            seeded.append(code)   # keep it from ever being re-seeded
     for code, data in BUILTIN_PROMOS.items():
         if code not in seeded:
             if code not in promos:

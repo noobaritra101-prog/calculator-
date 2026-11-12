@@ -722,7 +722,7 @@ async def all_webapps_cmd(message: Message):
         [InlineKeyboardButton(text="💣 Mine", url=L["mine"]),
          InlineKeyboardButton(text="🕵️ Scramble", url=L["scramble"])],
         [InlineKeyboardButton(text="🫯 Match", url=L["match"]),
-         InlineKeyboardButton(text="💹 Stockmarket", url=L["stockmarket"])],
+         InlineKeyboardButton(text="💹 Stocks", url=L["stockmarket"])],
         [InlineKeyboardButton(text="Diwali 🪔", url=L["diwali"], style="success")],
         [InlineKeyboardButton(text="Close", callback_data=f"webclose:{uid_int}", style=ButtonStyle.DANGER)],
     ])
@@ -827,6 +827,91 @@ async def top_halloweens_cb(cq: CallbackQuery):
                                           parse_mode=ParseMode.HTML)
         else:
             await cq.message.edit_text(caption, reply_markup=_hw_top_kb(int(owner)),
+                                       parse_mode=ParseMode.HTML)
+        await cq.answer("Refreshed")
+    except TelegramBadRequest:
+        await cq.answer("Already up to date")
+
+
+# ==========================================
+# /topdiwali — top 10 Diwali card holders
+# ==========================================
+DW_TOP_IMAGE = "https://i.ibb.co/PvK6xn0k/d77d7713aa5d47b4d2f4b2ad7d2b291f.jpg"
+
+
+def _dw_top_caption(viewer_id: int = 0) -> str:
+    db = load_db()
+    dw_ids = {cid for cid, c in (db.get("global_cards", {}) or {}).items() if diwali.is_diwali_card(c)}
+    rows = []
+    for uid, u in (db.get("users", {}) or {}).items():
+        if not isinstance(u, dict):
+            continue
+        total = unique = 0
+        for cid, cd in (u.get("cards", {}) or {}).items():
+            if cid in dw_ids:
+                amt = int((cd or {}).get("amount", 0) or 0)
+                if amt > 0:
+                    total += amt
+                    unique += 1
+        if total > 0:
+            rows.append((total, unique, str(u.get("name") or "Unknown"), str(uid)))
+    rows.sort(key=lambda r: (-r[0], -r[1], r[2].lower()))
+    head = "<b>「 🪔 TOP 10 DIWALI HOLDERS 」</b>\n━━━━━━━━━━━━━━━━━\n"
+    if not rows:
+        return head + "No one holds a Diwali card yet."
+    lines = []
+    for i, (total, unique, name, _uid) in enumerate(rows[:10], 1):
+        lines.append(f"<b>{i}.</b> {_html_mod.escape(name)} — <b>{total}</b> cards ({unique} unique)")
+    mine = next(((i, r) for i, r in enumerate(rows, 1) if r[3] == str(viewer_id)), None)
+    if mine:
+        your = f"<b>Your rank:</b> #{mine[0]} of {len(rows)} — <b>{mine[1][0]}</b> cards ({mine[1][1]} unique)"
+    else:
+        your = "<b>Your rank:</b> not ranked yet (you hold no Diwali card)"
+    return (head + "\n".join(lines) +
+            f"\n━━━━━━━━━━━━━━━━━\n{your}\n<i>Diwali cards in total: {len(dw_ids)}</i>")
+
+
+def _dw_top_kb(owner_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Refresh", callback_data=f"dwtop_refresh:{owner_id}"),
+        InlineKeyboardButton(text="Close", callback_data=f"dwtop_close:{owner_id}", style=ButtonStyle.DANGER),
+    ]])
+
+
+@main_router.message(Command("topdiwali"))
+async def top_diwali_cmd(message: Message):
+    uid_int = message.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int): return
+    caption = _dw_top_caption(uid_int)
+    kb = _dw_top_kb(uid_int)
+    try:
+        await smart_reply_photo(message, photo=DW_TOP_IMAGE, caption=caption,
+                                reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        # image could not be fetched by Telegram -> still show the list
+        await smart_reply(message, caption, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@main_router.callback_query(F.data.startswith("dwtop_"))
+async def top_diwali_cb(cq: CallbackQuery):
+    action, _, owner = cq.data[len("dwtop_"):].partition(":")
+    if cq.from_user.id != int(owner or 0) and cq.from_user.id not in ADMIN_IDS:
+        await cq.answer("This list belongs to someone else. Use /topdiwali.", show_alert=True)
+        return
+    if action == "close":
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+        await cq.answer()
+        return
+    caption = _dw_top_caption(int(owner))
+    try:
+        if cq.message.photo:
+            await cq.message.edit_caption(caption=caption, reply_markup=_dw_top_kb(int(owner)),
+                                          parse_mode=ParseMode.HTML)
+        else:
+            await cq.message.edit_text(caption, reply_markup=_dw_top_kb(int(owner)),
                                        parse_mode=ParseMode.HTML)
         await cq.answer("Refreshed")
     except TelegramBadRequest:
@@ -1151,7 +1236,6 @@ async def send_deck_page(message, db: dict, user_id: str, page=0, edit=False, mu
             InlineKeyboardButton(text="Collection 🫧", switch_inline_query_current_chat=f"card_user.{user_id}"),
             InlineKeyboardButton(text="🌐 Web", url=WEBDECK_APP_LINK)
         ],
-        [InlineKeyboardButton(text="💹 Stockmarket", url=f"https://t.me/{BOT_USERNAME}/stockmarket")],
         [InlineKeyboardButton(text="🗑️", callback_data=f"deckdel_{user_id}", style="danger")]
     ])
 
