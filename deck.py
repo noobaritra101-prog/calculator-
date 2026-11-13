@@ -836,7 +836,7 @@ async def top_halloweens_cb(cq: CallbackQuery):
 # ==========================================
 # /topdiwali — top 10 Diwali card holders
 # ==========================================
-DW_TOP_IMAGE = "https://i.ibb.co/PvK6xn0k/d77d7713aa5d47b4d2f4b2ad7d2b291f.jpg"
+DW_TOP_IMAGE = "https://i.ibb.co/xKxGn34C/IMG-20261112-124138.jpg"
 
 
 def _dw_top_caption(viewer_id: int = 0) -> str:

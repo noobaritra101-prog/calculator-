@@ -25,6 +25,16 @@ from vlog import log_action
 # and are retrievable via /dlog without any extra setup here.
 dlog = logging.getLogger("deck_dlog")
 
+# Short name of the Mini App registered in BotFather (t.me/<bot>/<short_name>).
+# Override by setting WEBAPP_SHORT_NAME in config.py if yours differs.
+WEBAPP_SHORT_NAME = getattr(config, "WEBAPP_SHORT_NAME", "webdeck")
+
+
+def _offline_buy_link(bot_username: str, listing_id: str) -> str:
+    """'Buy Now' link for offline store posts: opens the Mini App straight on the
+    card purchase section (see openTabFromLink in index.html)."""
+    return f"https://t.me/{bot_username}/{WEBAPP_SHORT_NAME}?startapp=buy_{listing_id}"
+
 store_api = APIRouter(prefix="/api/store", tags=["Store"])
 
 # ==========================================
@@ -873,7 +883,7 @@ async def confirm_sell_cb(cq: CallbackQuery):
 
     listing_id = str(uuid.uuid4())[:8]
     bot_info = await bot.get_me()
-    deep_link = f"https://t.me/{bot_info.username}?start=buy_{listing_id}"
+    deep_link = _offline_buy_link(bot_info.username, listing_id)
 
     global_data = db["global_cards"][card_id]
     seller_name = db["users"][uid]["name"]
@@ -1708,7 +1718,7 @@ async def api_create_listing(req: SellRequest):
 
         listing_id = str(uuid.uuid4())[:8]
         bot_info = await bot.get_me()
-        deep_link = f"https://t.me/{bot_info.username}?start=buy_{listing_id}"
+        deep_link = _offline_buy_link(bot_info.username, listing_id)
         seller_name = user_data["name"]
         rarity_name, _, rarity_icon = rarity_normalized.rpartition(" ")
 
@@ -1847,6 +1857,38 @@ async def api_get_global_listings(category: str = "all", page: int = 0):
     except Exception as e:
         dlog.error(f"[store_offline_all_CRASH]: {e}", exc_info=True)
         return {"error": True, "listings": [], "page": 0, "total_pages": 1, "total": 0}
+
+
+@store_api.get("/offline/listing/{listing_id}")
+async def api_get_offline_listing(listing_id: str):
+    """Single active listing — used when the Mini App is opened from a group 'Buy Now' button."""
+    try:
+        db = load_db()
+        data = db.get("offline_store", {}).get(listing_id)
+        if not data:
+            raise HTTPException(status_code=404, detail="This listing is no longer available.")
+        card_data = db["global_cards"].get(data["card_id"])
+        if not card_data:
+            raise HTTPException(status_code=404, detail="This listing is no longer available.")
+        seller_name = db["users"].get(data["seller_id"], {}).get("name", "User")
+        return {
+            "error": False,
+            "listing": {
+                "listing_id": listing_id,
+                "card_id": data["card_id"],
+                "name": card_data["name"],
+                "rarity": format_rarity(card_data["rarity"]),
+                "anime": card_data.get("anime"),
+                "price": data["price"],
+                "seller_name": seller_name,
+                "seller_id": data["seller_id"],
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        dlog.error(f"[store_offline_listing_CRASH] lid={listing_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Couldn't load this listing.")
 
 
 @store_api.post("/offline/buy")
