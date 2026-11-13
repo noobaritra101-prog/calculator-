@@ -1,1 +1,1 @@
-worker: python card_aio.py
+worker: python python Main.py
