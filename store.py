@@ -30,10 +30,65 @@ dlog = logging.getLogger("deck_dlog")
 WEBAPP_SHORT_NAME = getattr(config, "WEBAPP_SHORT_NAME", "webdeck")
 
 
+def _ensure_user_keep(user_id, name=None):
+    """ensure_user() overwrites the saved name/username with whatever it is given.
+    Mini App endpoints have no Telegram user object, so pass the saved values
+    back in; otherwise every Mini App call reset the name to 'User'."""
+    existing = load_db().get("users", {}).get(str(user_id))
+    if existing:
+        return ensure_user(user_id, name or existing.get("name") or "User", existing.get("username"))
+    return ensure_user(user_id, name or "User", None)
+
+
+_PLACEHOLDER_NAMES = {"", "user", "unknown", "none"}
+
+
+def _user_label(db, uid, escape=True) -> str:
+    """Display name for a user (first name only, no @username)."""
+    u = db.get("users", {}).get(str(uid), {}) or {}
+    name = str(u.get("name") or "User")
+    return html.escape(name) if escape else name
+
+
+async def _resolve_user_label(db, uid, tg_name=None) -> str:
+    """Returns the user's real name. Refreshes the saved name from Telegram when
+    we have it (tg_name) or when the saved one is a placeholder like 'User' /
+    'Unknown', so notifications and edits never show those."""
+    uid = str(uid)
+    u = db.get("users", {}).get(uid)
+    if u is not None:
+        if tg_name:
+            u["name"] = tg_name
+        elif str(u.get("name", "")).strip().lower() in _PLACEHOLDER_NAMES:
+            try:
+                chat = await bot.get_chat(int(uid))
+                real = getattr(chat, "first_name", None) or getattr(chat, "title", None)
+                if real:
+                    u["name"] = real
+            except Exception:
+                pass
+    return _user_label(db, uid)
+
+
 def _offline_buy_link(bot_username: str, listing_id: str) -> str:
     """'Buy Now' link for offline store posts: opens the Mini App straight on the
     card purchase section (see openTabFromLink in index.html)."""
     return f"https://t.me/{bot_username}/{WEBAPP_SHORT_NAME}?startapp=buy_{listing_id}"
+
+def _offline_buy_bot_link(bot_username: str, listing_id: str) -> str:
+    """Previous system: 'Buy Now' opens the bot chat and the /start buy_<id>
+    deep link (handlers.py start_cmd) shows the in-chat Confirm/Cancel card."""
+    return f"https://t.me/{bot_username}?start=buy_{listing_id}"
+
+
+def _offline_listing_kb(bot_username: str, listing_id: str) -> InlineKeyboardMarkup:
+    """Two-row Buy Now keyboard for offline store posts:
+    Row 1 - [Buy Now]    no colour, previous (bot chat) system
+    Row 2 - [🌐 Buy Now] success colour, web (Mini App)"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Buy Now", url=_offline_buy_bot_link(bot_username, listing_id))],
+        [InlineKeyboardButton(text="🌐 Buy Now", url=_offline_buy_link(bot_username, listing_id), style=ButtonStyle.SUCCESS)],
+    ])
 
 store_api = APIRouter(prefix="/api/store", tags=["Store"])
 
@@ -886,7 +941,7 @@ async def confirm_sell_cb(cq: CallbackQuery):
     deep_link = _offline_buy_link(bot_info.username, listing_id)
 
     global_data = db["global_cards"][card_id]
-    seller_name = db["users"][uid]["name"]
+    seller_name = await _resolve_user_label(db, uid, cq.from_user.first_name)
 
     rarity_str = format_rarity(global_data["rarity"])
     rarity_name, _, rarity_icon = rarity_str.rpartition(" ")
@@ -902,9 +957,7 @@ async def confirm_sell_cb(cq: CallbackQuery):
         f"<blockquote><b>Seller:</b> {seller_name} \n[<code>{uid}</code>]</blockquote>"
     )
 
-    group_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Buy Now", url=deep_link)]
-    ])
+    group_kb = _offline_listing_kb(bot_info.username, listing_id)
 
     try:
         msg = await bot.send_photo(
@@ -1160,8 +1213,9 @@ async def _execute_offline_buy(cq: CallbackQuery, uid: str, lid: str):
         save_db()
         await config.flush_db_now()
 
-        buyer_name = db["users"][uid].get("name", "User")
-        seller_name = db["users"].get(seller_id, {}).get("name", "Unknown")
+        buyer_name = await _resolve_user_label(db, uid, cq.from_user.first_name)
+        seller_name = await _resolve_user_label(db, seller_id)
+        save_db()
         rarity_str = format_rarity(global_card["rarity"])
         rarity_name, _, rarity_icon = rarity_str.rpartition(" ")
 
@@ -1384,7 +1438,7 @@ async def st_global_listings_cb(cq: CallbackQuery):
             n += 1
             rarity = format_rarity(card_data["rarity"])
             seller_id = data["seller_id"]
-            seller_name = html.escape(str(db["users"].get(seller_id, {}).get("name", "User")))
+            seller_name = _user_label(db, seller_id)
 
             # Hyperlink configured to redirect specifically to the offline GC post
             msg_id = data.get("msg_id")
@@ -1447,6 +1501,7 @@ class RemoveListingRequest(BaseModel):
 class OfflineBuyRequest(BaseModel):
     user_id: str
     listing_id: str
+    first_name: str = None   # sent by the Mini App so the real name is always known
 
 
 def _slot_payload(cid_data, bought_list):
@@ -1469,7 +1524,7 @@ async def api_get_online_store(user_id: str):
     """Same roll/lock-in logic as store_online_cb — reused so the price and
     card shown in the web app always matches what /store shows in chat."""
     try:
-        db = ensure_user(user_id, "User", None)
+        db = _ensure_user_keep(user_id)
         today = config.get_shop_rotation_seed()
         dp = db["users"][user_id].setdefault("daily_purchases", {})
 
@@ -1681,7 +1736,7 @@ async def api_create_listing(req: SellRequest):
     just skips the fuzzy-name search since the user picks a card_id directly
     from their own deck."""
     try:
-        db = ensure_user(req.user_id, "User", None)
+        db = _ensure_user_keep(req.user_id)
         user_data = db["users"][req.user_id]
 
         account_age_hours = (time.time() - user_data.get("joined", time.time())) / 3600
@@ -1719,7 +1774,7 @@ async def api_create_listing(req: SellRequest):
         listing_id = str(uuid.uuid4())[:8]
         bot_info = await bot.get_me()
         deep_link = _offline_buy_link(bot_info.username, listing_id)
-        seller_name = user_data["name"]
+        seller_name = await _resolve_user_label(db, req.user_id)
         rarity_name, _, rarity_icon = rarity_normalized.rpartition(" ")
 
         post_text = (
@@ -1732,9 +1787,7 @@ async def api_create_listing(req: SellRequest):
             f"━━━━━━━━━━━━━━━━━\n"
             f"<blockquote><b>Seller:</b> {seller_name} \n[<code>{req.user_id}</code>]</blockquote>"
         )
-        group_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Buy Now", url=deep_link)]
-        ])
+        group_kb = _offline_listing_kb(bot_info.username, listing_id)
 
         try:
             msg = await bot.send_photo(
@@ -1841,7 +1894,7 @@ async def api_get_global_listings(category: str = "all", page: int = 0):
             card_data = db["global_cards"].get(data["card_id"])
             if not card_data:
                 continue
-            seller_name = db["users"].get(data["seller_id"], {}).get("name", "User")
+            seller_name = _user_label(db, data["seller_id"], escape=False)
             results.append({
                 "listing_id": lid,
                 "card_id": data["card_id"],
@@ -1870,7 +1923,7 @@ async def api_get_offline_listing(listing_id: str):
         card_data = db["global_cards"].get(data["card_id"])
         if not card_data:
             raise HTTPException(status_code=404, detail="This listing is no longer available.")
-        seller_name = db["users"].get(data["seller_id"], {}).get("name", "User")
+        seller_name = _user_label(db, data["seller_id"], escape=False)
         return {
             "error": False,
             "listing": {
@@ -1895,7 +1948,7 @@ async def api_get_offline_listing(listing_id: str):
 async def api_buy_offline(req: OfflineBuyRequest):
     try:
         async with _get_lock(f"buy_offline_{req.listing_id}"):
-            db = ensure_user(req.user_id, "User", None)
+            db = _ensure_user_keep(req.user_id, req.first_name)
             if req.listing_id not in db.get("offline_store", {}):
                 raise HTTPException(status_code=404, detail="This listing is no longer available.")
 
@@ -1932,8 +1985,9 @@ async def api_buy_offline(req: OfflineBuyRequest):
             save_db()
             await config.flush_db_now()
 
-            buyer_name = db["users"][req.user_id].get("name", "User")
-            seller_name = db["users"].get(seller_id, {}).get("name", "Unknown")
+            buyer_name = await _resolve_user_label(db, req.user_id, req.first_name)
+            seller_name = await _resolve_user_label(db, seller_id)
+            save_db()
             rarity_str = format_rarity(global_card["rarity"])
             rarity_name, _, rarity_icon = rarity_str.rpartition(" ")
 

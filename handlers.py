@@ -17,7 +17,7 @@ from aiogram.types import (
     FSInputFile
 )
 from aiogram.filters import Command, CommandObject
-from aiogram.enums import ParseMode, ChatType, ChatMemberStatus
+from aiogram.enums import ParseMode, ChatType, ChatMemberStatus, ButtonStyle
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 
 import config
@@ -2699,7 +2699,6 @@ def _anycard_pool(db: dict, rarity: str | None = None, exclude_ids=()) -> dict:
     a star card (starred by any user), a Halloween card, a Diwali card, one of ANYCARD_EXCLUDED_SERIES, or a card ID in
     `exclude_ids` (set per reward, e.g. 4KSPECIAL never gives DB-0513F7)."""
     blocked_ids = {str(x).upper() for x in (exclude_ids or ())}
-    import diwali   # lazy: diwali only imports config, but this keeps module import order safe
     star_ids = set()
     for u in db.get("users", {}).values():
         star_ids.update(u.get("star_purchases", []) or [])
@@ -2709,7 +2708,7 @@ def _anycard_pool(db: dict, rarity: str | None = None, exclude_ids=()) -> dict:
             continue
         if rarity and format_rarity(c.get("rarity", "")) != format_rarity(rarity):
             continue
-        if config.is_halloween_card(c) or diwali.is_diwali_card(c):
+        if config.is_halloween_card(c) or config.is_diwali_edition_card(c):
             continue
         anime = _norm_series(c.get("anime", ""))
         if any(ex in anime for ex in ANYCARD_EXCLUDED_SERIES):
@@ -3574,6 +3573,54 @@ def _cl_anime_key_lookup(db: dict, anime_key: str):
 
 
 CARDLISTS_PER_PAGE = 10  # laid out as 4 + 4 + 2 button rows
+CARDLISTS_IMAGE = "https://i.ibb.co/tPsCGwzD/file-0000000067688211aafc9d276d2f5216.png"
+
+
+async def _cl_show(event, text: str, markup, edit: bool = False):
+    """Renders every /cardlists screen as a photo message with CARDLISTS_IMAGE.
+    Falls back to plain text if the caption would exceed Telegram's 1024 limit or
+    the image can't be sent. Old text-only cardlists messages are replaced by a photo."""
+    use_photo = len(text) <= 1024
+    if isinstance(event, CallbackQuery):
+        msg = event.message
+        if edit:
+            try:
+                if msg.photo and use_photo:
+                    await msg.edit_caption(caption=text, reply_markup=markup, parse_mode=ParseMode.HTML)
+                    return
+                if (not msg.photo) and (not use_photo):
+                    await msg.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+                    return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
+            # photo <-> text switch (or edit refused): replace the message
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            try:
+                if use_photo:
+                    await bot.send_photo(msg.chat.id, photo=CARDLISTS_IMAGE, caption=text, reply_markup=markup, parse_mode=ParseMode.HTML)
+                else:
+                    await bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            except Exception:
+                await bot.send_message(msg.chat.id, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            return
+        target = msg
+    else:
+        target = event
+    try:
+        if use_photo:
+            await target.reply_photo(photo=CARDLISTS_IMAGE, caption=text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            return
+    except Exception:
+        pass
+    await target.reply(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+def _cl_close_btn(owner_id) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="✕ Close", callback_data=f"close_msg|{owner_id}", style=ButtonStyle.DANGER)
 
 
 async def _show_cardlists_anime_page(event, edit=False, page=0, owner_id=None):
@@ -3591,14 +3638,7 @@ async def _show_cardlists_anime_page(event, edit=False, page=0, owner_id=None):
 
     if not anime_titles:
         text = "<b>「 Anime List 🪐 」</b>\n━━━━━━━━━━━━━━━━━\nNo cards are registered yet."
-        if edit and isinstance(event, CallbackQuery):
-            try:
-                await event.message.edit_text(text, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
-        else:
-            target = event.message if isinstance(event, CallbackQuery) else event
-            await target.reply(text, parse_mode=ParseMode.HTML)
+        await _cl_show(event, text, None, edit=edit)
         return
 
     total = len(anime_titles)
@@ -3635,25 +3675,23 @@ async def _show_cardlists_anime_page(event, edit=False, page=0, owner_id=None):
         rows.append(number_buttons[:chunk_size])
         number_buttons = number_buttons[chunk_size:]
 
+    # Event sections
+    rows.append([
+        InlineKeyboardButton(text="🎃 Halloween", callback_data=f"cl_ev|{owner_id}|hw|0"),
+        InlineKeyboardButton(text="🪔 Diwali", callback_data=f"cl_ev|{owner_id}|dw|0"),
+    ])
+
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="« Prev", callback_data=f"cl_page|{owner_id}|{page-1}"))
+        nav.append(InlineKeyboardButton(text="« Prev", callback_data=f"cl_page|{owner_id}|{page-1}", style=ButtonStyle.PRIMARY))
     if end < total:
-        nav.append(InlineKeyboardButton(text="Next »", callback_data=f"cl_page|{owner_id}|{page+1}"))
+        nav.append(InlineKeyboardButton(text="Next »", callback_data=f"cl_page|{owner_id}|{page+1}", style=ButtonStyle.PRIMARY))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text="✕ Close", callback_data=f"close_msg|{owner_id}")])
+    rows.append([_cl_close_btn(owner_id)])
 
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
-
-    if edit and isinstance(event, CallbackQuery):
-        try:
-            await event.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-    else:
-        target = event.message if isinstance(event, CallbackQuery) else event
-        await target.reply(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    await _cl_show(event, text, markup, edit=edit)
 
 
 def _cl_find_anime(db: dict, query: str):
@@ -3776,17 +3814,10 @@ async def _show_cardlists_rarity_picker(event, anime_name: str, edit=False, owne
 
     kb = InlineKeyboardMarkup(inline_keyboard=rarity_rows + [
         [InlineKeyboardButton(text="« Back to Anime List", callback_data=f"cl_page|{owner_id}|0")],
-        [InlineKeyboardButton(text="✕ Close", callback_data=f"close_msg|{owner_id}")]
+        [_cl_close_btn(owner_id)]
     ])
 
-    if edit and isinstance(event, CallbackQuery):
-        try:
-            await event.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-    else:
-        target = event.message if isinstance(event, CallbackQuery) else event
-        await target.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await _cl_show(event, text, kb, edit=edit)
 
 
 @main_router.callback_query(F.data.startswith("cl_an|"))
@@ -3889,21 +3920,99 @@ async def cardlists_card_view_cb(cq: CallbackQuery):
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="« Prev", callback_data=f"cl_r|{owner_id}|{anime_key}|{rarity_safe}|{page-1}"))
+        nav.append(InlineKeyboardButton(text="« Prev", callback_data=f"cl_r|{owner_id}|{anime_key}|{rarity_safe}|{page-1}", style=ButtonStyle.PRIMARY))
     if end < total:
-        nav.append(InlineKeyboardButton(text="Next »", callback_data=f"cl_r|{owner_id}|{anime_key}|{rarity_safe}|{page+1}"))
+        nav.append(InlineKeyboardButton(text="Next »", callback_data=f"cl_r|{owner_id}|{anime_key}|{rarity_safe}|{page+1}", style=ButtonStyle.PRIMARY))
 
     rows = []
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="« Back to Rarities", callback_data=f"cl_an|{owner_id}|{anime_key}")])
-    rows.append([InlineKeyboardButton(text="✕ Close", callback_data=f"close_msg|{owner_id}")])
+    rows.append([_cl_close_btn(owner_id)])
 
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await _cl_show(cq, text, kb, edit=True)
+    await cq.answer()
+
+
+# ---- Event sections (Halloween / Diwali) -------------------------------
+_CL_EVENTS = {
+    "hw": ("🎃", "Halloween", lambda c: config.is_halloween_card(c)),
+    "dw": ("🪔", "Diwali",    lambda c: config.is_diwali_edition_card(c)),
+}
+
+
+@main_router.callback_query(F.data.startswith("cl_ev|"))
+async def cardlists_event_cb(cq: CallbackQuery):
+    import html as _cl_html
+    uid_int = cq.from_user.id
+    if is_ghost_banned(uid_int) or is_shadow_banned(uid_int):
+        await cq.answer()
+        return
+
     try:
-        await cq.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        _, owner_id, ev, page_s = cq.data.split("|")
+        page = int(page_s)
     except Exception:
-        pass
+        await cq.answer("Invalid button.", show_alert=True)
+        return
+    if str(uid_int) != owner_id:
+        await cq.answer("This menu is not for you!", show_alert=True)
+        return
+    if ev not in _CL_EVENTS:
+        await cq.answer("Unknown section.", show_alert=True)
+        return
+
+    icon, label, match = _CL_EVENTS[ev]
+    db = load_db()
+    owned_cards = db.get("users", {}).get(str(uid_int), {}).get("cards", {})
+    cards = [(cid, c) for cid, c in db.get("global_cards", {}).items() if match(c)]
+    cards.sort(key=lambda x: (RARITY_ORDER.get(format_rarity(x[1].get("rarity", "")), 99), str(x[1].get("name", "")).lower()))
+
+    if not cards:
+        await cq.answer(f"No {label} cards yet.", show_alert=True)
+        return
+
+    per_page = BROWSE_PER_PAGE
+    total = len(cards)
+    total_pages = max(1, (total - 1) // per_page + 1)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = min(start + per_page, total)
+
+    def _is_owned(cid):
+        return cid in owned_cards and owned_cards[cid].get("amount", 0) > 0
+
+    owned_count = sum(1 for cid, _ in cards if _is_owned(cid))
+    lines = []
+    for cid, c in cards[start:end]:
+        dot = "⬤" if _is_owned(cid) else "◯"
+        r = format_rarity(c.get("rarity", ""))
+        r_icon = r.rpartition(" ")[2] if r else ""
+        lines.append(f"{dot} {_cl_html.escape(str(c.get('name', 'Unknown')))} 〔{r_icon}〕")
+
+    text = (
+        f"<b>「 {icon} {label} Edition 」</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(lines) +
+        "\n━━━━━━━━━━━━━━━━━\n"
+        f"<blockquote><b>Collected: ({owned_count}/{total})\n⬤  - Owned \n◯  - not owned</b></blockquote>"
+    )
+    if total_pages > 1:
+        text += f"\nPage <b>{page+1}/{total_pages}</b>"
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="« Prev", callback_data=f"cl_ev|{owner_id}|{ev}|{page-1}", style=ButtonStyle.PRIMARY))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="Next »", callback_data=f"cl_ev|{owner_id}|{ev}|{page+1}", style=ButtonStyle.PRIMARY))
+    rows = []
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="« Back to Anime List", callback_data=f"cl_page|{owner_id}|0")])
+    rows.append([_cl_close_btn(owner_id)])
+
+    await _cl_show(cq, text, InlineKeyboardMarkup(inline_keyboard=rows), edit=True)
     await cq.answer()
 
 
