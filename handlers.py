@@ -4,6 +4,7 @@ import time
 import uuid
 import random
 import asyncio
+import aiohttp
 import difflib
 import unicodedata
 from datetime import datetime, timezone, timedelta
@@ -129,6 +130,12 @@ def _ratio_if(a: str, b: str, th: float) -> float:
 
 DAILY_BASE_REWARD  = 150
 DAILY_BIO_BONUS    = 150
+
+# Adexium ads (https://docs.adexium.io/publisher/bot-integration)
+ADEXIUM_ENABLED      = True
+ADEXIUM_PLACEMENT_ID = "9ad63935-53eb-4a9f-b410-d0734dd84b18"
+ADEXIUM_URL          = "https://bid.tgads.live/bot-request"
+ADEXIUM_TTL_SECS     = 24 * 3600   # ads auto-delete after 24h (Telegram allows bot deletes up to 48h)
 WEEKLY_BASE_REWARD = 500
 WEEKLY_BIO_BONUS   = 300
 
@@ -256,6 +263,89 @@ async def check_and_reward_referral(user_id: str, db: dict):
 
 
 # ==========================================
+# ADEXIUM ADS
+# ==========================================
+async def _adexium_delete_now(chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass  # already deleted / too old / chat gone
+
+
+async def _adexium_sweep() -> None:
+    """Delete any ads whose 24h is up. Saved in the DB, so it also catches
+    ads left over from before a bot restart."""
+    try:
+        db = load_db()
+        pending = db.get("adexium_ads") or []
+        if not pending:
+            return
+        now = time.time()
+        due  = [a for a in pending if a["delete_at"] <= now]
+        if not due:
+            return
+        db["adexium_ads"] = [a for a in pending if a["delete_at"] > now]
+        save_db()
+        for a in due:
+            await _adexium_delete_now(a["chat_id"], a["message_id"])
+    except Exception as e:
+        print(f"[adexium] sweep failed: {e!r}")
+
+
+async def _adexium_schedule_delete(user, chat_id: int, message_id: int) -> None:
+    db = ensure_user(str(user.id), user.first_name, user.username)
+    db.setdefault("adexium_ads", []).append({
+        "chat_id": chat_id, "message_id": message_id,
+        "delete_at": time.time() + ADEXIUM_TTL_SECS,
+    })
+    save_db()
+
+    async def _later():
+        await asyncio.sleep(ADEXIUM_TTL_SECS)
+        await _adexium_sweep()
+    asyncio.create_task(_later())
+
+
+async def send_adexium_ad(user) -> None:
+    """Request one Adexium ad for `user` and DM it to them. Never raises."""
+    if not ADEXIUM_ENABLED:
+        return
+    await _adexium_sweep()
+    try:
+        payload = {
+            "wid":        ADEXIUM_PLACEMENT_ID,
+            "language":   (user.language_code or "en")[:2].lower(),
+            "isPremium":  bool(getattr(user, "is_premium", False)),
+            "firstName":  user.first_name or "",
+            "telegramId": str(user.id),
+        }
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(ADEXIUM_URL, json=payload) as resp:
+                if resp.status != 200:
+                    print(f"[adexium] bid request failed: HTTP {resp.status}")
+                    return
+                ads = await resp.json(content_type=None)
+
+        # Empty list = no ad for this user -> send nothing.
+        if not ads:
+            return
+        ad = ads[0]
+        image, text, btn, url = ad.get("image"), ad.get("text", ""), ad.get("buttonText"), ad.get("clickUrl")
+        if not (image and url):
+            return
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn or "Open", url=url)]])
+        # parse_mode=None: advertiser text is sent as plain text.
+        sent = await bot.send_photo(user.id, photo=image, caption=text[:1024], parse_mode=None, reply_markup=kb)
+        await _adexium_schedule_delete(user, sent.chat.id, sent.message_id)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass  # user hasn't started the bot / blocked it / bad image
+    except Exception as e:
+        print(f"[adexium] failed for {getattr(user, 'id', '?')}: {e!r}")
+
+
+# ==========================================
 # DAILY REWARDS CLAIM SYSTEM (/daily)
 # ==========================================
 _daily_locks: dict[str, asyncio.Lock] = {}
@@ -308,6 +398,9 @@ async def daily_reward_cmd(message: Message):
             parse_mode=ParseMode.HTML,
             reply_markup=_bio_kb("daily", user_id, bio_bonus),
         )
+
+        # Fire-and-forget so the ad can never delay or break the claim.
+        asyncio.create_task(send_adexium_ad(message.from_user))
 
 
 async def _daily_text(bio_bonus: bool) -> str:
